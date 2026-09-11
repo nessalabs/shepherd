@@ -7,8 +7,9 @@
 //! honestly via [`Capabilities`].
 //!
 //! Decisions recorded in `docs/decisions/0002-drop-hard-kill.md`,
-//! `docs/decisions/0003-serialized-scope-process-groups.md`, and
-//! `docs/decisions/0004-reuse-safe-signaling.md`.
+//! `docs/decisions/0003-serialized-scope-process-groups.md`,
+//! `docs/decisions/0004-reuse-safe-signaling.md`, and
+//! `docs/decisions/0010-retain-slot-until-wait.md`.
 
 use std::collections::HashMap;
 use std::os::unix::process::ExitStatusExt;
@@ -143,9 +144,12 @@ impl UnixProcessBackend {
         }
     }
 
-    fn note_child_exited(&self, scope: ProcessScopeId, key: ChildKey) {
+    /// The OS child has exited. Decrement `live` so the next spawn can create a fresh
+    /// group, but **keep the slot** until [`wait`](ProcessBackend::wait) consumes the
+    /// recorded exit. Removing it here races a monitor that has not subscribed yet
+    /// (macOS CI: `CleanupUnverified(ReapFailed)`). See ADR 0010.
+    fn note_os_exit(&self, scope: ProcessScopeId) {
         let mut state = self.state.lock().expect("unix backend mutex");
-        state.children.remove(&key);
         if let Some(group) = state.scope_groups.get_mut(&scope) {
             group.live = group.live.saturating_sub(1);
             // Keep the pgid when live hits 0 so `signal_scope` can still sweep descendants
@@ -233,7 +237,6 @@ impl ProcessBackend for UnixProcessBackend {
         );
 
         let this = self.clone();
-        let key = child_key(&os);
         tokio::spawn(async move {
             let status = child.wait().await;
             let raw = match status {
@@ -249,7 +252,7 @@ impl ProcessBackend for UnixProcessBackend {
                 },
             };
             let _ = exit_tx.send(Some(raw));
-            this.note_child_exited(scope, key);
+            this.note_os_exit(scope);
         });
 
         Ok(Spawned { os })
@@ -300,9 +303,10 @@ impl ProcessBackend for UnixProcessBackend {
     }
 
     async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
+        let key = child_key(&target.os);
         let mut rx = {
             let state = self.state.lock().expect("unix backend mutex");
-            match state.children.get(&child_key(&target.os)) {
+            match state.children.get(&key) {
                 Some(slot) => slot.sender.subscribe(),
                 None => {
                     return Err(WaitError::Backend(format!(
@@ -312,14 +316,20 @@ impl ProcessBackend for UnixProcessBackend {
                 }
             }
         };
-        loop {
+        let exit = loop {
             if let Some(exit) = *rx.borrow_and_update() {
-                return Ok(exit);
+                break exit;
             }
             if rx.changed().await.is_err() {
                 return Err(WaitError::Backend("waiter channel closed".into()));
             }
-        }
+        };
+        self.state
+            .lock()
+            .expect("unix backend mutex")
+            .children
+            .remove(&key);
+        Ok(exit)
     }
 
     async fn sample(&self, target: &Spawned) -> Result<RawStats, StatsError> {
@@ -543,5 +553,28 @@ fn parse_state(field: &str) -> ProcessState {
         Some('T') => ProcessState::Stopped,
         Some('Z') => ProcessState::Zombie,
         _ => ProcessState::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The waiter task reaps as soon as the OS child exits. A late `wait()` — the
+    /// monitor not yet scheduled, or a caller that subscribed after reap — must still
+    /// observe the recorded exit instead of `WaitError` / `ReapFailed`.
+    #[tokio::test]
+    async fn late_wait_after_natural_exit_still_sees_status() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let spec = ProcessSpec::new("true");
+        let spawned = backend.spawn(scope, &spec).await.expect("spawn true");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let exit = backend
+            .wait(&spawned)
+            .await
+            .expect("late wait must not lose a reaped child");
+        assert_eq!(exit.code, Some(0));
     }
 }

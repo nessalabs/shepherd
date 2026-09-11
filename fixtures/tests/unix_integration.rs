@@ -187,7 +187,9 @@ async fn concurrent_first_spawns_share_one_process_group() {
     ra.unwrap();
     rb.unwrap();
 
+    #[cfg_attr(not(target_os = "linux"), expect(unused_variables))]
     let os_a = read_os_pid(&a_file).await;
+    #[cfg_attr(not(target_os = "linux"), expect(unused_variables))]
     let os_b = read_os_pid(&b_file).await;
     #[cfg(target_os = "linux")]
     {
