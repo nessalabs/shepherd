@@ -78,12 +78,23 @@ infrastructure" is a build-graph fact, not a convention.
 One bounded context — **Process Supervision** — with a strict *dependencies point inward*
 rule: `infra → app → domain`, never the reverse.
 
-- `shepherd-domain` **(pure).** Entities, Value Objects, Aggregates, Domain Events, domain
-errors, and **Ports** (traits). No `tokio`, no `nix`, no OS, no `std::process`/`std::fs`.
-`#![forbid(unsafe_code)]`. Deterministic and unit-testable without spawning a process.
-- `shepherd-app`**.** Application services / use-cases. Orchestrates the domain, drives the
-ports, owns async (`tokio`). Hosts the in-process `EventDispatcher` (a mediator) and the
-integration-event translator. Depends on `shepherd-domain` only.
+- `shepherd-domain` **(pure).** Entities, Value Objects, Aggregates, Domain Events, and
+domain errors. No `tokio`, no `nix`, no OS, no `std::process`/`std::fs`, and **no async** —
+its only dependency is `thiserror`. `#![forbid(unsafe_code)]`. Deterministic and
+unit-testable without spawning a process.
+- `shepherd-app`**.** Application services / use-cases. Orchestrates the domain, **defines and
+owns the driven ports** (`ProcessBackend`, `Clock`, `Waiters`, `OutputSink`, `EventHandler`,
+`IntegrationEventPublisher`), owns async (`tokio`), and hosts the in-process
+`EventDispatcher` (a mediator) and the integration-event translator. Depends on
+`shepherd-domain` only.
+
+> **Design note — where the ports live.** The ports are **application-owned driven ports**,
+> not domain traits. The driven ports are inherently async (spawn/wait/reap, sleep, publish)
+> and require trait objects, which would pull `async-trait`/runtime concerns into the domain.
+> Keeping them in `shepherd-app` lets `shepherd-domain` stay a zero-dependency, zero-async,
+> synchronous core — the strongest possible purity guarantee, enforced by the
+> `ddd-architecture` CI job. This is a deliberate refinement of the original "domain-owned
+> ports" sketch.
 - `shepherd-infra`**.** Adapters implementing the domain ports: `cgroups-rs`,
 `process-wrap`, `nix`, `windows-sys`, `libproc`, the clock, the stats sampler, output
 plumbing. This is the **Anti-Corruption Layer**: it translates OS concepts (pids, cgroup
@@ -111,14 +122,16 @@ events and handler design.
 published across Shepherd's boundary to the consuming application's bounded context via an
 outbound port. Decoupled and lossy-tolerant; never affects Shepherd's internal invariants.
 - **Repository —** `ScopeRegistry`**.** Collection-style access to `ProcessScope` aggregates
-(in-memory runtime state; the pattern still applies).
-- **Ports (domain-owned traits)** — inbound handling: `EventHandler`; capability/effect:
-`ProcessBackend`, `Clock`, `OutputSink`, `Waiters`; outbound boundary:
-`IntegrationEventPublisher`.
+(in-memory runtime state; the pattern still applies). Lives in `shepherd-app`.
+- **Ports (application-owned driven traits, in `shepherd-app`)** — inbound handling:
+`EventHandler`; capability/effect: `ProcessBackend`, `Clock`, `OutputSink`, `Waiters`;
+outbound boundary: `IntegrationEventPublisher`. (See the design note in §3.1.)
 - **No anemic model.** Behavior lives on the aggregate. The domain is a **pure state
-machine**: e.g. `ProcessScope::request_termination(now) -> Vec<Command>` returns *what to
-do* as data; the app layer executes those commands via ports and feeds results back as
-events. This purity is what makes the invariants property-testable.
+machine**: aggregate methods (e.g. `ProcessScope::request_termination` /
+`record_reaped`) mutate state and **return `Vec<DomainEvent>`** describing what happened; the
+app layer reads aggregate state, drives the ports, and dispatches those events. The aggregate
+never performs I/O or dispatches. This purity is what makes the invariants unit- and
+property-testable.
 
 
 
@@ -192,8 +205,8 @@ This also resolves the earlier subscription question: internal domain events + h
 
 ```
 crates/
-  shepherd-domain/     # PURE domain (entities, VOs, aggregates, events, ports, errors)
-  shepherd-app/        # application services / use-cases (async orchestration)
+  shepherd-domain/     # PURE domain (entities, VOs, aggregates, events, errors) — no ports, no async
+  shepherd-app/        # application services / use-cases, driven ports, async orchestration
   shepherd-infra/      # adapters: cgroups-rs, process-wrap, nix, windows-sys, libproc
   shepherd/            # public facade: wires app + infra, re-exports API
 fixtures/              # non-published pathological helper binaries (workspace member)
@@ -275,7 +288,7 @@ supervisor.terminate(pid, options).await        -> Result<ProcessExit, Terminate
 supervisor.terminate_scope(scope_id, options).await -> Result<ScopeTerminationReport, _>
 supervisor.wait(pid).await                      -> Result<ProcessExit, _>
 supervisor.shutdown().await                     -> Result<ShutdownReport, ShutdownError>
-supervisor.with_scope(specs, |scope| async { .. }).await  // async scope guard (§7.3)
+supervisor.with_scope(specs, |scope| async { .. }).await  // async scope guard (§7.3) — planned
 ```
 
 Raw mutable `Child` ownership is never exposed. All cleanup APIs are idempotent.
@@ -333,9 +346,9 @@ reported as success.
 worker can deadlock the runtime, and `Drop` frequently runs during runtime shutdown (no
 reactor) or panic unwinding. `Drop` also cannot return a `Result`, so it cannot surface a
 typed outcome. Therefore the **full, verified, typed** cleanup is delivered through the
-explicit async path and the **async scope guard** (`with_scope`), which runs verified
-cleanup on *any* block exit — normal return, `?` error, or cancellation — while still in
-async context. `Drop` is only the last-ditch honest backstop.
+explicit async path and the **async scope guard** (`with_scope`, *planned*), which runs
+verified cleanup on *any* block exit — normal return, `?` error, or cancellation — while
+still in async context. `Drop` is only the last-ditch honest backstop.
 
 ### 7.4 Cancellation safety
 
@@ -465,16 +478,23 @@ capability gap is made explicit.
 
 ## 15. Phased sequencing (scaffold first, verifiable units)
 
-1. **Scaffold** — workspace + 4-crate split, `GLOSSARY.md`, error/type stubs, CI skeleton,
-  `ddd-arch-check`, fixtures harness. *(Benefits every later phase.)*
-2. **Domain core** — types + lifecycle state machine + `null` backend + contract tests.
-3. **Linux backend** — cgroup v2 + process-group fallback + isolation/termination tests.
-4. **Stats sampler** — interval polling + resource fixtures/tests.
-5. **Output plumbing** — bounded queue + tail capture + output-stress tests.
-6. **macOS + Windows backends** — validated via CI.
-7. **Hardening** — property/stress/race suites; finalize the guarantee table.
+Status legend: ✅ done · 🚧 partial · ⬜ planned.
 
-Platform backend implementation is delegated to subagents to keep the main context clean.
+1. ✅ **Scaffold** — workspace + 4-crate split, `GLOSSARY.md`, error/types, CI, `ddd-arch-check`,
+   fixtures harness.
+2. ✅ **Domain core** — types + lifecycle state machine + `null` backend + contract tests
+   (domain at 100% line/function coverage, enforced by the `domain-coverage` CI job).
+3. 🚧 **Unix / Linux backend** — real process-group backend (spawn, signal, wait/reap,
+   `/proc` stats) with isolation/termination/descendant tests. cgroup v2 (`cgroup.kill`,
+   detached-child containment) is ⬜ still to come.
+4. ⬜ **Stats sampler** — shared interval-poll sampler + CPU stats + resource fixtures/tests.
+5. ⬜ **Output plumbing** — bounded byte queue + tail capture + output-stress tests.
+6. ⬜ **macOS + Windows backends** — validated via CI.
+7. ⬜ **Hardening** — property/`loom`/stress/race suites; finalize the guarantee table.
+
+Also ⬜: the `with_scope` async scope guard (§7.3).
+
+Platform backend implementation may be delegated to subagents to keep the main context clean.
 
 ## 16. Open decisions to confirm
 

@@ -19,13 +19,13 @@ flowchart TD
         SUP[ProcessSupervisor<br/>application service]
         SAMP[StatsSampler]
         REAP[Reaper]
+        PORT[Ports: ProcessBackend / Clock / Waiters / OutputSink / EventHandler / IntegrationEventPublisher]
     end
     subgraph domain["shepherd-domain (PURE)"]
         AGG[ProcessScope&nbsp;«Aggregate Root»]
         ENT[Process&nbsp;«Entity»]
         VO[Value Objects]
         EV[Domain Events]
-        PORT[Ports: ProcessBackend / Clock / OutputSink]
     end
     subgraph infra["shepherd-infra (adapters / ACL)"]
         LIN[LinuxBackend<br/>cgroups-rs + process-wrap + nix]
@@ -53,8 +53,9 @@ flowchart TD
     F --> infra
 ```
 
-> The domain never depends on `app`, `infra`, or any OS crate. Adapters *implement* domain
-> ports; wiring happens only in the facade.
+> The domain never depends on `app`, `infra`, or any OS crate (and has no async). The driven
+> **ports live in `shepherd-app`**; adapters in `shepherd-infra` *implement* them; wiring
+> happens only in the facade.
 
 ---
 
@@ -207,8 +208,9 @@ classDiagram
 Notes:
 - `ProcessScope` is the **consistency boundary**; `Process` is only reachable *through* it
   (composition `*--`). External code holds `ProcessId`, never a `Process`/`Child`.
-- `ProcessBackend`, `Clock`, `OutputSink` are **ports** owned by the domain; the concrete
-  backends (`LinuxBackend`, …) implement them in `shepherd-infra`.
+- `ProcessBackend`, `Clock`, `OutputSink` are **application-owned driven ports** (in
+  `shepherd-app`, not the domain); the concrete backends (`LinuxBackend`, …) implement them in
+  `shepherd-infra`.
 
 ---
 

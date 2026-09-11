@@ -17,7 +17,7 @@ class/state diagrams.
 | Value Object | Immutable, compared by value; carries no identity. |
 | Domain Event | An immutable fact that happened in the domain; emitted at most once logically. |
 | Repository | Collection-style access to aggregates. |
-| Port | A trait the domain owns; implemented by an infrastructure adapter. |
+| Port | A driven trait owned by the application layer (`shepherd-app`); implemented by an infrastructure adapter. Kept out of the pure domain crate so it stays zero-async and zero-dependency. |
 | Adapter / ACL | Infrastructure implementation of a port; translates OS concepts to domain terms. |
 | Application Service | Orchestrates the domain and drives ports; owns async. |
 
@@ -186,7 +186,7 @@ invariants; delivery is bounded and lossy-tolerant.
 **Port (outbound).** Interface for publishing `IntegrationEvent`s to the consuming
 application. A slow/absent publisher never affects Shepherd's internal state.
 
-## Ports (domain-owned traits)
+## Ports (application-owned driven traits)
 
 ### ProcessBackend
 **Port.** The platform abstraction: spawn, sample, terminate, terminate_scope, reap, and
