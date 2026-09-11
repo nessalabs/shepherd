@@ -157,12 +157,9 @@ message bus.
 
 ### EventHandler
 **Port.** Interface for a focused handler that reacts to specific domain events using only
-injected ports (dependency inversion). Concrete handlers: `ReaperHandler`,
-`WaitNotifierHandler`, `RegistryPruneHandler`, `IntegrationTranslator`.
-
-### ReaperHandler
-**Handler.** On `ProcessExited`, reaps the process via `ProcessBackend` and yields
-`ProcessReaped`.
+injected ports (dependency inversion). Concrete handlers: `WaitNotifierHandler`,
+`RegistryPruneHandler`, `IntegrationTranslator`. Wait/reap is owned by the per-spawn
+monitor task, not a handler (see `docs/decisions/0008-monitor-owned-wait.md`).
 
 ### WaitNotifierHandler
 **Handler.** On `ProcessReaped`, wakes pending `wait(pid)` callers via `Waiters`.

@@ -55,6 +55,7 @@ The domain's purity, the layering, and the ubiquitous language are enforced by t
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture and implementation plan.
 - [`docs/DIAGRAMS.md`](docs/DIAGRAMS.md) — class and state diagrams.
 - [`docs/GLOSSARY.md`](docs/GLOSSARY.md) — the ubiquitous language (enforced in CI).
+- [`docs/decisions/`](docs/decisions/) — implementation ADRs (ports, Drop kill, groups, signaling, wait failure, deferred crates, publishers, monitors, toolchain).
 
 ## Development
 

@@ -1,10 +1,12 @@
 # Shepherd — Design & Implementation Plan
 
-> Status: **Plan / RFC** (pre-implementation). This document is the source of truth for
-> the architecture. Companion documents:
+> Status: **Plan / RFC** (implementation in progress). This document is the source of
+> truth for the architecture. Companion documents:
 >
 > - `[DIAGRAMS.md](./DIAGRAMS.md)` — class and state diagrams.
 > - `[GLOSSARY.md](./GLOSSARY.md)` — the ubiquitous language (enforced in CI).
+> - `[decisions/](./decisions/)` — ADRs for choices made in this implementation that
+>   refine or defer sketches below.
 
 ## 1. What Shepherd is
 
@@ -44,8 +46,8 @@ honesty, resource observation, and an adversarial test suite.
 
 | Concern                                                               | Reused primitive                                                                              |
 | --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| Async spawn, process group (Unix), Job Object (Windows), kill-on-drop | `[process-wrap](https://docs.rs/process-wrap)` (Tokio frontend)                               |
-| Linux cgroup v2 (create, place, `cgroup.kill`, controller stats)      | `[cgroups-rs](https://crates.io/crates/cgroups-rs)` (with a direct `/sys/fs/cgroup` fallback) |
+| Async spawn, process group (Unix), Job Object (Windows), kill-on-drop | `[process-wrap](https://docs.rs/process-wrap)` (Tokio frontend) — **deferred this phase**; Unix uses `tokio::process` + `nix` ([0006](./decisions/0006-direct-tokio-process-nix.md)) |
+| Linux cgroup v2 (create, place, `cgroup.kill`, controller stats)      | `[cgroups-rs](https://crates.io/crates/cgroups-rs)` (with a direct `/sys/fs/cgroup` fallback) — **deferred**; process-group backend ships first |
 | pidfd, signals, `pre_exec`, `clone3`, `waitpid`                       | `nix` / `rustix`                                                                              |
 | Per-process `/proc` stats (Linux)                                     | `procfs` or direct reads                                                                      |
 | Job Object accounting/stats (Windows)                                 | `windows-sys`                                                                                 |
@@ -173,8 +175,9 @@ transition committed under the registry lock**.
   registry lock is released**, to focused `EventHandler`s.
 - **Handlers depend only on interfaces (ports)** — dependency inversion, constructor
   injection, no service locator — so each handler is isolated and fake-testable:
-  - `ReaperHandler` (depends on `ProcessBackend`): on `ProcessExited`, reaps → returns
-    `ProcessReaped`.
+  - Wait/reap is owned by a per-spawn **monitor task** (not a `ReaperHandler`): `waitpid`
+    is the source of the exit fact, so wait starts at spawn
+    ([0008](./decisions/0008-monitor-owned-wait.md)).
   - `WaitNotifierHandler` (depends on `Waiters`): on `ProcessReaped`, wakes `wait(pid)`.
   - `RegistryPruneHandler` (depends on `ScopeRegistry`): on `ProcessReaped`/`ScopeClosed`,
     prunes bookkeeping (invariant #9) and releases the scope containment resource.
@@ -498,10 +501,15 @@ Platform backend implementation may be delegated to subagents to keep the main c
 
 ## 16. Open decisions to confirm
 
-- Fitness functions in **TypeScript** (default) vs Rust `xtask`.
 - Availability of a **privileged/self-hosted Linux runner** for `privileged-cgroup` (else
 containerize on hosted runners).
-- Confirm **edition 2021 / MSRV 1.83** (installed toolchain) vs edition 2024.
+
+Closed in this implementation (see `docs/decisions/`):
+
+- Fitness functions are **TypeScript** (`tools/ddd-arch-check/`) — [0009](./decisions/0009-toolchain-and-quality-gates.md).
+- **Edition 2021 / MSRV 1.83**; clippy CI pinned to that toolchain — [0009](./decisions/0009-toolchain-and-quality-gates.md).
+- Unix adapter is **`tokio::process` + `nix`** this phase; `process-wrap` and `cgroups-rs`
+  are deferred — [0006](./decisions/0006-direct-tokio-process-nix.md).
 
 
 

@@ -90,17 +90,19 @@ impl SupervisorBuilder {
         let waiters = Arc::new(InMemoryWaiters::new());
         let publisher = self
             .publisher
-            .unwrap_or_else(|| Arc::new(NoopIntegrationPublisher));
+            .unwrap_or_else(|| Arc::new(NoopIntegrationPublisher)); // ADR 0007
         ProcessSupervisor::new(backend, clock, waiters, publisher)
     }
 }
 
 #[cfg(unix)]
 fn default_backend() -> Arc<dyn ProcessBackend> {
+    // Process-group Unix adapter; process-wrap / cgroups-rs are deferred (ADR 0006).
     Arc::new(UnixProcessBackend::new())
 }
 
 #[cfg(not(unix))]
 fn default_backend() -> Arc<dyn ProcessBackend> {
+    // Honest default: no Job Object adapter yet (ADR 0006).
     Arc::new(NullBackend::new())
 }

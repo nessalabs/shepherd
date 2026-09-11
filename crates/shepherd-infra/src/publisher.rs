@@ -6,8 +6,8 @@ use shepherd_domain::IntegrationEvent;
 
 /// A publisher that drops every integration event.
 ///
-/// The default outbound adapter: the boundary port exists so consumers can plug in their own
-/// bus, but nothing is emitted until they do.
+/// The default outbound adapter (ADR 0007): the boundary port exists so consumers can
+/// plug in their own bus, but nothing is emitted until they do.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopIntegrationPublisher;
 

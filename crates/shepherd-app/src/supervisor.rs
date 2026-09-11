@@ -207,6 +207,7 @@ impl ProcessSupervisor {
             .expect("spawn_times mutex")
             .insert(pid, self.inner.clock.now());
         self.inner.dispatcher.dispatch(&events).await;
+        // Wait/reap starts here, not in a ReaperHandler (ADR 0008).
         self.start_monitor(scope, pid, spawned);
         Ok(pid)
     }
