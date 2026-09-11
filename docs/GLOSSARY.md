@@ -129,6 +129,44 @@ confirmed.
 ### ScopeClosed
 **Domain Event.** A scope reached the Closed state; all its processes are reaped.
 
+## Event handling
+
+### EventDispatcher
+**Application Service (mediator).** Routes domain events, after the transition is committed,
+to the registered in-process `EventHandler`s in deterministic order. In-process only; no
+message bus.
+
+### EventHandler
+**Port.** Interface for a focused handler that reacts to specific domain events using only
+injected ports (dependency inversion). Concrete handlers: `ReaperHandler`,
+`WaitNotifierHandler`, `RegistryPruneHandler`, `IntegrationTranslator`.
+
+### ReaperHandler
+**Handler.** On `ProcessExited`, reaps the process via `ProcessBackend` and yields
+`ProcessReaped`.
+
+### WaitNotifierHandler
+**Handler.** On `ProcessReaped`, wakes pending `wait(pid)` callers via `Waiters`.
+
+### RegistryPruneHandler
+**Handler.** On `ProcessReaped`/`ScopeClosed`, prunes bookkeeping and releases the scope's
+containment resource.
+
+### IntegrationTranslator
+**Handler.** Maps the externally-meaningful subset of domain events into `IntegrationEvent`s
+and publishes them via `IntegrationEventPublisher`.
+
+## Integration events
+
+### IntegrationEvent
+**Value Object (enum).** A lifecycle fact published across Shepherd's boundary to another
+bounded context (the consuming application's policy layer). Decoupled from internal
+invariants; delivery is bounded and lossy-tolerant.
+
+### IntegrationEventPublisher
+**Port (outbound).** Interface for publishing `IntegrationEvent`s to the consuming
+application. A slow/absent publisher never affects Shepherd's internal state.
+
 ## Ports (domain-owned traits)
 
 ### ProcessBackend
@@ -141,6 +179,10 @@ tests.
 
 ### OutputSink
 **Port.** Destination for drained stdout/stderr byte chunks.
+
+### Waiters
+**Port.** Registry that lets `wait(pid)` callers be woken when a process reaches its reaped
+terminal state.
 
 ## Repository
 
@@ -163,6 +205,9 @@ Typed error for failed reaping.
 
 ### ShutdownError
 Typed error for failed supervisor shutdown.
+
+### HandlerError
+Typed error surfaced by an `EventHandler`; logged via tracing and never swallowed.
 
 ### ScopeClosed
 Domain error returned when spawning into a Draining/Closed scope.

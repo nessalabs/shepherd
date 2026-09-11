@@ -328,3 +328,103 @@ flowchart TD
     P3 --> O3[CleanupUnverified DroppedWithoutShutdown]
     P4 --> O4[OS kills tree: JobObject KILL_ON_JOB_CLOSE / cgroup / PDEATHSIG]
 ```
+
+---
+
+## 7. Class diagram — event handling (domain vs integration)
+
+In-process **domain events** drive same-context handlers that depend only on ports;
+**integration events** cross Shepherd's boundary through an outbound, decoupled publisher.
+
+```mermaid
+classDiagram
+    class EventDispatcher {
+        <<Application Service (mediator)>>
+        -List handlers
+        +dispatch(events) Result
+    }
+    class EventHandler {
+        <<Port>>
+        +handle(event) Result~HandlerError~
+    }
+    class ReaperHandler {
+        <<Handler>>
+        -ProcessBackend backend
+        +handle(event) Result
+    }
+    class WaitNotifierHandler {
+        <<Handler>>
+        -Waiters waiters
+        +handle(event) Result
+    }
+    class RegistryPruneHandler {
+        <<Handler>>
+        -ScopeRegistry registry
+        +handle(event) Result
+    }
+    class IntegrationTranslator {
+        <<Handler>>
+        -IntegrationEventPublisher publisher
+        +handle(event) Result
+    }
+    class IntegrationEventPublisher {
+        <<Port (outbound)>>
+        +publish(IntegrationEvent)
+    }
+    class IntegrationEvent {
+        <<Value Object / enum>>
+        ProcessTerminated
+        ScopeTerminated
+    }
+
+    EventDispatcher o-- "*" EventHandler
+    ReaperHandler ..|> EventHandler
+    WaitNotifierHandler ..|> EventHandler
+    RegistryPruneHandler ..|> EventHandler
+    IntegrationTranslator ..|> EventHandler
+    ReaperHandler ..> ProcessBackend : depends on port
+    WaitNotifierHandler ..> Waiters : depends on port
+    RegistryPruneHandler ..> ScopeRegistry : depends on port
+    IntegrationTranslator ..> IntegrationEventPublisher : depends on port
+    IntegrationEventPublisher ..> IntegrationEvent : publishes
+    EventDispatcher ..> DomainEvent : routes
+```
+
+Notes:
+- All handlers depend on **ports**, never concretions (dependency inversion), so each is
+  isolated and testable with fakes; wiring/injection happens only in the facade.
+- `IntegrationTranslator` maps the externally-meaningful *subset* of domain events to
+  integration events. A slow/absent `IntegrationEventPublisher` cannot affect Shepherd's
+  internal invariants.
+
+---
+
+## 8. Sequence diagram — event dispatch (in-process domain events → optional integration)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant APP as ProcessSupervisor (app)
+    participant AGG as ProcessScope (aggregate)
+    participant D as EventDispatcher (mediator)
+    participant H1 as ReaperHandler
+    participant H2 as WaitNotifierHandler
+    participant H3 as RegistryPruneHandler
+    participant IT as IntegrationTranslator
+    participant PUB as IntegrationEventPublisher
+
+    APP->>AGG: record_exit(pid, raw)
+    AGG-->>APP: [ProcessExited]
+    Note over APP: transition committed under lock, then lock released
+    APP->>D: dispatch([ProcessExited])
+    D->>H1: handle(ProcessExited)
+    H1->>H1: backend.reap(os) -> [ProcessReaped]
+    H1-->>D: Ok
+    APP->>D: dispatch([ProcessReaped])
+    D->>H2: handle(ProcessReaped) -> wake wait(pid)
+    D->>H3: handle(ProcessReaped) -> prune + release resource
+    D->>IT: handle(ProcessReaped)
+    IT->>PUB: publish(ProcessTerminated)
+    Note over IT,PUB: bounded, lossy-tolerant; cannot stall Shepherd
+    Note over D: handler error -> typed HandlerError + tracing, never swallowed
+```
