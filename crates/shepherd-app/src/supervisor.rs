@@ -49,9 +49,41 @@ pub struct ShutdownReport {
 ///
 /// Cheaply cloneable (shares one inner state). Never a global singleton — construct and own
 /// it explicitly.
-#[derive(Clone)]
+///
+/// Cloning a supervisor keeps the same cleanup responsibility: only when the **last
+/// user-facing handle** is dropped (and `shutdown` was not awaited) does the RAII guard
+/// issue a synchronous hard-kill. Monitor tasks hold [`Inner`] only, so they cannot keep
+/// that guard alive and silently orphan children.
 pub struct ProcessSupervisor {
     inner: Arc<Inner>,
+    cleanup: Arc<CleanupGuard>,
+}
+
+impl Clone for ProcessSupervisor {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            cleanup: Arc::clone(&self.cleanup),
+        }
+    }
+}
+
+/// Drops with the last user-facing [`ProcessSupervisor`] handle and hard-kills remaining
+/// work. Shared with [`Inner::shutting_down`] so an explicit shutdown is not warned as a leak.
+struct CleanupGuard {
+    backend: Arc<dyn ProcessBackend>,
+    shutting_down: Arc<AtomicBool>,
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        if !self.shutting_down.load(Ordering::SeqCst) {
+            tracing::warn!(
+                "ProcessSupervisor dropped without shutdown; issuing unverified hard-kill"
+            );
+        }
+        self.backend.hard_kill_all();
+    }
 }
 
 struct Inner {
@@ -61,7 +93,7 @@ struct Inner {
     waiters: Arc<dyn Waiters>,
     dispatcher: EventDispatcher,
     spawn_times: Mutex<HashMap<ProcessId, Instant>>,
-    shutting_down: AtomicBool,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ProcessSupervisor {
@@ -82,6 +114,7 @@ impl ProcessSupervisor {
         publisher: Arc<dyn IntegrationEventPublisher>,
     ) -> Self {
         let registry: SharedRegistry = Arc::new(Mutex::new(ScopeRegistry::new()));
+        let shutting_down = Arc::new(AtomicBool::new(false));
         let handlers: Vec<Arc<dyn EventHandler>> = vec![
             Arc::new(WaitNotifierHandler::new(waiters.clone())),
             Arc::new(RegistryPruneHandler::new(registry.clone())),
@@ -90,12 +123,16 @@ impl ProcessSupervisor {
         Self {
             inner: Arc::new(Inner {
                 registry,
-                backend,
+                backend: Arc::clone(&backend),
                 clock,
                 waiters,
                 dispatcher: EventDispatcher::new(handlers),
                 spawn_times: Mutex::new(HashMap::new()),
-                shutting_down: AtomicBool::new(false),
+                shutting_down: Arc::clone(&shutting_down),
+            }),
+            cleanup: Arc::new(CleanupGuard {
+                backend,
+                shutting_down,
             }),
         }
     }
@@ -383,15 +420,7 @@ impl ProcessSupervisor {
     fn start_monitor(&self, scope: ProcessScopeId, pid: ProcessId, spawned: Spawned) {
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            let raw = inner
-                .backend
-                .wait(&spawned)
-                .await
-                .unwrap_or(shepherd_domain::RawExit {
-                    code: None,
-                    signal: None,
-                    core_dumped: false,
-                });
+            let wait_result = inner.backend.wait(&spawned).await;
             let events = {
                 let mut registry = inner.registry.lock().expect("registry mutex");
                 let Some(s) = registry.get_mut(scope) else {
@@ -400,13 +429,29 @@ impl ProcessSupervisor {
                 let Some(process) = s.get(pid) else {
                     return;
                 };
+                // A failed wait must never be reported as a verified exit: the process may
+                // still be running. Record CleanupUnverified so callers can branch, and leave
+                // OS-level bookkeeping to the backend / Drop hard-kill path.
+                let (raw, wait_failed) = match wait_result {
+                    Ok(raw) => (raw, false),
+                    Err(_) => (
+                        shepherd_domain::RawExit {
+                            code: None,
+                            signal: None,
+                            core_dumped: false,
+                        },
+                        true,
+                    ),
+                };
                 // Derive the outcome from what actually happened, not from whether an
                 // escalation was *attempted*: a process may exit gracefully in the window
                 // between the grace timer firing and this record, and a redundant SIGKILL to
                 // an already-dead process is a no-op.
                 let terminating = process.state().is_terminating();
                 let killed = raw.signal == Some(Signal::Kill);
-                let outcome = if !terminating {
+                let outcome = if wait_failed {
+                    TerminationOutcome::CleanupUnverified(UnverifiedReason::ReapFailed)
+                } else if !terminating {
                     TerminationOutcome::ExitedNaturally
                 } else if killed {
                     TerminationOutcome::ForcedRequired

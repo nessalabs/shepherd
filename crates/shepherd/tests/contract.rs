@@ -5,10 +5,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use shepherd::{
-    GracePeriod, NullBackend, ProcessSpec, SpawnError, SupervisorBuilder, TerminateOptions,
-    TerminationOutcome,
+    Capabilities, Containment, GracePeriod, NullBackend, ProcessBackend, ProcessSpec, SpawnError,
+    Spawned, StatsError, SupervisorBuilder, Support, TerminateError, TerminateOptions,
+    TerminationOutcome, UnverifiedReason, WaitError,
 };
+use shepherd_domain::{ProcessScopeId, RawExit, RawStats, Signal};
 
 fn supervisor() -> shepherd::ProcessSupervisor {
     SupervisorBuilder::new()
@@ -127,4 +130,74 @@ async fn shutdown_is_idempotent() {
     sup.shutdown().await.unwrap();
     // A second shutdown is a no-op that still succeeds.
     sup.shutdown().await.unwrap();
+}
+
+/// Backend whose `wait` always fails, to prove we never manufacture a verified exit.
+struct WaitFailsBackend {
+    inner: NullBackend,
+}
+
+#[async_trait]
+impl ProcessBackend for WaitFailsBackend {
+    async fn spawn(
+        &self,
+        scope: ProcessScopeId,
+        spec: &ProcessSpec,
+    ) -> Result<Spawned, SpawnError> {
+        self.inner.spawn(scope, spec).await
+    }
+
+    async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+        self.inner.signal(target, signal).await
+    }
+
+    async fn signal_scope(
+        &self,
+        scope: ProcessScopeId,
+        signal: Signal,
+    ) -> Result<(), TerminateError> {
+        self.inner.signal_scope(scope, signal).await
+    }
+
+    async fn wait(&self, _target: &Spawned) -> Result<RawExit, WaitError> {
+        Err(WaitError::Backend("lost child handle".into()))
+    }
+
+    async fn sample(&self, target: &Spawned) -> Result<RawStats, StatsError> {
+        self.inner.sample(target).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            descendant_containment: Containment::None,
+            cpu: Support::Unsupported,
+            rss: Support::Unsupported,
+            peak_rss: Support::Unsupported,
+            io: Support::Unsupported,
+            force_termination: true,
+        }
+    }
+
+    fn hard_kill_all(&self) {
+        self.inner.hard_kill_all();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_failure_is_cleanup_unverified() {
+    let sup = SupervisorBuilder::new()
+        .backend(Arc::new(WaitFailsBackend {
+            inner: NullBackend::new(),
+        }))
+        .build();
+    let scope = sup.create_scope();
+    let pid = sup
+        .spawn(scope, ProcessSpec::new("respect-graceful"))
+        .await
+        .unwrap();
+    let exit = sup.wait(pid).await.unwrap();
+    assert_eq!(
+        exit.outcome,
+        TerminationOutcome::CleanupUnverified(UnverifiedReason::ReapFailed)
+    );
 }

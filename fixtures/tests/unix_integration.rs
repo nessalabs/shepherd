@@ -114,3 +114,128 @@ async fn scope_termination_cleans_up_descendants() {
     let report = sup.terminate_scope(scope, short_opts()).await.unwrap();
     assert!(report.all_verified());
 }
+
+fn process_alive(os_pid: u32) -> bool {
+    // kill(pid, 0) is a liveness probe; ESRCH means the pid is gone.
+    unsafe { libc::kill(os_pid as i32, 0) == 0 }
+}
+
+fn spawn_sleep_writing_pid(pid_file: &std::path::Path) -> ProcessSpec {
+    ProcessSpec::new("sh").args([
+        "-c",
+        &format!("echo $$ > {}; exec sleep 3600", pid_file.display()),
+    ])
+}
+
+async fn read_os_pid(pid_file: &std::path::Path) -> u32 {
+    for _ in 0..50 {
+        if let Ok(text) = std::fs::read_to_string(pid_file) {
+            if let Ok(pid) = text.trim().parse::<u32>() {
+                return pid;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for pid file {}", pid_file.display());
+}
+
+#[tokio::test]
+async fn dropping_supervisor_hard_kills_running_children() {
+    let dir = std::env::temp_dir();
+    let pid_file = dir.join(format!("shepherd-drop-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pid_file);
+
+    let os_pid = {
+        let sup = SupervisorBuilder::new().build();
+        let scope = sup.create_scope();
+        let _pid = sup
+            .spawn(scope, spawn_sleep_writing_pid(&pid_file))
+            .await
+            .unwrap();
+        let os_pid = read_os_pid(&pid_file).await;
+        assert!(process_alive(os_pid), "child should be running before drop");
+        os_pid
+        // last supervisor handle drops here → CleanupGuard hard-kills
+    };
+
+    let mut gone = false;
+    for _ in 0..50 {
+        if !process_alive(os_pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = std::fs::remove_file(&pid_file);
+    assert!(gone, "dropped supervisor must SIGKILL remaining children");
+}
+
+#[tokio::test]
+async fn concurrent_first_spawns_share_one_process_group() {
+    let dir = std::env::temp_dir();
+    let a_file = dir.join(format!("shepherd-conc-a-{}.pid", std::process::id()));
+    let b_file = dir.join(format!("shepherd-conc-b-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&a_file);
+    let _ = std::fs::remove_file(&b_file);
+
+    let sup = SupervisorBuilder::new().build();
+    let scope = sup.create_scope();
+    let (ra, rb) = tokio::join!(
+        sup.spawn(scope, spawn_sleep_writing_pid(&a_file)),
+        sup.spawn(scope, spawn_sleep_writing_pid(&b_file)),
+    );
+    ra.unwrap();
+    rb.unwrap();
+
+    let os_a = read_os_pid(&a_file).await;
+    let os_b = read_os_pid(&b_file).await;
+    #[cfg(target_os = "linux")]
+    {
+        let pg_a = process_group(os_a);
+        let pg_b = process_group(os_b);
+        assert_eq!(
+            pg_a, pg_b,
+            "concurrent first spawns into an empty scope must share one process group"
+        );
+    }
+
+    let report = sup.terminate_scope(scope, short_opts()).await.unwrap();
+    assert!(report.all_verified());
+    let _ = std::fs::remove_file(&a_file);
+    let _ = std::fs::remove_file(&b_file);
+}
+
+#[cfg(target_os = "linux")]
+fn process_group(os_pid: u32) -> i32 {
+    let stat = std::fs::read_to_string(format!("/proc/{os_pid}/stat")).expect("stat");
+    let after = stat.rsplit_once(')').expect("comm").1;
+    after
+        .split_whitespace()
+        .nth(3)
+        .expect("pgrp")
+        .parse()
+        .expect("pgrp int")
+}
+
+#[tokio::test]
+async fn scope_can_be_reused_after_natural_exit() {
+    let sup = SupervisorBuilder::new().build();
+    let scope = sup.create_scope();
+    let first = sup
+        .spawn(
+            scope,
+            ProcessSpec::new(env!("CARGO_BIN_EXE_exit_code")).arg("0"),
+        )
+        .await
+        .unwrap();
+    let exit = sup.wait(first).await.unwrap();
+    assert_eq!(exit.outcome, TerminationOutcome::ExitedNaturally);
+
+    // The process group is now empty and must be forgotten so the next spawn can create one.
+    let second = sup
+        .spawn(scope, ProcessSpec::new(env!("CARGO_BIN_EXE_sleep_forever")))
+        .await
+        .expect("reusing an open scope after natural exit must succeed");
+    let exit = sup.terminate(second, short_opts()).await.unwrap();
+    assert!(exit.outcome.is_verified());
+}

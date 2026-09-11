@@ -110,6 +110,7 @@ dependencies = [
 name = "shepherd"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "shepherd-app",
  "shepherd-domain",
  "shepherd-infra",

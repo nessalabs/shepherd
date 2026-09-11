@@ -176,6 +176,13 @@ impl ProcessBackend for NullBackend {
             force_termination: true,
         }
     }
+
+    fn hard_kill_all(&self) {
+        let state = self.state.lock().expect("null backend mutex");
+        for proc in state.procs.values() {
+            NullBackend::deliver(proc, KILLED_EXIT);
+        }
+    }
 }
 
 fn apply_signal(proc: &NullProc, signal: Signal) {

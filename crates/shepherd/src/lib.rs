@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-pub use shepherd_app::ports::{IntegrationEventPublisher, ProcessBackend};
+pub use shepherd_app::ports::{IntegrationEventPublisher, ProcessBackend, Spawned};
 pub use shepherd_app::{
     HandlerError, ProcessSupervisor, ScopeTerminationReport, ShutdownError, ShutdownReport,
     SpawnError, StatsError, TerminateError, TerminateOptions, WaitError,

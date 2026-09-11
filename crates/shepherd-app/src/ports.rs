@@ -67,6 +67,13 @@ pub trait ProcessBackend: Send + Sync {
 
     /// The runtime-detected guarantees of this backend.
     fn capabilities(&self) -> Capabilities;
+
+    /// Synchronously hard-kills every process this backend still tracks.
+    ///
+    /// Invoked from [`Drop`](std::ops::Drop) of the last user-facing supervisor handle when
+    /// `shutdown` was not awaited. Must not block or `.await`. Idempotent: a second call, or
+    /// a call after an explicit shutdown, is a no-op.
+    fn hard_kill_all(&self);
 }
 
 /// Time source, so grace periods and uptime are deterministic in tests.
