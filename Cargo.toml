@@ -1,0 +1,16 @@
+[package]
+name = "shepherd"
+version = "0.1.0"
+edition = "2021"
+description = "Shepherd command-line application"
+license = "Apache-2.0"
+
+[[bin]]
+name = "shepherd"
+path = "src/main.rs"
+
+[lib]
+name = "shepherd"
+path = "src/lib.rs"
+
+[dependencies]

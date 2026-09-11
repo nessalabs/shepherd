@@ -1,0 +1,4 @@
+{
+  "name": "shepherd",
+  "install": "cargo fetch && cargo build --all-targets"
+}
