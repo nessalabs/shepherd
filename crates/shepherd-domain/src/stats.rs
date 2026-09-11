@@ -83,3 +83,50 @@ impl ProcessStats {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_raw_copies_every_field_and_adds_identity_and_uptime() {
+        let raw = RawStats {
+            cpu_usage: 0.5,
+            memory_rss_bytes: 2048,
+            virtual_memory_bytes: Some(4096),
+            peak_rss_bytes: Some(3000),
+            io_read_bytes: Some(10),
+            io_write_bytes: Some(20),
+            descendant_count: Some(2),
+            state: ProcessState::Sleeping,
+        };
+        let pid = ProcessId::new(9);
+        let stats = ProcessStats::from_raw(pid, raw, Duration::from_secs(3));
+        assert_eq!(stats.pid, pid);
+        assert_eq!(stats.cpu_usage, 0.5);
+        assert_eq!(stats.memory_rss_bytes, 2048);
+        assert_eq!(stats.virtual_memory_bytes, Some(4096));
+        assert_eq!(stats.peak_rss_bytes, Some(3000));
+        assert_eq!(stats.io_read_bytes, Some(10));
+        assert_eq!(stats.io_write_bytes, Some(20));
+        assert_eq!(stats.descendant_count, Some(2));
+        assert_eq!(stats.uptime, Duration::from_secs(3));
+        assert_eq!(stats.state, ProcessState::Sleeping);
+    }
+
+    #[test]
+    fn process_states_are_distinct() {
+        let all = [
+            ProcessState::Running,
+            ProcessState::Sleeping,
+            ProcessState::Stopped,
+            ProcessState::Zombie,
+            ProcessState::Unknown,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(i == j, a == b);
+            }
+        }
+    }
+}

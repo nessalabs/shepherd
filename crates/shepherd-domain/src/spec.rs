@@ -157,3 +157,76 @@ impl Default for OutputMode {
         Self::Discard
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_spec_has_sensible_defaults() {
+        let spec = ProcessSpec::new("prog");
+        assert_eq!(spec.program, OsString::from("prog"));
+        assert!(spec.args.is_empty());
+        assert_eq!(spec.env, EnvPolicy::Inherit);
+        assert_eq!(spec.cwd, None);
+        assert_eq!(spec.graceful_signal, Signal::Term);
+        assert_eq!(spec.output, OutputMode::Discard);
+    }
+
+    #[test]
+    fn builder_sets_every_field() {
+        let spec = ProcessSpec::new("prog")
+            .arg("one")
+            .args(["two", "three"])
+            .env(EnvPolicy::Clear(vec![(
+                OsString::from("K"),
+                OsString::from("V"),
+            )]))
+            .cwd("/tmp")
+            .graceful_signal(Signal::Interrupt)
+            .output(OutputMode::Capture {
+                buffer_bytes: 10,
+                tail_bytes: 5,
+            });
+        assert_eq!(
+            spec.args,
+            vec![
+                OsString::from("one"),
+                OsString::from("two"),
+                OsString::from("three")
+            ]
+        );
+        assert!(matches!(spec.env, EnvPolicy::Clear(_)));
+        assert_eq!(spec.cwd, Some(std::path::PathBuf::from("/tmp")));
+        assert_eq!(spec.graceful_signal, Signal::Interrupt);
+        assert!(matches!(spec.output, OutputMode::Capture { .. }));
+    }
+
+    #[test]
+    fn env_policy_variants() {
+        let overrides = EnvPolicy::Overrides(vec![
+            (OsString::from("A"), Some(OsString::from("1"))),
+            (OsString::from("B"), None),
+        ]);
+        assert!(matches!(overrides, EnvPolicy::Overrides(ref v) if v.len() == 2));
+    }
+
+    #[test]
+    fn signal_variants_are_distinct() {
+        assert_ne!(Signal::Term, Signal::Kill);
+        assert_ne!(Signal::Interrupt, Signal::Custom(9));
+        assert_eq!(Signal::Custom(3), Signal::Custom(3));
+    }
+
+    #[test]
+    fn grace_period_roundtrips_and_defaults() {
+        let g = GracePeriod::new(Duration::from_millis(250));
+        assert_eq!(g.as_duration(), Duration::from_millis(250));
+        assert_eq!(GracePeriod::default().as_duration(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn output_mode_default_is_discard() {
+        assert_eq!(OutputMode::default(), OutputMode::Discard);
+    }
+}

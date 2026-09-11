@@ -287,10 +287,7 @@ mod tests {
         let first = scope.request_termination(pid).unwrap();
         assert_eq!(first.len(), 1);
         let second = scope.request_termination(pid).unwrap();
-        assert!(
-            second.is_empty(),
-            "second request must not re-emit an event"
-        );
+        assert!(second.is_empty());
     }
 
     #[test]
@@ -335,6 +332,148 @@ mod tests {
         assert_eq!(
             scope.request_termination(missing).unwrap_err(),
             DomainError::UnknownProcess(missing)
+        );
+        assert_eq!(
+            scope.escalate_termination(missing).unwrap_err(),
+            DomainError::UnknownProcess(missing)
+        );
+        assert_eq!(
+            scope.record_exit(missing).unwrap_err(),
+            DomainError::UnknownProcess(missing)
+        );
+        assert_eq!(
+            scope
+                .record_reaped(missing, exit(missing, TerminationOutcome::Failed))
+                .unwrap_err(),
+            DomainError::UnknownProcess(missing)
+        );
+    }
+
+    #[test]
+    fn new_scope_is_open_and_empty() {
+        let scope = ProcessScope::new(ProcessScopeId::new(1));
+        assert!(scope.is_open());
+        assert!(!scope.is_closed());
+        assert!(scope.process_ids().is_empty());
+        assert!(scope.live_process_ids().is_empty());
+        assert!(!scope.has_live_processes());
+        assert_eq!(scope.get(ProcessId::new(1)), None);
+    }
+
+    #[test]
+    fn begin_scope_termination_is_idempotent() {
+        let mut scope = ProcessScope::new(ProcessScopeId::new(1));
+        let pid = ProcessId::new(10);
+        scope.attach_spawned(pid, os(100), spec()).unwrap();
+        let first = scope.begin_scope_termination();
+        assert_eq!(first.len(), 1);
+        let second = scope.begin_scope_termination();
+        assert!(second.is_empty());
+        assert_eq!(scope.state(), ScopeState::Draining);
+    }
+
+    #[test]
+    fn terminating_empty_scope_leaves_it_draining() {
+        let mut scope = ProcessScope::new(ProcessScopeId::new(1));
+        let events = scope.begin_scope_termination();
+        assert!(events.is_empty());
+        assert_eq!(scope.state(), ScopeState::Draining);
+        assert!(!scope.is_open());
+    }
+
+    #[test]
+    fn record_exit_is_idempotent() {
+        let mut scope = ProcessScope::new(ProcessScopeId::new(1));
+        let pid = ProcessId::new(10);
+        scope.attach_spawned(pid, os(100), spec()).unwrap();
+        assert_eq!(scope.record_exit(pid).unwrap().len(), 1);
+        assert!(scope.record_exit(pid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reap_event_is_emitted_at_most_once() {
+        // invariant #7
+        let mut scope = ProcessScope::new(ProcessScopeId::new(1));
+        let pid = ProcessId::new(10);
+        scope.attach_spawned(pid, os(100), spec()).unwrap();
+        let first = scope
+            .record_reaped(pid, exit(pid, TerminationOutcome::ForcedRequired))
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let second = scope
+            .record_reaped(pid, exit(pid, TerminationOutcome::ForcedRequired))
+            .unwrap();
+        assert!(second.is_empty(), "reaping twice emits no duplicate event");
+    }
+
+    #[test]
+    fn escalate_termination_succeeds_for_owned_process() {
+        let mut scope = ProcessScope::new(ProcessScopeId::new(1));
+        let pid = ProcessId::new(10);
+        scope.attach_spawned(pid, os(100), spec()).unwrap();
+        scope.escalate_termination(pid).unwrap();
+        assert!(scope.get(pid).unwrap().was_forced());
+    }
+
+    #[test]
+    fn terminating_a_scope_never_touches_another_scope() {
+        // invariant #5 at the aggregate level: a scope only ever holds its own processes.
+        let mut a = ProcessScope::new(ProcessScopeId::new(1));
+        let mut b = ProcessScope::new(ProcessScopeId::new(2));
+        let pa = ProcessId::new(10);
+        let pb = ProcessId::new(20);
+        a.attach_spawned(pa, os(100), spec()).unwrap();
+        b.attach_spawned(pb, os(200), spec()).unwrap();
+
+        a.begin_scope_termination();
+        // B is entirely unaffected: still open, still owns its live process.
+        assert!(b.is_open());
+        assert_eq!(b.live_process_ids(), vec![pb]);
+        assert!(!a.contains(pb));
+        assert!(!b.contains(pa));
+    }
+
+    #[test]
+    fn draining_scope_with_two_processes_closes_only_after_both_reaped() {
+        let mut scope = ProcessScope::new(ProcessScopeId::new(1));
+        let p1 = ProcessId::new(10);
+        let p2 = ProcessId::new(11);
+        scope.attach_spawned(p1, os(100), spec()).unwrap();
+        scope.attach_spawned(p2, os(101), spec()).unwrap();
+        scope.begin_scope_termination();
+
+        let e1 = scope
+            .record_reaped(p1, exit(p1, TerminationOutcome::GracefulSuccess))
+            .unwrap();
+        assert!(!e1
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ScopeClosed { .. })));
+        assert!(!scope.is_closed());
+
+        let e2 = scope
+            .record_reaped(p2, exit(p2, TerminationOutcome::GracefulSuccess))
+            .unwrap();
+        assert!(e2
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ScopeClosed { .. })));
+        assert!(scope.is_closed());
+    }
+
+    #[test]
+    fn closed_scope_rejects_new_spawns() {
+        let mut scope = ProcessScope::new(ProcessScopeId::new(1));
+        let pid = ProcessId::new(10);
+        scope.attach_spawned(pid, os(100), spec()).unwrap();
+        scope.begin_scope_termination();
+        scope
+            .record_reaped(pid, exit(pid, TerminationOutcome::GracefulSuccess))
+            .unwrap();
+        assert!(scope.is_closed());
+        assert_eq!(
+            scope
+                .attach_spawned(ProcessId::new(11), os(101), spec())
+                .unwrap_err(),
+            DomainError::ScopeClosed(scope.id())
         );
     }
 }

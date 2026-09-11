@@ -54,3 +54,36 @@ impl Support {
         matches!(self, Self::Supported)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_kernel_containers_contain_detached_children() {
+        assert!(Containment::CgroupV2.contains_detached());
+        assert!(Containment::JobObject.contains_detached());
+        assert!(!Containment::ProcessGroup.contains_detached());
+        assert!(!Containment::None.contains_detached());
+    }
+
+    #[test]
+    fn support_is_supported() {
+        assert!(Support::Supported.is_supported());
+        assert!(!Support::Unsupported.is_supported());
+    }
+
+    #[test]
+    fn capabilities_are_plain_values() {
+        let caps = Capabilities {
+            descendant_containment: Containment::CgroupV2,
+            cpu: Support::Supported,
+            rss: Support::Supported,
+            peak_rss: Support::Unsupported,
+            io: Support::Supported,
+            force_termination: true,
+        };
+        assert_eq!(caps, caps);
+        assert!(caps.descendant_containment.contains_detached());
+    }
+}

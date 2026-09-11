@@ -11,7 +11,7 @@ use crate::spec::ProcessSpec;
 /// An entity (identity = [`ProcessId`]) that lives inside exactly one
 /// [`ProcessScope`](crate::ProcessScope). Its fields are private: all mutation happens
 /// through methods, and transitions are idempotent where repetition must be safe.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Process {
     id: ProcessId,
     os: OsIdentity,
@@ -130,5 +130,98 @@ impl Process {
             }
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exit::TerminationOutcome;
+    use crate::ids::ProcessScopeId;
+    use crate::os::{OsIdentity, ReuseToken};
+    use crate::spec::ProcessSpec;
+
+    fn process() -> Process {
+        Process::running(
+            ProcessId::new(1),
+            OsIdentity::new(100, ReuseToken::StartTime(5)),
+            ProcessSpec::new("dummy"),
+        )
+    }
+
+    fn exit() -> ProcessExit {
+        ProcessExit {
+            pid: ProcessId::new(1),
+            code: Some(0),
+            signal: None,
+            outcome: TerminationOutcome::GracefulSuccess,
+            forced: false,
+        }
+    }
+
+    #[test]
+    fn running_process_exposes_its_identity_and_spec() {
+        let p = process();
+        assert_eq!(p.id(), ProcessId::new(1));
+        assert_eq!(p.os_identity().pid, 100);
+        assert_eq!(p.spec().program, std::ffi::OsString::from("dummy"));
+        assert_eq!(p.state(), ProcessLifecycle::Running);
+        assert!(!p.was_forced());
+        assert_eq!(p.exit(), None);
+        // ProcessScopeId is used only to keep the import meaningful in aggregate wiring.
+        let _ = ProcessScopeId::new(1);
+    }
+
+    #[test]
+    fn graceful_request_is_idempotent() {
+        let mut p = process();
+        assert!(p.request_graceful());
+        assert_eq!(p.state(), ProcessLifecycle::GracefulRequested);
+        assert!(!p.request_graceful(), "second graceful request is a no-op");
+    }
+
+    #[test]
+    fn escalation_sets_forced_and_is_idempotent() {
+        let mut p = process();
+        assert!(p.escalate_to_force());
+        assert_eq!(p.state(), ProcessLifecycle::Forcing);
+        assert!(p.was_forced());
+        assert!(!p.escalate_to_force());
+    }
+
+    #[test]
+    fn escalation_from_graceful() {
+        let mut p = process();
+        p.request_graceful();
+        assert!(p.escalate_to_force());
+        assert_eq!(p.state(), ProcessLifecycle::Forcing);
+    }
+
+    #[test]
+    fn mark_exited_then_reaped() {
+        let mut p = process();
+        assert!(p.mark_exited());
+        assert_eq!(p.state(), ProcessLifecycle::ExitedUnreaped);
+        assert!(!p.mark_exited(), "already exited");
+        assert!(p.mark_reaped(exit()));
+        assert_eq!(p.state(), ProcessLifecycle::Reaped);
+        assert_eq!(p.exit(), Some(exit()));
+        assert!(!p.mark_reaped(exit()), "already reaped");
+    }
+
+    #[test]
+    fn reaping_directly_from_running_is_allowed() {
+        let mut p = process();
+        assert!(p.mark_reaped(exit()));
+        assert_eq!(p.state(), ProcessLifecycle::Reaped);
+    }
+
+    #[test]
+    fn terminal_process_rejects_further_transitions() {
+        let mut p = process();
+        p.mark_reaped(exit());
+        assert!(!p.request_graceful());
+        assert!(!p.escalate_to_force());
+        assert!(!p.mark_exited());
     }
 }

@@ -77,3 +77,50 @@ pub struct ProcessExit {
     /// Whether force was required.
     pub forced: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verified_outcomes_are_the_success_variants() {
+        assert!(TerminationOutcome::ExitedNaturally.is_verified());
+        assert!(TerminationOutcome::GracefulSuccess.is_verified());
+        assert!(TerminationOutcome::ForcedRequired.is_verified());
+    }
+
+    #[test]
+    fn failure_and_unverified_outcomes_are_not_verified() {
+        assert!(!TerminationOutcome::Failed.is_verified());
+        for reason in [
+            UnverifiedReason::DroppedWithoutShutdown,
+            UnverifiedReason::RuntimeShutdown,
+            UnverifiedReason::WaitTimedOut {
+                waited: Duration::from_secs(1),
+            },
+            UnverifiedReason::ReapFailed,
+            UnverifiedReason::ProcessDisappeared,
+        ] {
+            assert!(!TerminationOutcome::CleanupUnverified(reason).is_verified());
+        }
+    }
+
+    #[test]
+    fn process_exit_and_raw_exit_are_values() {
+        let raw = RawExit {
+            code: Some(1),
+            signal: None,
+            core_dumped: false,
+        };
+        assert_eq!(raw.code, Some(1));
+        let exit = ProcessExit {
+            pid: ProcessId::new(1),
+            code: Some(0),
+            signal: Some(Signal::Term),
+            outcome: TerminationOutcome::GracefulSuccess,
+            forced: false,
+        };
+        assert_eq!(exit, exit);
+        assert!(exit.outcome.is_verified());
+    }
+}

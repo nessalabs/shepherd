@@ -92,3 +92,72 @@ impl ScopeState {
         matches!(self, Self::Open)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL_PROCESS: [ProcessLifecycle; 7] = [
+        ProcessLifecycle::Spawning,
+        ProcessLifecycle::Running,
+        ProcessLifecycle::GracefulRequested,
+        ProcessLifecycle::Forcing,
+        ProcessLifecycle::ExitedUnreaped,
+        ProcessLifecycle::Reaped,
+        ProcessLifecycle::SpawnFailed,
+    ];
+
+    #[test]
+    fn process_state_names_are_stable_and_unique() {
+        let names: Vec<_> = ALL_PROCESS.iter().map(|s| s.name()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Spawning",
+                "Running",
+                "GracefulRequested",
+                "Forcing",
+                "ExitedUnreaped",
+                "Reaped",
+                "SpawnFailed",
+            ]
+        );
+    }
+
+    #[test]
+    fn liveness_classification() {
+        use ProcessLifecycle::*;
+        for state in ALL_PROCESS {
+            let live = matches!(state, Spawning | Running | GracefulRequested | Forcing);
+            assert_eq!(state.is_live(), live);
+        }
+    }
+
+    #[test]
+    fn terminal_classification() {
+        use ProcessLifecycle::*;
+        for state in ALL_PROCESS {
+            let terminal = matches!(state, Reaped | SpawnFailed);
+            assert_eq!(state.is_terminal(), terminal);
+        }
+    }
+
+    #[test]
+    fn terminating_classification() {
+        use ProcessLifecycle::*;
+        for state in ALL_PROCESS {
+            let terminating = matches!(state, GracefulRequested | Forcing);
+            assert_eq!(state.is_terminating(), terminating);
+        }
+    }
+
+    #[test]
+    fn scope_states() {
+        assert_eq!(ScopeState::Open.name(), "Open");
+        assert_eq!(ScopeState::Draining.name(), "Draining");
+        assert_eq!(ScopeState::Closed.name(), "Closed");
+        assert!(ScopeState::Open.accepts_processes());
+        assert!(!ScopeState::Draining.accepts_processes());
+        assert!(!ScopeState::Closed.accepts_processes());
+    }
+}

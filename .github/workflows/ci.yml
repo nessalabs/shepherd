@@ -41,6 +41,20 @@ jobs:
         working-directory: tools/ddd-arch-check
         run: node --experimental-strip-types check.ts
 
+  domain-coverage:
+    name: domain coverage (100% lines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Enforce 100% line coverage for the pure domain
+        run: cargo llvm-cov -p shepherd-domain --fail-under-lines 100
+
   test:
     name: test (${{ matrix.os }})
     strategy:
