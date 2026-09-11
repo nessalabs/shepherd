@@ -1,16 +1,27 @@
-[package]
-name = "shepherd"
+[workspace]
+resolver = "2"
+members = [
+    "crates/shepherd-domain",
+    "crates/shepherd-app",
+    "crates/shepherd-infra",
+    "crates/shepherd",
+    "fixtures",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Shepherd command-line application"
+rust-version = "1.83"
 license = "Apache-2.0"
+repository = "https://github.com/nessalabs/shepherd"
 
-[[bin]]
-name = "shepherd"
-path = "src/main.rs"
+[workspace.dependencies]
+shepherd-domain = { path = "crates/shepherd-domain" }
+shepherd-app = { path = "crates/shepherd-app" }
+shepherd-infra = { path = "crates/shepherd-infra" }
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
 
-[lib]
-name = "shepherd"
-path = "src/lib.rs"
-
-[dependencies]
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
