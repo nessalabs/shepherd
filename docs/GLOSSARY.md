@@ -104,6 +104,21 @@ maps to Job Object soft-close / terminate semantics.
 containment strength, and support for CPU / RSS / peak RSS / I/O stats and force
 termination. Guarantees are values, never prose.
 
+### Containment
+**Value Object (enum).** The mechanism enforcing whole-tree cleanup, and thus how strong
+containment is: cgroup v2, Job Object, POSIX process group, or none.
+
+### Support
+**Value Object (enum).** Whether a particular statistic is supported by a backend.
+
+### RawStats
+**Value Object.** A raw resource sample produced by a backend, before the supervisor adds
+identity and uptime to form a `ProcessStats`.
+
+### RawExit
+**Value Object.** Raw exit information reported by a backend after a process is reaped
+(code, terminating signal, core-dump flag).
+
 ### ScopeTerminationReport
 **Value Object.** The aggregated per-process `TerminationOutcome`s produced by
 `terminate_scope`.
@@ -112,6 +127,10 @@ termination. Guarantees are values, never prose.
 **Value Object.** The aggregated result of `shutdown` across all scopes.
 
 ## Domain events
+
+### DomainEvent
+**Domain Event (enum).** The umbrella type of in-process facts returned by aggregate
+transitions and dispatched to same-context handlers.
 
 ### ProcessSpawned
 **Domain Event.** A process was successfully spawned into a scope.
@@ -217,3 +236,10 @@ Domain error for an unknown `ProcessId`.
 
 ### UnknownScope
 Domain error for an unknown `ProcessScopeId`.
+
+### DomainError
+The umbrella pure-domain error enum (scope closed, unknown process/scope, invalid
+transition). Contains no I/O errors.
+
+### InvalidTransition
+A domain error indicating an illegal lifecycle transition was attempted.

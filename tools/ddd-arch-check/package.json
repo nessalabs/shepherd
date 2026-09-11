@@ -1,0 +1,9 @@
+{
+  "name": "ddd-arch-check",
+  "private": true,
+  "type": "module",
+  "description": "DDD architecture fitness functions for Shepherd (dependency boundary, domain purity, ubiquitous-language coverage).",
+  "scripts": {
+    "check": "node --experimental-strip-types check.ts"
+  }
+}
