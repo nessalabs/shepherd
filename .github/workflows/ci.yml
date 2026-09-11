@@ -19,7 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pin to the MSRV so clippy is reproducible and matches local development; newer stable
+      # clippy adds lints that would otherwise fail CI non-deterministically.
+      - uses: dtolnay/rust-toolchain@1.83.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2

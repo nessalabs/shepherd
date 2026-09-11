@@ -138,9 +138,10 @@ impl Default for GracePeriod {
 }
 
 /// How stdout/stderr are handled. Bytes only; never assumes UTF-8.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
     /// Drain and discard output.
+    #[default]
     Discard,
     /// Drain into a bounded queue (drop-oldest on overflow) the caller consumes, and keep a
     /// capped tail for post-mortem.
@@ -150,12 +151,6 @@ pub enum OutputMode {
         /// Maximum bytes retained for the post-mortem tail.
         tail_bytes: usize,
     },
-}
-
-impl Default for OutputMode {
-    fn default() -> Self {
-        Self::Discard
-    }
 }
 
 #[cfg(test)]
