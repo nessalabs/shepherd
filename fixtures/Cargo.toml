@@ -1,0 +1,18 @@
+[package]
+name = "shepherd-fixtures"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Pathological helper binaries used by Shepherd's test suite. Not published."
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+shepherd = { path = "../crates/shepherd" }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true
