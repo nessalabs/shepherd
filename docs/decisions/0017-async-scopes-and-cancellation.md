@@ -31,13 +31,18 @@ Lookup history retains the most recent 256 verified completed scope reports. Pen
 and failed/unverified cleanup reports are not evicted. A receiver registered before
 completion retains its result even after the lookup history expires that scope ID;
 new lookups of expired verified scopes return UnknownScope. A separate observer
-awaits the cleanup worker's JoinHandle and publishes TerminateError on worker panic;
-a retained sender can therefore never hide a cleanup panic as a permanently pending
-report while the runtime remains running.
+awaits the cleanup worker's JoinHandle and publishes TerminateError only on worker
+failure. Normal results and verified-history eviction are published by the cleanup
+worker before it returns, with no intervening await. A completed worker therefore
+cannot lose its report if the runtime stops before the JoinHandle observer runs;
+a retained sender also cannot hide a worker panic while the runtime remains running.
 
 Spawns run in owned application workers so cancellation cannot interrupt the
 backend-spawn-to-monitor ownership handoff. Scope operations serialize cleanup
 against an admitted spawn; the guard worker waits for any such spawn to complete.
+Scope creation holds the registry mutex through operation-lock insertion, so a
+concurrent shutdown cannot observe a registered scope without its serialization
+lock. The shared lock order is registry before the operation-lock map.
 Operation locks are allocated only for created scopes and removed after verified
 cleanup, after publishing the cached report. Queued callers recheck that report
 under the retained operation lock; completed or unknown lookups do not recreate

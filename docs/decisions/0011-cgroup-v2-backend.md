@@ -16,6 +16,10 @@ Each scope has one cgroup. Open cgroup.procs in the parent and write `0` in the
 child's async-signal-safe pre_exec hook before user code can fork or call setsid.
 A post-spawn move would leave an escape window. Failed membership fails exec.
 Application scope operations serialize spawn against scope cleanup.
+The registry entry and operation lock are published atomically under the registry
+lock. Unknown IDs never allocate operation locks; verified cleanup removes its
+lock, and cached completion lookups do not recreate it. Unverified scopes retain
+their lock so cleanup retries remain serialized.
 
 Require cgroup.kill and exercise it on an empty probe. A PID sweep on older
 kernels cannot make the same atomic guarantee against concurrent forks, so those
@@ -38,6 +42,11 @@ verified completion removes it and retains only the bounded final report.
 ScopeClosed delivery is deferred until that verified commit, including for empty
 scopes. The corresponding ScopeTerminated publication is scheduled once, remains
 best effort, and holds only event handlers, never supervisor/backend ownership.
+All integration publication uses one lazy worker and a 64-event queue. Enqueue
+never waits; overflow is dropped, and each publication has a one-second timeout.
+This bounds retained events and prevents a stalled publisher from retaining one
+deferred task per completed scope. Dropping the last sender lets the worker drain
+the bounded queue and release the publisher; it never holds a sender itself.
 Root children are separately waited and reaped. Descendant zombies belong to their
 OS parent/reaper; emptiness means no live descendant, not that Shepherd can wait
 for arbitrary non-child processes. Tests use a subreaper to verify their reaping.
