@@ -685,9 +685,20 @@ impl ProcessSupervisor {
         {
             return Ok(report);
         }
-        let operation = self
-            .scope_operation(scope)
-            .ok_or(TerminateError::UnknownScope(scope))?;
+        let operation = match self.scope_operation(scope) {
+            Some(operation) => operation,
+            None => {
+                // Cleanup may have published and removed its lock since our first read.
+                return self
+                    .inner
+                    .reports
+                    .lock()
+                    .expect("reports mutex")
+                    .get(&scope)
+                    .cloned()
+                    .ok_or(TerminateError::UnknownScope(scope));
+            }
+        };
         let _serial = operation.lock().await;
         if let Some(report) = self
             .inner
