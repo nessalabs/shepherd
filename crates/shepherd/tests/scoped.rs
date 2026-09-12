@@ -63,7 +63,8 @@ async fn abort_closure_still_yields_verified_cleanup_report() {
     assert!(report.all_verified());
     assert!(supervisor.wait(pid).await.unwrap().outcome.is_verified());
 }
-#[tokio::test]
+// Virtual time orders cancellation before grace expiry even on a stalled CI runner.
+#[tokio::test(start_paused = true)]
 async fn dropping_with_scope_future_cleans_up_but_dropping_terminate_does_not() {
     let supervisor = sup();
     let (tx, rx) = tokio::sync::oneshot::channel();

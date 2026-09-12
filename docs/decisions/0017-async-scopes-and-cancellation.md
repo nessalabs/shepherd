@@ -43,3 +43,8 @@ scope lifetime; subsequent spawn is rejected after block cleanup.
 Verified cancellation requires a running runtime and cooperative backend ports.
 Abrupt runtime/process shutdown cannot await or return verified cleanup; OS limits
 and fallback behavior remain explicit. No claim of async Drop is made.
+
+The in-memory terminate-cancellation test uses Tokio's paused clock: cancellation
+occurs at 5 ms, before 20 ms grace expiry, then the unchanged liveness assertion
+observes another 50 ms. Wall-clock scheduler delays must not let force escalation
+occur before the cancellation being tested. Real-process tests retain real time.
