@@ -91,7 +91,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build privileged tests as runner
-        run: cargo test -p shepherd-fixtures --test cgroup_integration --no-run --message-format=json > cgroup-artifacts.json
+        run: |
+          cargo test -p shepherd-fixtures --test cgroup_integration --no-run --message-format=json > cgroup-artifacts.json
+          cargo test -p shepherd-infra --lib --no-run --message-format=json > cgroup-backstop-artifacts.json
       - name: Exercise real cgroup v2 (fail closed)
         run: |
           set -euo pipefail
@@ -101,6 +103,9 @@ jobs:
           test_bin=$(python3 -c 'import json; rows=[json.loads(line) for line in open("cgroup-artifacts.json")]; print(next(r["executable"] for r in rows if r.get("target", {}).get("name") == "cgroup_integration" and r.get("executable")))')
           test -n "$test_bin"
           sudo env SHEPHERD_CGROUP_ROOT=/sys/fs/cgroup/shepherd-ci "$test_bin" --ignored --test-threads=1 --nocapture
+          backstop_bin=$(python3 -c 'import json; rows=[json.loads(line) for line in open("cgroup-backstop-artifacts.json")]; print(next(r["executable"] for r in rows if r.get("target", {}).get("name") == "shepherd_infra" and r.get("executable")))')
+          test -n "$backstop_bin"
+          sudo env SHEPHERD_CGROUP_ROOT=/sys/fs/cgroup/shepherd-ci "$backstop_bin" cgroup_backstop_tests --ignored --test-threads=1 --nocapture
 
   resource:
     name: cached stats + real resource observations (${{ matrix.os }})

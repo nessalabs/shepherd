@@ -60,6 +60,10 @@ for arbitrary non-child processes. Tests use a subreaper to verify their reaping
 `Capabilities` is available on the supervisor. Stats support is unchanged in this
 phase. Process-group cleanup remains best effort and cannot verify escaped trees.
 Cgroups do not automatically kill on supervisor SIGKILL; no such backstop is claimed.
+If a synchronous cgroup kill write fails, the Unix backstop also signals that
+scope's registered roots through their retained pidfds (or checked reuse tokens).
+The all-scope backstop does this for every failed cgroup. This salvages root
+termination only: it never turns a failed containment sweep into verified cleanup.
 
 Prerequisite fixes: preserve backend wait errors, retain waiter exits even before
 subscription, start monitors before dispatch, and propagate final sweep failures.
