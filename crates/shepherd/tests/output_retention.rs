@@ -135,3 +135,47 @@ async fn unclaimed_capture_preserves_live_unverified_and_transferred_observers()
     // the synchronous kill backstop for the fake process still tracked by the backend.
     drop(sup);
 }
+
+struct GatedPublisher {
+    gate: tokio::sync::Semaphore,
+    calls: AtomicUsize,
+}
+#[async_trait]
+impl shepherd::IntegrationEventPublisher for GatedPublisher {
+    async fn publish(&self, _: shepherd_domain::IntegrationEvent) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let _permit = self.gate.acquire().await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_publication_cannot_bypass_completed_capture_bound() {
+    let backend = Arc::new(CapturingBackend::default());
+    let publisher = Arc::new(GatedPublisher {
+        gate: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+    });
+    let sup = SupervisorBuilder::new()
+        .backend(backend.clone())
+        .integration_publisher(publisher.clone())
+        .build();
+    let scope = sup.create_scope();
+    let mut first = None;
+    for _ in 0..320 {
+        let pid = sup
+            .spawn(scope, ProcessSpec::new("exit-immediately"))
+            .await
+            .unwrap();
+        first.get_or_insert(pid);
+        sup.wait(pid).await.unwrap();
+    }
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(publisher.calls.load(Ordering::SeqCst) > 0);
+    // Keep the publisher blocked while checking actual observer destruction.
+    assert_eq!(backend.retained.load(Ordering::SeqCst), 256);
+    assert!(sup.take_output(first.unwrap()).is_none());
+    publisher.gate.add_permits(1);
+    sup.shutdown().await.unwrap();
+}
