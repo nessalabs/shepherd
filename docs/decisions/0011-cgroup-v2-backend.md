@@ -16,6 +16,10 @@ Each scope has one cgroup. Open cgroup.procs in the parent and write `0` in the
 child's async-signal-safe pre_exec hook before user code can fork or call setsid.
 A post-spawn move would leave an escape window. Failed membership fails exec.
 Application scope operations serialize spawn against scope cleanup.
+The registry entry and operation lock are published atomically under the registry
+lock. Unknown IDs never allocate operation locks; verified cleanup removes its
+lock, and cached completion lookups do not recreate it. Unverified scopes retain
+their lock so cleanup retries remain serialized.
 
 Require cgroup.kill and exercise it on an empty probe. A PID sweep on older
 kernels cannot make the same atomic guarantee against concurrent forks, so those
