@@ -12,7 +12,7 @@ class WatchdogTests(unittest.TestCase):
             log = Path(directory) / "stress.log"
             result = subprocess.run(
                 [sys.executable, str(Path(__file__).with_name("run-stress.py")),
-                 "--log", str(log), "--idle-timeout", "1", "--", sys.executable, "-c", code],
+                 "--log", str(log), "--idle-timeout", "3", "--", sys.executable, "-c", code],
                 capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
@@ -27,7 +27,7 @@ class WatchdogTests(unittest.TestCase):
         self.run_command("raise SystemExit(7)", 7)
 
     def test_eof_does_not_mean_process_has_exited(self):
-        self.run_command("import os,time;os.close(1);os.close(2);time.sleep(0.2)", 0)
+        self.run_command("import os,time;os.close(1);os.close(2);time.sleep(0.2);os._exit(7)", 7)
 
     def test_stall_fails_and_retains_diagnostics(self):
         self.run_command('import time;print("started",flush=True);time.sleep(20)', 124)

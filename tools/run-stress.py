@@ -41,6 +41,7 @@ def main():
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command or args.idle_timeout <= 0 or args.overall_timeout <= 0:
         parser.error("provide a command and positive timeouts")
+    log_file = args.log.open("w", encoding="utf-8")
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                text=True, encoding="utf-8", errors="replace", bufsize=1,
                                start_new_session=sys.platform != "win32")
@@ -54,7 +55,7 @@ def main():
     threading.Thread(target=read, daemon=True).start()
     started = last_output = time.monotonic()
     eof = False
-    with args.log.open("w", encoding="utf-8") as log:
+    with log_file as log:
         while True:
             if eof and process.poll() is not None:
                 return process.returncode
