@@ -865,7 +865,7 @@ fn kill_registered_roots(state: &State, scope: Option<ProcessScopeId>) {
     for ((pid, token), slot) in state
         .children
         .iter()
-        .filter(|(_, slot)| scope.map_or(true, |scope| slot.scope == scope))
+        .filter(|(_, slot)| scope.is_none_or(|scope| slot.scope == scope))
     {
         #[cfg(target_os = "linux")]
         if let Some(fd) = &slot.pidfd {
