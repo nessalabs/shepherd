@@ -1,6 +1,7 @@
 //! Portable retention regression with fake capture observers and no OS processes.
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use shepherd::{
@@ -34,6 +35,7 @@ impl OutputSink for Capture {
 struct CapturingBackend {
     inner: NullBackend,
     retained: Arc<AtomicUsize>,
+    failed_reaps: Mutex<HashSet<u32>>,
 }
 #[async_trait]
 impl ProcessBackend for CapturingBackend {
@@ -42,7 +44,11 @@ impl ProcessBackend for CapturingBackend {
         scope: ProcessScopeId,
         spec: &ProcessSpec,
     ) -> Result<Spawned, SpawnError> {
-        self.inner.spawn(scope, spec).await
+        let spawned = self.inner.spawn(scope, spec).await?;
+        if spec.program == "wait-fails" {
+            self.failed_reaps.lock().unwrap().insert(spawned.os.pid);
+        }
+        Ok(spawned)
     }
     async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
         self.inner.signal(target, signal).await
@@ -55,6 +61,9 @@ impl ProcessBackend for CapturingBackend {
         self.inner.signal_scope(scope, signal).await
     }
     async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
+        if self.failed_reaps.lock().unwrap().contains(&target.os.pid) {
+            return Err(WaitError::Backend("injected reap failure".into()));
+        }
         self.inner.wait(target).await
     }
     async fn sample(&self, target: &Spawned) -> Result<RawStats, StatsError> {
@@ -73,7 +82,7 @@ impl ProcessBackend for CapturingBackend {
 }
 
 #[tokio::test(start_paused = true)]
-async fn unclaimed_capture_is_bounded_without_evicting_live_or_transferred_observers() {
+async fn unclaimed_capture_preserves_live_unverified_and_transferred_observers() {
     let backend = Arc::new(CapturingBackend::default());
     let sup = SupervisorBuilder::new().backend(backend.clone()).build();
     let scope = sup.create_scope();
@@ -81,6 +90,11 @@ async fn unclaimed_capture_is_bounded_without_evicting_live_or_transferred_obser
         .spawn(scope, ProcessSpec::new("respect-graceful"))
         .await
         .unwrap();
+    let unverified = sup
+        .spawn(scope, ProcessSpec::new("wait-fails"))
+        .await
+        .unwrap();
+    assert!(!sup.wait(unverified).await.unwrap().outcome.is_verified());
     let transferred = sup
         .spawn(scope, ProcessSpec::new("exit-immediately"))
         .await
@@ -100,7 +114,7 @@ async fn unclaimed_capture_is_bounded_without_evicting_live_or_transferred_obser
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
-    assert_eq!(backend.retained.load(Ordering::SeqCst), 256 + 2);
+    assert_eq!(backend.retained.load(Ordering::SeqCst), 256 + 3);
     for pid in &completed[..64] {
         assert!(sup.take_output(*pid).is_none());
     }
@@ -108,9 +122,16 @@ async fn unclaimed_capture_is_bounded_without_evicting_live_or_transferred_obser
         assert!(sup.take_output(*pid).is_some());
     }
     assert!(sup.take_output(live).is_some());
+    assert_eq!(backend.retained.load(Ordering::SeqCst), 2);
+    assert!(
+        sup.take_output(unverified).is_some(),
+        "failed reap capture must remain available"
+    );
     assert_eq!(backend.retained.load(Ordering::SeqCst), 1);
     assert!(observer.read().errors.is_empty());
     drop(observer);
     assert_eq!(backend.retained.load(Ordering::SeqCst), 0);
-    sup.shutdown().await.unwrap();
+    // The injected reap failure cannot become verified cleanup; owner Drop supplies
+    // the synchronous kill backstop for the fake process still tracked by the backend.
+    drop(sup);
 }

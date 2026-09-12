@@ -271,7 +271,7 @@ impl ProcessSupervisor {
 
     /// Transfers the capture observer to the caller, at most once per process.
     /// Call after spawn, or after wait for post-mortem output. Unclaimed observers
-    /// are retained for the most recent 256 completed processes.
+    /// are retained for the most recent 256 verified completed processes.
     pub fn take_output(&self, pid: ProcessId) -> Option<crate::output::ProcessOutput> {
         self.inner
             .outputs
@@ -560,6 +560,7 @@ impl ProcessSupervisor {
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let wait_result = inner.backend.wait(&spawned).await;
+            let verified_reap = wait_result.is_ok();
             let events = {
                 let mut registry = inner.registry.lock().expect("registry mutex");
                 let Some(s) = registry.get_mut(scope) else {
@@ -610,7 +611,9 @@ impl ProcessSupervisor {
             };
             inner.samples.lock().expect("samples mutex").remove(&pid);
             inner.dispatcher.dispatch(&events).await;
-            {
+            // A failed reap may leave a live producer behind this observer. Only
+            // verified completions are eligible for bounded post-mortem eviction.
+            if verified_reap {
                 let mut completed = inner.completed.lock().expect("completed mutex");
                 completed.push_back(pid);
                 while completed.len() > 256 {
