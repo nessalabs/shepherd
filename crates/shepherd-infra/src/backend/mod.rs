@@ -10,3 +10,6 @@ pub use unix::UnixProcessBackend;
 
 #[cfg(target_os = "linux")]
 mod cgroup;
+
+#[cfg(unix)]
+mod sampling;
