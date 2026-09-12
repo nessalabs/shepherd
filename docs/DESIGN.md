@@ -1,6 +1,6 @@
 # Shepherd — Design & Implementation Plan
 
-> Status: **Implemented; final hardening CI validation in progress**. This document is the source of
+> Status: **Implemented and validated through §18**. This document is the source of
 > truth for the architecture. Companion documents:
 >
 > - `[DIAGRAMS.md](./DIAGRAMS.md)` — class and state diagrams.
@@ -500,7 +500,7 @@ Status legend: ✅ done · 🚧 partial · ⬜ planned.
 4. ✅ **Stats sampler** — one shared cached sampler, Linux CPU/RSS/I/O, resource fixtures/tests (ADR 0013). Platform extensions follow in item 6.
 5. ✅ **Output plumbing** — bounded byte queue + tail capture + output-stress tests (ADR 0014).
 6. ✅ **macOS + Windows backends** — real runtime tests passed on all OSes ([CI 34674491652](https://github.com/nessalabs/shepherd/actions/runs/34674491652)); ADRs 0015–0016.
-7. 🚧 **Hardening** — property/loom/stress/race suites, quarantine and bounded history implemented; 2,000 local resource cycles passed; final CI pending.
+7. ✅ **Hardening** — property/loom/stress/race suites, quarantine and bounded history; all 18 final CI jobs and 2,000 resource cycles on each OS passed. See [VALIDATION.md](./VALIDATION.md) for runtime evidence and limits.
 
 Also ✅: `with_scope` async scope guard, including cancellation reports (ADR 0017).
 

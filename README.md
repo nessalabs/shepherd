@@ -5,8 +5,8 @@ A reusable, production-quality **process supervision** library for Rust. Shepher
 resource observation — and leaves *policy* to the caller.
 
 > Status: platform adapters, cached statistics, and bounded byte capture are implemented.
-> Async scopes and adversarial hardening are implemented; final CI evidence is tracked in
-> [VALIDATION.md](docs/VALIDATION.md). Platform limits are exposed explicitly.
+> Async scopes and adversarial hardening passed CI and 2,000 lifecycle cycles on each OS.
+> [VALIDATION.md](docs/VALIDATION.md) records the evidence and explicit platform limits.
 
 ## The core invariant
 

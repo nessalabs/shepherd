@@ -69,8 +69,26 @@ SHEPHERD_STRESS_ITERATIONS=2000 cargo test -p shepherd-fixtures --test leak_stre
 
 The manual stress workflow runs long loops on Linux, macOS and Windows. Privileged
 cgroup prerequisites and a fail-closed command are in ADR 0012. Final Phase F CI and
-manual stress execution are pending at this document revision; they must be recorded
-before the hardening checkbox is closed.
+manual stress execution both passed on implementation commit
+`0e88cbb5e9937140decf7a6c04bbc4789c53b1a8`:
+
+- [Final implementation CI](https://github.com/nessalabs/shepherd/actions/runs/34675344960):
+  all 18 jobs passed, including privileged cgroup containment, all three real platform
+  backends, output/resource/leak tests, property/loom suites, MSRV lint, DDD fitness,
+  and 100% domain line coverage.
+- [Manual 2,000-cycle stress](https://github.com/nessalabs/shepherd/actions/runs/34675403510):
+  all three OS jobs passed with unchanged descriptor/handle counts:
+
+| Platform | Before | After | Cycles |
+| --- | ---: | ---: | ---: |
+| Linux | 12 | 12 | 2,000 |
+| macOS | 17 | 17 | 2,000 |
+| Windows | 89 | 89 | 2,000 |
+
+The Unix jobs found no owned zombies; Windows additionally exercises Job Object
+active-process verification. These are measured runtime results, not inferred from
+cross-compilation. All ten skeptical-review items are satisfied within the explicit
+OS and runtime limits below; this document and OWNERSHIP.md supply the final review.
 
 ## OS limits
 
