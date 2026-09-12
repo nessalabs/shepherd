@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Shepherd application layer: supervisor, dispatcher, handlers, and ports."
 
 [dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 shepherd-domain = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
