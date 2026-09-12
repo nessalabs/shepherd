@@ -17,3 +17,6 @@ pub use publisher::{BroadcastIntegrationPublisher, NoopIntegrationPublisher};
 pub use waiters::InMemoryWaiters;
 
 mod output;
+
+#[cfg(windows)]
+pub use backend::WindowsJobBackend;

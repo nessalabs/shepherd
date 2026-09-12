@@ -389,19 +389,25 @@ like "memory > 2 GB", "CPU > 95% for 10 min", "tree unexpectedly growing".
 `Capabilities` value. Guarantees are values, never prose lies.
 
 
-| Capability                            | Linux (cgroup v2)   | Linux (fallback)       | macOS         | Windows              |
-| ------------------------------------- | ------------------- | ---------------------- | ------------- | -------------------- |
-| Root process tracking                 | yes                 | yes                    | yes           | yes                  |
-| Descendant cleanup                    | yes (`cgroup.kill`) | best-effort (`killpg`) | best-effort   | yes (Job Object)     |
-| Detached-child (`setsid`) containment | **yes**             | **no**                 | **no**        | **yes**              |
-| CPU stats                             | yes                 | yes                    | yes (libproc) | yes                  |
-| RSS stats                             | yes                 | yes                    | yes           | yes                  |
-| Peak RSS                              | yes                 | yes (`VmHWM`)          | limited       | yes                  |
-| I/O stats                             | yes (`io.stat`)     | per-proc               | limited       | yes (Job accounting) |
-| Force termination                     | yes                 | yes                    | yes           | yes                  |
+| Capability | Linux (cgroup v2) | Linux (fallback) | macOS | Windows |
+| --- | --- | --- | --- | --- |
+| Root tracking/reap | yes | yes | yes | yes |
+| Descendant cleanup | cgroup.kill + populated=0 | best-effort killpg | best-effort killpg | Job termination + ActiveProcesses=0 |
+| Detached containment | yes | no | no | yes |
+| CPU | /proc tick deltas | /proc tick deltas | libproc + Mach conversion | GetProcessTimes |
+| RSS | /proc status | /proc status | libproc | working set |
+| Peak RSS | /proc VmHWM | /proc VmHWM | Unsupported | peak working set |
+| I/O | per-root physical /proc bytes | per-root physical /proc bytes | Unsupported | per-root logical transfer bytes |
+| Force termination | yes | yes | yes | yes |
+| Descendant-count observation | None | None | None | None |
+
+Stats are cached per-root samples, not scope totals. CPU 1.0 means one core.
+Windows graceful signals are Unsupported as typed signal errors; natural exit can
+still occur during grace. There is no abrupt-death cgroup backstop. Windows job
+close protection begins at assignment; suspended-create setup has a crash window.
 
 
-The table is finalized against the *actual* implementation before 1.0. macOS never claims
+The table describes the actual adapters; runtime test evidence is recorded per phase. macOS never claims
 cgroup/Job-Object-level containment.
 
 ### 10.1 Invariants (executable)
@@ -492,7 +498,7 @@ Status legend: ✅ done · 🚧 partial · ⬜ planned.
    detached-child containment) is implemented ([0011](./decisions/0011-cgroup-v2-backend.md)); privileged runtime tests passed in [CI run 34674051633](https://github.com/nessalabs/shepherd/actions/runs/34674051633).
 4. ✅ **Stats sampler** — one shared cached sampler, Linux CPU/RSS/I/O, resource fixtures/tests (ADR 0013). Platform extensions follow in item 6.
 5. ✅ **Output plumbing** — bounded byte queue + tail capture + output-stress tests (ADR 0014).
-6. ⬜ **macOS + Windows backends** — validated via CI.
+6. 🚧 **macOS + Windows backends** — implemented (ADRs 0015–0016); Windows runtime CI pending.
 7. ⬜ **Hardening** — property/`loom`/stress/race suites; finalize the guarantee table.
 
 Also ⬜: the `with_scope` async scope guard (§7.3).

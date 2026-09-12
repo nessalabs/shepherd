@@ -24,3 +24,5 @@ they do not replace that document.
 | [0012](./0012-privileged-cgroup-ci.md) | Hosted privileged cgroup tests fail closed |
 | [0013](./0013-shared-cached-statistics.md) | Shared sampler, cached observations, real per-root CPU |
 | [0014](./0014-bounded-byte-output.md) | Bounded combined byte queue, capped tail, transferable observer |
+| [0015](./0015-macos-libproc-observations.md) | macOS libproc stats and Mach time conversion |
+| [0016](./0016-windows-job-object-backend.md) | Windows Job Object containment before execution |

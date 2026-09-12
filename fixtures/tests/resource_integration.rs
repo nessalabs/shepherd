@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 use shepherd::{ProcessSpec, StatsError, SupervisorBuilder, TerminateOptions};
 use std::time::Duration;
 
@@ -93,7 +93,7 @@ async fn real_cpu_and_rss_move() {
         .all_verified());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[tokio::test]
 async fn real_io_counters_increase() {
     let sup = SupervisorBuilder::new()

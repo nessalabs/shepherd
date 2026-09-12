@@ -55,7 +55,7 @@ struct ScopeGroup {
 #[derive(Default)]
 struct State {
     children: HashMap<ChildKey, ChildSlot>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     cpu_samples: HashMap<ChildKey, (std::time::Instant, u64)>,
     scope_groups: HashMap<ProcessScopeId, ScopeGroup>,
     /// Serializes spawns per scope so the first process creates exactly one process group.
@@ -443,7 +443,7 @@ impl ProcessBackend for UnixProcessBackend {
             .expect("unix backend mutex")
             .children
             .remove(&key);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.state
             .lock()
             .expect("unix backend mutex")
@@ -514,6 +514,44 @@ impl ProcessBackend for UnixProcessBackend {
                 .unwrap_or(0.0) as f32;
             RawStats { cpu_usage, ..raw }
         };
+        #[cfg(target_os = "macos")]
+        let raw = {
+            let task =
+                libproc::proc_pid::pidinfo::<libproc::task_info::TaskInfo>(target.os.pid as i32, 0)
+                    .map_err(StatsError::Backend)?;
+            let mut timebase = mach2::mach_time::mach_timebase_info_data_t { numer: 0, denom: 0 };
+            // TaskInfo reports Mach absolute time units, not nanoseconds on ARM.
+            if unsafe { mach2::mach_time::mach_timebase_info(&mut timebase) } != 0
+                || timebase.denom == 0
+            {
+                return Err(StatsError::Backend("invalid Mach timebase".into()));
+            }
+            let ticks = ((task.pti_total_user as u128 + task.pti_total_system as u128)
+                * timebase.numer as u128
+                / timebase.denom as u128)
+                .min(u64::MAX as u128) as u64;
+            let now = std::time::Instant::now();
+            let mut state = self.state.lock().expect("unix backend mutex");
+            if !state.children.contains_key(&child_key(&target.os)) {
+                return Err(StatsError::Backend("child reaped during sample".into()));
+            }
+            let previous = state
+                .cpu_samples
+                .insert(child_key(&target.os), (now, ticks));
+            let cpu_usage = previous
+                .map(|(time, old)| {
+                    ticks.saturating_sub(old) as f64
+                        / 1e9
+                        / now.duration_since(time).as_secs_f64().max(1e-9)
+                })
+                .unwrap_or(0.0) as f32;
+            RawStats {
+                cpu_usage,
+                memory_rss_bytes: task.pti_resident_size,
+                virtual_memory_bytes: Some(task.pti_virtual_size),
+                ..raw
+            }
+        };
         if !identity_still_matches(&target.os) {
             return Err(StatsError::Backend("child changed during sample".into()));
         }
@@ -535,7 +573,7 @@ impl ProcessBackend for UnixProcessBackend {
             cpu: cpu_support(),
             rss: rss_support(),
             peak_rss: peak_support(),
-            io: cpu_support(),
+            io: io_support(),
             force_termination: true,
         }
     }
@@ -654,21 +692,30 @@ fn pidfd_kill(fd: i32, signal: NixSignal) -> Result<(), TerminateError> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn cpu_support() -> Support {
     Support::Supported
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn cpu_support() -> Support {
     Support::Unsupported
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rss_support() -> Support {
     Support::Supported
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn rss_support() -> Support {
+    Support::Unsupported
+}
+
+#[cfg(target_os = "linux")]
+fn io_support() -> Support {
+    Support::Supported
+}
+#[cfg(not(target_os = "linux"))]
+fn io_support() -> Support {
     Support::Unsupported
 }
 
@@ -688,7 +735,16 @@ fn read_start_time(pid: u32) -> Option<u64> {
     let after_comm = stat.rsplit_once(')')?.1;
     after_comm.split_whitespace().nth(19)?.parse().ok()
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn read_start_time(pid: u32) -> Option<u64> {
+    let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid as i32, 0).ok()?;
+    Some(
+        info.pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec),
+    )
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_start_time(_pid: u32) -> Option<u64> {
     None
 }

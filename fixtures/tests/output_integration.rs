@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 use shepherd::{
     GracePeriod, OutputMode, OutputStream, ProcessSpec, SupervisorBuilder, TerminateOptions,
 };
@@ -107,7 +107,13 @@ async fn discard_has_no_pipe_backpressure() {
     assert!(sup.take_output(pid).is_none());
     assert!(tokio::time::timeout(
         Duration::from_secs(3),
-        sup.terminate_scope(scope, TerminateOptions::default())
+        sup.terminate_scope(
+            scope,
+            TerminateOptions {
+                grace: GracePeriod::new(Duration::from_millis(50)),
+                force_timeout: Some(Duration::from_secs(2))
+            }
+        )
     )
     .await
     .unwrap()

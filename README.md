@@ -4,10 +4,9 @@ A reusable, production-quality **process supervision** library for Rust. Shepher
 *mechanism* — spawning, ownership by explicit scopes, verified termination, reaping, and
 resource observation — and leaves *policy* to the caller.
 
-> Status: early implementation. The pure domain, application orchestration, a deterministic
-> test backend, and a real Unix (process-group) backend are in place and tested. Linux
-> cgroup v2 is implemented with privileged tests; macOS statistics and Windows backends, plus streaming stats and output plumbing, remain on
-> the roadmap (see [`docs/DESIGN.md`](docs/DESIGN.md)).
+> Status: platform adapters, cached statistics, and bounded byte capture are implemented.
+> Cancellation guards and adversarial hardening are still in progress. See the design and
+> phase PRs for evidence; platform limits are exposed explicitly.
 
 ## The core invariant
 
@@ -68,13 +67,14 @@ cargo fmt --all --check                                  # format
 
 ## Platform guarantees (current)
 
-| Capability | Linux (cgroup v2 when usable; else process group) | macOS | Windows |
+| Capability | Linux cgroup v2 / fallback | macOS | Windows |
 | --- | --- | --- | --- |
-| Root process tracking | yes | yes | (null backend) |
-| Descendant cleanup | `cgroup.kill` with emptiness verification; fallback best-effort (`killpg`) | best-effort | — |
-| Force termination | yes | yes | — |
-| RSS / peak RSS stats | yes (cached `/proc`) | — | — |
-| CPU / I/O stats | yes (cached per-root counters) | — | — |
+| Roots waited/reaped | yes | yes | yes |
+| Detached containment | yes / no | no | yes (Job Object) |
+| Force cleanup | cgroup.kill / best-effort killpg | best-effort killpg | Job Object |
+| Cached CPU / RSS | yes | yes (libproc) | yes (process handles) |
+| Cached peak RSS / I/O | yes | Unsupported | yes |
+
 
 Guarantees are reported at runtime through the `Capabilities` type. See the design doc for
 the full target matrix (including Linux cgroup v2, Windows Job Objects, and honest macOS

@@ -58,7 +58,7 @@ jobs:
         run: cargo llvm-cov -p shepherd-domain --fail-under-lines 100
 
   test:
-    name: test (${{ matrix.os }})
+    name: contract + real platform backends + docs (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
