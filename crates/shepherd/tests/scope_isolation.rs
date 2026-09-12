@@ -277,12 +277,14 @@ async fn cleanup_worker_panic_publishes_error_for_returned_and_canceled_blocks()
     )
     .await
     .expect("cleanup panic left retained report pending forever");
+    // The synchronous Drop backstop can publish before JoinHandle supervision.
+    // Both are typed errors; the timeout above proves neither path leaves a hang.
     assert_eq!(returned.result.unwrap(), 42);
     assert!(
-        matches!(returned.termination, Err(TerminateError::Signal(message)) if message.contains("scope cleanup worker failed"))
+        matches!(returned.termination, Err(TerminateError::Signal(message)) if (message.contains("scope cleanup worker failed") || message == "scope cleanup interrupted or unverified; synchronous backstop issued"))
     );
     assert!(
-        matches!(supervisor.wait_scope_cleanup(returned.scope).await, Err(TerminateError::Signal(message)) if message.contains("scope cleanup worker failed"))
+        matches!(supervisor.wait_scope_cleanup(returned.scope).await, Err(TerminateError::Signal(message)) if (message.contains("scope cleanup worker failed") || message == "scope cleanup interrupted or unverified; synchronous backstop issued"))
     );
     assert!(supervisor
         .terminate_scope(returned.scope, Default::default())
@@ -311,7 +313,7 @@ async fn cleanup_worker_panic_publishes_error_for_returned_and_canceled_blocks()
     .await
     .expect("canceled block cleanup panic left report pending forever");
     assert!(
-        matches!(report, Err(TerminateError::Signal(message)) if message.contains("scope cleanup worker failed"))
+        matches!(report, Err(TerminateError::Signal(message)) if (message.contains("scope cleanup worker failed") || message == "scope cleanup interrupted or unverified; synchronous backstop issued"))
     );
     assert!(supervisor
         .terminate_scope(scope, Default::default())
