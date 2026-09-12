@@ -21,7 +21,11 @@ drops, per-stream closure flags and reader errors without awaiting new bytes. Th
 observer retains only output state, never the child or supervisor ownership guard.
 
 Discard connects both streams to the OS null device: there is no pipe that can fill.
-Capture readers continue even when no caller consumes output. Following root reap,
+Capture readers continue even when no caller consumes output. The waiter publishes
+the root exit immediately after OS reap, independently of pipe completion. A
+completed wait/termination does not imply output EOF; callers needing all retained
+bytes must continue consuming snapshots until both stream closure flags are true.
+The existing waiter task still owns reader finishing. Following root reap,
 each reader has a 100 ms completion budget; an inherited pipe still open afterwards
 is aborted and reported explicitly. This can truncate descendant output, but avoids
 an escaped or long-lived descendant holding cleanup open indefinitely. Reader failure
