@@ -46,10 +46,10 @@ honesty, resource observation, and an adversarial test suite.
 
 | Concern                                                               | Reused primitive                                                                              |
 | --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| Async spawn, process group (Unix), Job Object (Windows), kill-on-drop | `[process-wrap](https://docs.rs/process-wrap)` (Tokio frontend) — **deferred this phase**; Unix uses `tokio::process` + `nix` ([0006](./decisions/0006-direct-tokio-process-nix.md)) |
-| Linux cgroup v2 (create, place, `cgroup.kill`, controller stats)      | `[cgroups-rs](https://crates.io/crates/cgroups-rs)` (with a direct `/sys/fs/cgroup` fallback) — **deferred**; process-group backend ships first |
-| pidfd, signals, `pre_exec`, `clone3`, `waitpid`                       | `nix` / `rustix`                                                                              |
-| Per-process `/proc` stats (Linux)                                     | `procfs` or direct reads                                                                      |
+| Async spawn, process group (Unix), Job Object (Windows), kill-on-drop | `tokio::process` + `nix` on Unix; `windows-sys` Job Objects on Windows. `process-wrap` remains deferred ([0006](./decisions/0006-direct-tokio-process-nix.md), [0016](./decisions/0016-windows-job-object-backend.md)) |
+| Linux cgroup v2 (create, place, `cgroup.kill`, controller stats)      | Direct kernel cgroup v2 filesystem interface; `cgroups-rs` remains deferred ([0011](./decisions/0011-cgroup-v2-backend.md)) |
+| pidfd, signals, `pre_exec`, `clone3`, `waitpid`                       | `nix` / `libc`                                                                              |
+| Per-process `/proc` stats (Linux)                                     | Direct `/proc` reads                                                                      |
 | Job Object accounting/stats (Windows)                                 | `windows-sys`                                                                                 |
 | Process stats (macOS)                                                 | `libproc`                                                                                     |
 | Async runtime                                                         | `tokio`                                                                                       |
@@ -64,7 +64,7 @@ honesty, resource observation, and an adversarial test suite.
 `process-wrap` provides **process groups** (Unix) and **Job Objects** (Windows). A bare
 process group is *not* sufficient containment: a descendant that calls `setsid()` escapes
 it. On **Linux** we therefore add a **cgroup v2** layer for the strong guarantee, attached
-as a composable `process-wrap` `CommandWrapper` (no forking of the crate). On **Windows**
+before exec through the direct adapter (ADR 0011); `process-wrap` remains deferred. On **Windows**
 the Job Object already provides the strong guarantee. On **macOS** no cgroup / Job-Object
 equivalent exists without privileged entitlements, so macOS is process-group + explicit
 bookkeeping, and **says so through the** `Capabilities` **type** (see §9).
@@ -72,7 +72,7 @@ bookkeeping, and **says so through the** `Capabilities` **type** (see §9).
 ## 3. Domain-Driven Design (hard requirement, enforced)
 
 DDD is a **graded requirement enforced in CI**, not a style preference. The domain is a
-**pure crate** with a denylisted dependency closure, so "the domain is isolated from
+**pure crate** with a positively allowlisted dependency closure, so "the domain is isolated from
 infrastructure" is a build-graph fact, not a convention.
 
 ### 3.1 Bounded context & layering (hexagonal / ports & adapters)
@@ -93,12 +93,12 @@ owns the driven ports** (`ProcessBackend`, `Clock`, `Waiters`, `OutputSink`, `Ev
 > **Design note — where the ports live.** The ports are **application-owned driven ports**,
 > not domain traits. The driven ports are inherently async (spawn/wait/reap, sleep, publish)
 > and require trait objects, which would pull `async-trait`/runtime concerns into the domain.
-> Keeping them in `shepherd-app` lets `shepherd-domain` stay a zero-dependency, zero-async,
+> Keeping them in `shepherd-app` lets `shepherd-domain` keep only `thiserror` and stay an async-free,
 > synchronous core — the strongest possible purity guarantee, enforced by the
 > `ddd-architecture` CI job. This is a deliberate refinement of the original "domain-owned
 > ports" sketch.
-- `shepherd-infra`**.** Adapters implementing the domain ports: `cgroups-rs`,
-`process-wrap`, `nix`, `windows-sys`, `libproc`, the clock, the stats sampler, output
+- `shepherd-infra`**.** Adapters implementing the application-owned ports: direct cgroup filesystem access,
+`tokio::process`, `nix`, `windows-sys`, `libproc`, the clock, OS statistics and output
 plumbing. This is the **Anti-Corruption Layer**: it translates OS concepts (pids, cgroup
 files, job handles, signals) into domain terms.
 - `shepherd` **(facade).** Wires `app` + `infra`, re-exports the public API. This is what
@@ -210,7 +210,7 @@ This also resolves the earlier subscription question: internal domain events + h
 crates/
   shepherd-domain/     # PURE domain (entities, VOs, aggregates, events, errors) — no ports, no async
   shepherd-app/        # application services / use-cases, driven ports, async orchestration
-  shepherd-infra/      # adapters: cgroups-rs, process-wrap, nix, windows-sys, libproc
+  shepherd-infra/      # adapters: cgroup filesystem, tokio::process, nix, windows-sys, libproc
   shepherd/            # public facade: wires app + infra, re-exports API
 fixtures/              # non-published pathological helper binaries (workspace member)
 tools/ddd-arch-check/  # TypeScript fitness functions
@@ -377,7 +377,7 @@ Output plumbing never blocks termination; on kill, readers stop cleanly even mid
 
 - **A single shared sampler task per supervisor** (not one thread per process) walks live
 processes every configurable `stats_interval`, caches the latest `ProcessStats` per
-process; `stats(pid)` returns the last cached sample. Optional on-demand fresh read.
+process; `stats(pid)` returns the last cached sample. No on-demand fresh-read API is exposed (ADR 0013).
 - Designed so **hundreds of processes remain reasonable**.
 - Shepherd exposes **observations, not policy** — enough for a caller to implement rules
 like "memory > 2 GB", "CPU > 95% for 10 min", "tree unexpectedly growing".
@@ -386,7 +386,7 @@ like "memory > 2 GB", "CPU > 95% for 10 min", "tree unexpectedly growing".
 
 ## 10. Platform implementations & capability honesty
 
-`ProcessBackend` is the domain port; each platform is an adapter returning a runtime
+`ProcessBackend` is an application-owned port; each platform is an adapter returning a runtime
 `Capabilities` value. Guarantees are values, never prose lies.
 
 
@@ -519,12 +519,12 @@ Closed in this implementation (see `docs/decisions/`):
 
 
 
-## 17. Known limitations (current plan)
+## 17. Known limitations
 
 - macOS containment is weaker than Linux/Windows (no cgroups/Job Objects without privileged
 entitlements); surfaced via `Capabilities` and documented.
-- cgroup `cgroup.kill` requires Linux ≥ 5.14; older kernels fall back to sweeping
-`cgroup.procs` with per-pid `SIGKILL`.
+- cgroup `cgroup.kill` requires Linux ≥ 5.14; hosts without a working kill interface
+report ProcessGroup. A per-PID sweep cannot provide the same atomic guarantee (ADR 0011).
 - Hosted CI runners may not permit privileged cgroup operations; covered by a separate job.
 
 
@@ -539,7 +539,7 @@ faked.
 Phase A implementation note: Linux defaults to cgroup v2 only after a real filesystem
 and kill-interface probe; otherwise ProcessGroup. Kernel versions without cgroup.kill
 use the fallback. A cgroup does not kill its members merely because its creator dies.
-The table above remains the target until the later platform/stats phases land.
+The §10 table describes the implemented adapters and their runtime capabilities.
 
 
 ## Implementation refinements and final review
