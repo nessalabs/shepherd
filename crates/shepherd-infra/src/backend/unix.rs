@@ -40,6 +40,8 @@ type ExitChannels = (
 struct ChildSlot {
     output: Option<shepherd_app::output::ProcessOutput>,
     sampling: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(target_os = "linux")]
+    scope: ProcessScopeId,
     sender: watch::Sender<Option<Result<RawExit, String>>>,
     // Retain a receiver so the waiter task's `send` is never lost if it fires before the
     // supervisor's monitor subscribes.
@@ -218,6 +220,8 @@ impl UnixProcessBackend {
             ChildSlot {
                 output,
                 sampling: Arc::default(),
+                #[cfg(target_os = "linux")]
+                scope,
                 sender: channels.0,
                 _keep: channels.1,
                 #[cfg(target_os = "linux")]
@@ -567,7 +571,11 @@ impl ProcessBackend for UnixProcessBackend {
     fn hard_kill_all(&self) {
         #[cfg(target_os = "linux")]
         if let Some(cgroups) = &self.cgroups {
-            cgroups.kill_all();
+            let failed = cgroups.kill_all();
+            let state = self.state.lock().expect("unix backend mutex");
+            for scope in failed {
+                kill_registered_roots(&state, scope);
+            }
             return;
         }
         let groups: Vec<i32> = self
@@ -809,5 +817,87 @@ mod tests {
             .await
             .expect("late wait must not lose a reaped child");
         assert_eq!(exit.code, Some(0));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kill_registered_roots(state: &State, scope: ProcessScopeId) {
+    for ((pid, token), slot) in state
+        .children
+        .iter()
+        .filter(|(_, slot)| slot.scope == scope)
+    {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &slot.pidfd {
+            let _ = pidfd_kill(fd.as_raw_fd(), NixSignal::SIGKILL);
+            continue;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = slot;
+        if *token != 0 && read_start_time(*pid) == Some(*token) {
+            let _ = kill(Pid::from_raw(*pid as i32), Some(NixSignal::SIGKILL));
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod cgroup_backstop_tests {
+    use super::*;
+    use std::fs::File;
+    use std::time::Duration;
+
+    async fn failed_kill_file_preserves_root_backstop() {
+        let delegated = std::env::var_os("SHEPHERD_CGROUP_ROOT")
+            .expect("set a writable delegated cgroup v2 ancestor");
+        let backend = UnixProcessBackend::with_cgroup_root(delegated).unwrap();
+        let scope = ProcessScopeId::new(1);
+        let other = ProcessScopeId::new(2);
+        let spec = ProcessSpec::new("/bin/sleep").arg("30");
+        let root = backend.spawn(scope, &spec).await.unwrap();
+        let survivor = backend.spawn(other, &spec).await.unwrap();
+        assert!(
+            backend.state.lock().unwrap().children[&child_key(&root.os)]
+                .pidfd
+                .is_some(),
+            "privileged Linux regression requires a real pidfd"
+        );
+        let cgroups = backend.cgroups.as_ref().unwrap();
+        // Inject an actual write error into the retained descriptor; normal cgroup
+        // creation, membership, the OS child, and its pidfd are all real.
+        let saved = cgroups.replace_kill_file(scope, File::open("/dev/null").unwrap());
+        assert_eq!(
+            cgroups.kill(scope).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        backend.hard_kill_all();
+        let exit = tokio::time::timeout(Duration::from_secs(5), backend.wait(&root))
+            .await
+            .expect("failed cgroup write abandoned its registered root")
+            .unwrap();
+        assert_eq!(exit.signal, Some(Signal::Kill));
+        // Root reap does not establish descendant containment. The failed cgroup
+        // interface must still cause explicit cleanup to return an error.
+        assert!(backend.cleanup_scope(scope).await.is_err());
+        assert_eq!(
+            backend.capabilities().descendant_containment,
+            Containment::CgroupV2
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), backend.wait(&survivor))
+                .await
+                .unwrap()
+                .unwrap()
+                .signal,
+            Some(Signal::Kill)
+        );
+        backend.cleanup_scope(other).await.unwrap();
+        drop(cgroups.replace_kill_file(scope, saved));
+        backend.cleanup_scope(scope).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires delegated cgroup v2; privileged CI runs this fail-closed"]
+    async fn all_backstop_kills_roots_when_one_cgroup_write_fails() {
+        failed_kill_file_preserves_root_backstop().await;
     }
 }
