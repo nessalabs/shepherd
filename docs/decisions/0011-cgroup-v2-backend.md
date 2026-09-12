@@ -68,3 +68,9 @@ Cgroups do not automatically kill on supervisor SIGKILL; no such backstop is cla
 
 Prerequisite fixes: preserve backend wait errors, retain waiter exits even before
 subscription, start monitors before dispatch, and propagate final sweep failures.
+
+The synchronous global drop backstop attempts every retained `cgroup.kill` descriptor.
+If a write fails, it also kills that scope's registered roots using retained pidfds or
+matching start-time identities. This root fallback does not verify descendant cleanup;
+explicit cleanup still reports the cgroup failure. Privileged CI injects a failed retained
+descriptor and checks real root kill/reap alongside another healthy scope.
