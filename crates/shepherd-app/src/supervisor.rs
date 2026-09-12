@@ -115,6 +115,20 @@ struct Inner {
     shutdown_serial: tokio::sync::Mutex<()>,
 }
 
+// Claims and completion share this lock order; only retained captures consume history.
+fn retain_completed_output(inner: &Inner, pid: ProcessId) {
+    let mut completed = inner.completed.lock().expect("completed mutex");
+    let mut outputs = inner.outputs.lock().expect("outputs mutex");
+    if outputs.contains_key(&pid) && !completed.contains(&pid) {
+        completed.push_back(pid);
+        while completed.len() > 256 {
+            if let Some(old) = completed.pop_front() {
+                outputs.remove(&old);
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for ProcessSupervisor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProcessSupervisor")
@@ -674,6 +688,7 @@ impl ProcessSupervisor {
                     }
                 }
             }
+            retain_completed_output(&self.inner, pid);
             // Publish the correction before cancellation can interrupt dispatch/prune.
             // The Waiters contract prevents a delayed old failure from downgrading it.
             self.inner.waiters.signal_exit(pid, exit);
@@ -1017,17 +1032,7 @@ impl ProcessSupervisor {
             // A failed reap may leave a live producer behind this observer. Only
             // verified completions are eligible for bounded post-mortem eviction.
             if verified_reap {
-                let mut completed = inner.completed.lock().expect("completed mutex");
-                let mut outputs = inner.outputs.lock().expect("outputs mutex");
-                // Discarded or already claimed output consumes no observer history.
-                if outputs.contains_key(&pid) {
-                    completed.push_back(pid);
-                    while completed.len() > 256 {
-                        if let Some(old) = completed.pop_front() {
-                            outputs.remove(&old);
-                        }
-                    }
-                }
+                retain_completed_output(&inner, pid);
             }
             inner.dispatcher.dispatch(&events).await;
             inner

@@ -248,3 +248,40 @@ async fn discard_and_claimed_output_do_not_consume_unclaimed_capture_history() {
     assert!(sup.take_output(first).is_none());
     sup.shutdown().await.unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn recovered_wait_failures_retire_actual_capture_history() {
+    let backend = Arc::new(CapturingBackend::default());
+    let sup = SupervisorBuilder::new().backend(backend.clone()).build();
+    let scope = sup.create_scope();
+    let mut roots = Vec::new();
+    for _ in 0..300 {
+        let pid = sup.spawn(scope, capture_spec("wait-fails")).await.unwrap();
+        assert!(!sup.wait(pid).await.unwrap().outcome.is_verified());
+        roots.push(pid);
+    }
+    assert_eq!(backend.retained.load(Ordering::SeqCst), 300);
+    backend.failed_reaps.lock().unwrap().clear();
+    for pid in &roots {
+        assert!(sup
+            .terminate(*pid, Default::default())
+            .await
+            .unwrap()
+            .outcome
+            .is_verified());
+    }
+    assert_eq!(backend.retained.load(Ordering::SeqCst), 256);
+    assert!(sup.take_output(roots[0]).is_none());
+    let last = sup.take_output(*roots.last().unwrap()).unwrap();
+    assert!(sup
+        .terminate(*roots.last().unwrap(), Default::default())
+        .await
+        .unwrap()
+        .outcome
+        .is_verified());
+    drop(last);
+    assert_eq!(backend.retained.load(Ordering::SeqCst), 255);
+    sup.terminate_scope(scope, Default::default())
+        .await
+        .unwrap();
+}
