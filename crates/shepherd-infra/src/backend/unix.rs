@@ -103,6 +103,7 @@ impl Drop for AnchorWait {
 struct ScopeGroup {
     pgid: i32,
     live: usize,
+    wait_failed: bool,
 }
 
 #[derive(Default)]
@@ -373,9 +374,14 @@ impl UnixProcessBackend {
                 kill_issued: false,
             },
         );
-        state
-            .scope_groups
-            .insert(scope, ScopeGroup { pgid, live: 0 });
+        state.scope_groups.insert(
+            scope,
+            ScopeGroup {
+                pgid,
+                live: 0,
+                wait_failed: false,
+            },
+        );
         Ok(())
     }
 
@@ -403,15 +409,25 @@ impl UnixProcessBackend {
         );
         let pgid = i32::try_from(os.pid).unwrap_or(0);
         if new_group {
-            state
-                .scope_groups
-                .insert(scope, ScopeGroup { pgid, live: 1 });
+            state.scope_groups.insert(
+                scope,
+                ScopeGroup {
+                    pgid,
+                    live: 1,
+                    wait_failed: false,
+                },
+            );
         } else if let Some(group) = state.scope_groups.get_mut(&scope) {
             group.live = group.live.saturating_add(1);
         } else {
-            state
-                .scope_groups
-                .insert(scope, ScopeGroup { pgid, live: 1 });
+            state.scope_groups.insert(
+                scope,
+                ScopeGroup {
+                    pgid,
+                    live: 1,
+                    wait_failed: false,
+                },
+            );
         }
     }
 
@@ -437,6 +453,14 @@ impl UnixProcessBackend {
     ) {
         if raw.is_ok() {
             self.note_os_exit(scope);
+        } else if let Some(group) = self
+            .state
+            .lock()
+            .expect("unix backend mutex")
+            .scope_groups
+            .get_mut(&scope)
+        {
+            group.wait_failed = true;
         }
         let _ = sender.send(Some(raw));
     }
@@ -510,6 +534,13 @@ impl ProcessBackend for UnixProcessBackend {
         let (mut child, new_group) = loop {
             self.ensure_anchor(scope)?;
             let mut state = self.state.lock().expect("unix backend mutex");
+            if state
+                .scope_groups
+                .get(&scope)
+                .is_some_and(|group| group.wait_failed)
+            {
+                return Err(SpawnError::ScopeClosed(scope));
+            }
             if state
                 .anchors
                 .get(&scope)
@@ -834,6 +865,11 @@ fn signal_group(
     let Some(group) = state.scope_groups.get(&scope) else {
         return Ok(());
     };
+    if group.wait_failed && !state.anchors.contains_key(&scope) {
+        return Err(TerminateError::Signal(
+            "scope group identity unverified after wait failure".into(),
+        ));
+    }
     let pgid = Pid::from_raw(group.pgid);
     if let Some(anchor) = state.anchors.get(&scope) {
         if anchor.kill_issued {
@@ -1507,6 +1543,42 @@ mod failed_wait_tests {
     use super::*;
     use std::time::Duration;
     #[tokio::test]
+    async fn unanchored_failed_group_cannot_signal_recycled_pgid() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let other = ProcessScopeId::new(2);
+        let spec = ProcessSpec::new("/bin/sleep").arg("30");
+        let root = backend.spawn(scope, &spec).await.unwrap();
+        let sibling = backend.spawn(other, &spec).await.unwrap();
+        let (anchor, original_pgid) = {
+            let mut state = backend.state.lock().unwrap();
+            let anchor = state.anchors.remove(&scope).unwrap();
+            let sibling_pgid = state.scope_groups[&other].pgid;
+            let group = state.scope_groups.get_mut(&scope).unwrap();
+            let original = group.pgid;
+            group.wait_failed = true;
+            group.pgid = sibling_pgid;
+            (anchor, original)
+        };
+        assert!(backend.signal_scope(scope, Signal::Kill).await.is_err());
+        backend.hard_kill_scope(scope);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), backend.wait(&sibling))
+                .await
+                .is_err()
+        );
+        backend.wait(&root).await.unwrap();
+        {
+            let mut state = backend.state.lock().unwrap();
+            state.anchors.insert(scope, anchor);
+            state.scope_groups.get_mut(&scope).unwrap().pgid = original_pgid;
+        }
+        backend.cleanup_scope(scope).await.unwrap();
+        backend.cleanup_scope(other).await.unwrap();
+        backend.wait(&sibling).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn failed_wait_retains_identity_until_verified_reap() {
         let backend = UnixProcessBackend::new();
         let scope = ProcessScopeId::new(1);
@@ -1520,6 +1592,12 @@ mod failed_wait_tests {
         assert!(backend.wait(&root).await.is_err());
         assert!(backend.state.lock().unwrap().children.contains_key(&key));
         assert_eq!(backend.state.lock().unwrap().scope_groups[&scope].live, 1);
+        assert!(
+            matches!(backend.spawn(scope, &ProcessSpec::new("true")).await,
+            Err(SpawnError::ScopeClosed(id)) if id == scope)
+        );
+        // F retains a separate live anchor, so group signalling is still safe.
+        backend.signal_scope(scope, Signal::Kill).await.unwrap();
         // The real OS waiter remains alive and replaces the injected failure only
         // after it has actually reaped this process.
         let mut recovered = sender.subscribe();
