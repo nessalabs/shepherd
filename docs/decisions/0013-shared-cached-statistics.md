@@ -9,6 +9,9 @@ independently, so a stalled root cannot delay healthy roots or new arrivals.
 Reaped roots have their pending observations cancelled on the next tick. The
 coordinator retains only a Weak reference between scheduling/publication steps;
 it never owns a CleanupGuard. Construction outside a runtime remains valid.
+Successful shutdown aborts and joins the coordinator, cancelling pending sample
+futures and its timer immediately even while the supervisor is retained. Failed
+cleanup leaves sampling active until a later successful shutdown.
 `SupervisorBuilder::stats_interval` defaults to one second and clamps zero to 1 ms.
 
 `stats(pid)` reads the cache only. `NotReady` distinguishes the initial interval
