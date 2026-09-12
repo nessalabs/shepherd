@@ -28,6 +28,13 @@ pub enum ObservationError {
 pub trait ProcessObservationBackend: Send + Sync {
     /// Collect visible processes. Snapshots are always best-effort and non-atomic.
     async fn snapshot(&self) -> Result<ProcessSnapshot, ObservationError>;
+    /// Measure selected identities without taking lifecycle ownership.
+    async fn usage(
+        &self,
+        _members: Vec<ObservedProcessIdentity>,
+    ) -> Result<crate::UsageSnapshot, ObservationError> {
+        Err(ObservationError::Unsupported)
+    }
 }
 
 /// A reusable observer for both managed and externally started OS processes.
@@ -48,6 +55,27 @@ impl ProcessObserver {
     /// Observe a root selected by OS PID, without acquiring ownership.
     pub async fn tree(&self, os_pid: u32) -> Result<ProcessTree, ObservationError> {
         select_tree(self.snapshot().await?, os_pid, None)
+    }
+    /// Sample an external or managed root and its visible descendants.
+    pub async fn tree_usage(&self, os_pid: u32) -> Result<crate::TreeUsage, ObservationError> {
+        let tree = self.tree(os_pid).await?;
+        self.measure_tree(tree).await
+    }
+    /// Refresh while checking the root's reported identity. Compare the returned
+    /// usage with the previous usage using `totals(Some(&previous.usage))`.
+    pub async fn refresh_tree_usage(
+        &self,
+        previous: &crate::TreeUsage,
+    ) -> Result<crate::TreeUsage, ObservationError> {
+        let tree = self.refresh_tree(previous.tree.root).await?;
+        self.measure_tree(tree).await
+    }
+    async fn measure_tree(&self, tree: ProcessTree) -> Result<crate::TreeUsage, ObservationError> {
+        let usage = self
+            .backend
+            .usage(tree.processes.iter().map(|p| p.identity).collect())
+            .await?;
+        Ok(crate::TreeUsage { tree, usage })
     }
     /// Refresh a tree, rejecting a changed reported start time. Second-resolution or
     /// missing start times cannot rule out all PID reuse; never use this for signaling.

@@ -199,3 +199,78 @@ mod tests {
         fs::remove_dir(parent).unwrap();
     }
 }
+
+// Open under the membership lock, then sample through the pinned descriptor outside
+// that lock. Cleanup never waits for accounting I/O and path reuse cannot redirect it.
+impl Cgroups {
+    pub fn accounting_directory(&self, scope: ProcessScopeId) -> io::Result<File> {
+        let groups = self.groups.lock().expect("cgroup mutex");
+        let group = groups
+            .get(&scope)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "scope cgroup unavailable"))?;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&group.path)
+    }
+}
+pub(super) fn accounting(directory: File) -> io::Result<shepherd_app::ScopeAccounting> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    // The cgroup must still exist. Controller-specific files may be unavailable.
+    fs::read_to_string(path.join("cgroup.events"))?;
+    let value = |name: &str| {
+        fs::read_to_string(path.join(name))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    let cpu = fs::read_to_string(path.join("cpu.stat"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("usage_usec "))
+                .and_then(|v| v.parse::<u64>().ok())
+        });
+    let io = fs::read_to_string(path.join("io.stat")).ok();
+    let read = io.as_deref().and_then(|s| io_sum(s, "rbytes="));
+    let written = io.as_deref().and_then(|s| io_sum(s, "wbytes="));
+    let result = shepherd_app::ScopeAccounting {
+        source: shepherd_app::AccountingSource::LinuxCgroup,
+        sampled_at: std::time::Instant::now(),
+        cpu_time: cpu.map(Duration::from_micros),
+        memory_bytes: value("memory.current"),
+        peak_commit_bytes: None,
+        io_read_bytes: read,
+        io_write_bytes: written,
+        member_count: value("pids.current"),
+    };
+    fs::read_to_string(path.join("cgroup.events"))?;
+    Ok(result)
+}
+fn io_sum(text: &str, prefix: &str) -> Option<u64> {
+    text.lines().try_fold(0u64, |total, line| {
+        let value = line
+            .split_whitespace()
+            .find_map(|v| v.strip_prefix(prefix))?
+            .parse::<u64>()
+            .ok()?;
+        total.checked_add(value)
+    })
+}
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+    #[test]
+    fn io_totals_are_per_device_and_fail_on_bad_or_overflowed_data() {
+        assert_eq!(
+            io_sum("8:0 rbytes=7 wbytes=3\n8:1 rbytes=9 wbytes=5", "rbytes="),
+            Some(16)
+        );
+        assert_eq!(io_sum("", "rbytes="), Some(0));
+        assert_eq!(io_sum("8:0 wbytes=7", "rbytes="), None);
+        assert_eq!(io_sum("8:0 rbytes=no", "rbytes="), None);
+        assert_eq!(
+            io_sum("8:0 rbytes=18446744073709551615\n8:1 rbytes=1", "rbytes="),
+            None
+        );
+    }
+}

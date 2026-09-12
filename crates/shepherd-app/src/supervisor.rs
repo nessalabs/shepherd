@@ -286,6 +286,18 @@ impl ProcessSupervisor {
             .map(|s| s.live_process_ids())
     }
 
+    /// Observe current scope usage without holding cleanup locks. Cleanup may
+    /// remove the scope during collection; errors are not cleanup verdicts.
+    pub async fn scope_usage(
+        &self,
+        scope: ProcessScopeId,
+    ) -> Result<crate::ScopeUsage, crate::ObservationError> {
+        if self.processes(scope).is_none() {
+            return Err(crate::ObservationError::Backend("unknown scope".into()));
+        }
+        self.inner.backend.scope_usage(scope).await
+    }
+
     /// Returns the OS PID of a retained managed process, for read-only observation.
     /// Shepherd's ProcessId is a logical ID and must not be passed as an OS PID.
     /// This lookup is not proof the process is still alive; it may exit immediately.

@@ -19,6 +19,18 @@ impl Default for SystemProcessObserver {
 }
 #[async_trait]
 impl ProcessObservationBackend for SystemProcessObserver {
+    async fn usage(
+        &self,
+        members: Vec<ObservedProcessIdentity>,
+    ) -> Result<shepherd_app::UsageSnapshot, ObservationError> {
+        crate::usage::blocking(move || {
+            Ok(crate::usage::collect(
+                members,
+                shepherd_app::UsageSelection::Tree,
+            ))
+        })
+        .await
+    }
     async fn snapshot(&self) -> Result<ProcessSnapshot, ObservationError> {
         if !sysinfo::IS_SUPPORTED_SYSTEM {
             return Err(ObservationError::Unsupported);
