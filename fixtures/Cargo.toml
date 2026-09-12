@@ -11,6 +11,7 @@ description = "Pathological helper binaries used by Shepherd's test suite. Not p
 libc = "0.2"
 
 [dependencies]
+shepherd-test-support = { path = "../crates/shepherd-test-support" }
 shepherd = { path = "../crates/shepherd" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 

@@ -18,8 +18,7 @@ async fn detached(orphan: bool, drop_owner: bool) {
         unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
         0
     );
-    let root = std::env::var_os("SHEPHERD_CGROUP_ROOT")
-        .expect("set a writable delegated cgroup v2 ancestor");
+    let root = shepherd_test_support::TestEnvironment::from_env().cgroup_root();
     let backend = UnixProcessBackend::with_cgroup_root(&root)
         .expect("real cgroup v2 with cgroup.kill required");
     let sup = SupervisorBuilder::new().backend(Arc::new(backend)).build();
@@ -125,10 +124,7 @@ fn ordinary_directory_never_claims_cgroup_capability() {
 #[ignore = "requires delegated cgroup v2; privileged CI runs --ignored and fails closed"]
 async fn nested_cgroups_are_removed_after_kill_and_reap() {
     use shepherd::{ProcessBackend, ProcessScopeId, Signal};
-    let delegated = std::path::PathBuf::from(
-        std::env::var_os("SHEPHERD_CGROUP_ROOT")
-            .expect("set a writable delegated cgroup v2 ancestor"),
-    );
+    let delegated = shepherd_test_support::TestEnvironment::from_env().cgroup_root();
     let ancestor = delegated.join(format!("nested-test-{}", std::process::id()));
     std::fs::create_dir(&ancestor).unwrap();
     let backend = UnixProcessBackend::with_cgroup_root(&ancestor).unwrap();

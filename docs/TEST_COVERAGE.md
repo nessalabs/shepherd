@@ -1,5 +1,7 @@
 # Verification coverage and remaining gaps
 
+See [test environment settings](TEST_ENVIRONMENT.md) for all supported tuning variables, defaults, and validation.
+
 The audit found that the long stress runner repeated one serial sleeping-root case,
 real-process coverage mostly exercised the current-thread runtime, machine coverage
 relied on moving latest images, and property tests hard-coded 64 cases even when the
