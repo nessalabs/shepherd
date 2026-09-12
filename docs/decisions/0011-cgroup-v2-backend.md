@@ -89,3 +89,5 @@ and group signals never use that unverified PGID; hard cleanup still attempts re
 root identities. The quarantine remains even if a later root wait recovers, because root
 reap does not establish that the old group ID is safe. Cgroup kill remains independently
 available. On targets without a safe retained root identity, this fails closed.
+
+In Phase F, a live independent process-group anchor continues to pin the PGID even after a root wait fails, so verified anchored group signalling remains available. Admission still rejects a scope with failed wait evidence; unanchored groups require identity-safe root fallback.
