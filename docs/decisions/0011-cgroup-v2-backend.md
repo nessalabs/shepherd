@@ -65,6 +65,10 @@ for arbitrary non-child processes. Tests use a subreaper to verify their reaping
 `Capabilities` is available on the supervisor. Stats support is unchanged in this
 phase. Process-group cleanup remains best effort and cannot verify escaped trees.
 Cgroups do not automatically kill on supervisor SIGKILL; no such backstop is claimed.
+If a synchronous cgroup kill write fails, the Unix backstop also signals that
+scope's registered roots through their retained pidfds (or checked reuse tokens).
+The all-scope backstop does this for every failed cgroup. This salvages root
+termination only: it never turns a failed containment sweep into verified cleanup.
 
 Prerequisite fixes: preserve backend wait errors, retain waiter exits even before
 subscription, start monitors before dispatch, and propagate final sweep failures.
@@ -85,6 +89,8 @@ and group signals never use that unverified PGID; hard cleanup still attempts re
 root identities. The quarantine remains even if a later root wait recovers, because root
 reap does not establish that the old group ID is safe. Cgroup kill remains independently
 available. On targets without a safe retained root identity, this fails closed.
+
+In Phase F, a live independent process-group anchor continues to pin the PGID even after a root wait fails, so verified anchored group signalling remains available. Admission still rejects a scope with failed wait evidence; unanchored groups require identity-safe root fallback.
 
 A transient OS wait failure retains the actual native child handle, not just its last error. A later wait
 requests another native observation through a one-entry coalescing channel; permanent

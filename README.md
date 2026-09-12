@@ -5,8 +5,8 @@ A reusable, production-quality **process supervision** library for Rust. Shepher
 resource observation — and leaves *policy* to the caller.
 
 > Status: platform adapters, cached statistics, and bounded byte capture are implemented.
-> Cancellation guards and adversarial hardening are still in progress. See the design and
-> phase PRs for evidence; platform limits are exposed explicitly.
+> Async scopes and adversarial hardening passed CI and 2,000 lifecycle cycles on each OS.
+> [VALIDATION.md](docs/VALIDATION.md) records the evidence and explicit platform limits.
 
 ## The core invariant
 
@@ -46,7 +46,7 @@ rule, enforced in CI:
 | --- | --- |
 | `shepherd-domain` | Pure domain: entities, value objects, the `ProcessScope` aggregate, events. No async, no OS, no I/O. |
 | `shepherd-app` | Application services: the `ProcessSupervisor`, the event dispatcher + handlers, and the driven ports. |
-| `shepherd-infra` | Adapters: the Unix/null backends, clock, waiters, integration publishers. |
+| `shepherd-infra` | Adapters: Unix/cgroup and Windows Job Object backends, output, clock, waiters and publishers. |
 | `shepherd` | The public facade that wires it together. |
 
 The domain's purity, the layering, and the ubiquitous language are enforced by the
@@ -79,9 +79,7 @@ cargo fmt --all --check                                  # format
 | Cached peak RSS / I/O | yes | Unsupported | yes |
 
 
-Guarantees are reported at runtime through the `Capabilities` type. See the design doc for
-the full target matrix (including Linux cgroup v2, Windows Job Objects, and honest macOS
-limitations).
+Guarantees are reported at runtime through the `Capabilities` type. See the design doc for the implementation matrix and explicit OS limits.
 
 ## License
 
@@ -104,3 +102,13 @@ keeps a process alive.
 `with_scope` returns the closure value and a separate termination report. On caller
 cancellation cleanup continues; retain the scope ID from the closure and await
 `wait_scope_cleanup(id)` to inspect the result. Nested blocks own independent scopes.
+
+
+Completed process exits, scope reports, cancellation reports and unclaimed completed
+output retain up to 256 entries per category. Keep returned values or take an output
+observer for longer retention. Live/unverified ownership is never evicted.
+
+Process-group scopes keep a small private anchor process until scope cleanup.
+Windows has no generic graceful signal; force follows the configured grace interval.
+Use a running runtime for verified shutdown. See [ownership review](docs/OWNERSHIP.md)
+and [validation evidence](docs/VALIDATION.md).

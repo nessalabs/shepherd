@@ -63,7 +63,13 @@ output access accept only process IDs returned in that block's initial process l
 or by its scoped spawn method. The handle retains these IDs through process reap,
 so completed local output remains accessible and completed sibling IDs cannot
 bypass the scope boundary after registry pruning. The initial process list remains
-a snapshot; dynamic spawns are tracked separately for observation access.
+a snapshot; dynamic spawns are tracked separately for observation access. Scoped
+spawn, wait and output access lazily discard membership IDs once registry ownership,
+retained waiter results and retained output have all expired. This prevents an
+active block's sequential spawn/wait cycles from accumulating permanent dynamic
+history, while preserving live/quarantined processes and every retained observation.
+An idle handle may retain its last active peak until its next scoped operation; the
+caller-owned initial process snapshot is unchanged.
 
 Verified cancellation requires a running runtime and cooperative backend ports.
 Abrupt runtime/process shutdown cannot await or return verified cleanup; OS limits
@@ -73,6 +79,11 @@ The in-memory terminate-cancellation test uses Tokio's paused clock: cancellatio
 occurs at 5 ms, before 20 ms grace expiry, then the unchanged liveness assertion
 observes another 50 ms. Wall-clock scheduler delays must not let force escalation
 occur before the cancellation being tested. Real-process tests retain real time.
+
+The cleanup worker publishes its result before disarming its synchronous backstop.
+A separate JoinHandle observer only translates join failures; runtime shutdown after
+worker completion cannot leave the retained report pending. A cross-runtime test
+verifies completed cleanup remains observable without a join observer.
 
 Verified external scope termination publishes directly to a block's cleanup channel.
 The channel is registered before the scope becomes visible to shutdown; the active

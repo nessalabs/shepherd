@@ -122,3 +122,106 @@ async fn nested_blocks_are_independent_scopes() {
         .await;
     assert!(outer.termination.unwrap().all_verified());
 }
+
+#[tokio::test]
+async fn panic_and_nested_cancellation_still_clean_both_scopes() {
+    let supervisor = sup();
+    let worker = supervisor.clone();
+    let nested = supervisor.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    let task = tokio::spawn(async move {
+        worker
+            .with_scope_options(
+                vec![ProcessSpec::new("ignore-graceful")],
+                opts(),
+                |outer| async move {
+                    tx.send(outer.id()).await.unwrap();
+                    nested
+                        .with_scope_options(
+                            vec![ProcessSpec::new("ignore-graceful")],
+                            opts(),
+                            |inner| async move {
+                                tx.send(inner.id()).await.unwrap();
+                                std::future::pending::<()>().await;
+                            },
+                        )
+                        .await;
+                },
+            )
+            .await
+    });
+    let outer = rx.recv().await.unwrap();
+    let inner = rx.recv().await.unwrap();
+    task.abort();
+    let _ = task.await;
+    assert!(supervisor
+        .wait_scope_cleanup(inner)
+        .await
+        .unwrap()
+        .all_verified());
+    assert!(supervisor
+        .wait_scope_cleanup(outer)
+        .await
+        .unwrap()
+        .all_verified());
+    let worker = supervisor.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        worker
+            .with_scope_options(
+                vec![ProcessSpec::new("owned")],
+                opts(),
+                |scope| async move {
+                    tx.send(scope.id()).unwrap();
+                    panic!("injected closure panic");
+                },
+            )
+            .await
+    });
+    let scope = rx.await.unwrap();
+    assert!(task.await.unwrap_err().is_panic());
+    assert!(supervisor
+        .wait_scope_cleanup(scope)
+        .await
+        .unwrap()
+        .all_verified());
+}
+
+#[test]
+fn runtime_shutdown_reports_unverified_instead_of_hanging_on_cleanup() {
+    let supervisor = sup();
+    let worker = supervisor.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let scope = runtime.block_on(async {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            worker
+                .with_scope_options(
+                    vec![ProcessSpec::new("ignore-graceful")],
+                    opts(),
+                    |scope| async move {
+                        tx.send(scope.id()).unwrap();
+                        std::future::pending::<()>().await;
+                    },
+                )
+                .await;
+        });
+        rx.await.unwrap()
+    });
+    drop(runtime);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), supervisor.wait_scope_cleanup(scope))
+                .await
+                .unwrap()
+                .is_err()
+        );
+    });
+}

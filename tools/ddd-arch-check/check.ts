@@ -77,6 +77,11 @@ function transitiveDeps(meta: Meta, rootName: string): Set<string> {
 
 function checkDependencyBoundary(meta: Meta): void {
   const domainDeps = transitiveDeps(meta, "shepherd-domain");
+  const pureClosure = new Set(["thiserror", "thiserror-impl", "proc-macro2", "quote", "syn", "unicode-ident"]);
+  for (const name of domainDeps) {
+    if (!pureClosure.has(name)) fail(`domain dependency '${name}' is outside the pure allowlist`);
+  }
+
   for (const forbidden of INFRA_CRATES) {
     if (domainDeps.has(forbidden)) {
       fail(`shepherd-domain must not depend on '${forbidden}' (found in dependency closure)`);
@@ -154,6 +159,10 @@ function checkGlossaryCoverage(): void {
 const meta = cargoMetadata();
 checkDependencyBoundary(meta);
 checkPurity();
+for (const file of ["process.rs", "scope.rs"]) {
+  const source = readFileSync(join(repoRoot, "crates", "shepherd-domain", "src", file), "utf8");
+  if (/^\s*pub\s+[a-z_]\w*\s*:/m.test(source)) fail(`aggregate/entity fields must remain private: ${file}`);
+}
 checkGlossaryCoverage();
 
 if (failures.length > 0) {

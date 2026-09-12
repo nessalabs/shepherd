@@ -12,9 +12,10 @@
 //! `docs/decisions/0010-retain-slot-until-wait.md`.
 
 use std::collections::HashMap;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::task::Poll;
 
 use async_trait::async_trait;
 use nix::sys::signal::{kill, killpg, Signal as NixSignal};
@@ -42,9 +43,9 @@ struct WaitChannels {
 }
 
 struct ChildSlot {
+    scope: ProcessScopeId,
     output: Option<shepherd_app::output::ProcessOutput>,
     sampling: Arc<std::sync::atomic::AtomicBool>,
-    scope: ProcessScopeId,
     retry: tokio::sync::mpsc::Sender<()>,
     #[cfg(test)]
     failures: Arc<std::sync::atomic::AtomicUsize>,
@@ -54,6 +55,86 @@ struct ChildSlot {
     _keep: watch::Receiver<Option<Result<RawExit, String>>>,
     #[cfg(target_os = "linux")]
     pidfd: Option<OwnedFd>,
+}
+
+struct Anchor {
+    _input: std::process::ChildStdin,
+    exit: watch::Sender<Option<Result<(), String>>>,
+    kill_issued: bool,
+}
+
+// Constructed before task dispatch: cancellation before its first poll still runs Drop.
+struct AnchorWait {
+    child: NativeChild,
+    state: Weak<Mutex<State>>,
+    exit: watch::Sender<Option<Result<(), String>>>,
+    scope: ProcessScopeId,
+    pgid: i32,
+    armed: bool,
+}
+impl AnchorWait {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+    fn poll_exit(&mut self, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        let state = self.state.upgrade();
+        // Reap and loss-of-pin publication stay atomic with group signaling.
+        let _guard = state
+            .as_ref()
+            .map(|state| state.lock().expect("unix backend mutex"));
+        let result = loop {
+            match self.child.child.as_mut().expect("owned anchor").try_wait() {
+                Ok(Some(_)) => {
+                    self.child.child.take();
+                    break Ok(());
+                }
+                Err(error) => {
+                    if error.raw_os_error() == Some(libc::ECHILD) {
+                        self.child.child.take();
+                    }
+                    break Err(error.to_string());
+                }
+                Ok(None) => match self.child.changes.poll_recv(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(())) => {}
+                    Poll::Ready(None) => break Err("anchor SIGCHLD stream closed".into()),
+                },
+            }
+        };
+        self.exit.send_replace(Some(result));
+        self.disarm();
+        Poll::Ready(())
+    }
+}
+impl Drop for AnchorWait {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.upgrade();
+        let mut state = state
+            .as_ref()
+            .map(|s| s.lock().unwrap_or_else(|p| p.into_inner()));
+        // Only an owned child pins the numeric group. ECHILD discards ownership
+        // before disarming, so neither signaling nor orphan reaping can use it.
+        if self.child.child.is_some() {
+            let _ = killpg(Pid::from_raw(self.pgid), Some(NixSignal::SIGKILL));
+        }
+        if let Some(state) = state.as_mut() {
+            if state
+                .scope_groups
+                .get(&self.scope)
+                .is_some_and(|g| g.pgid == self.pgid)
+            {
+                if let Some(anchor) = state.anchors.get_mut(&self.scope) {
+                    anchor.kill_issued = true;
+                }
+            }
+        }
+        self.exit.send_replace(Some(Err(
+            "anchor waiter interrupted; synchronous group kill issued, reap unverified".into(),
+        )));
+    }
 }
 
 struct ScopeGroup {
@@ -68,6 +149,7 @@ struct State {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     cpu_samples: HashMap<ChildKey, (std::time::Instant, u64)>,
     scope_groups: HashMap<ProcessScopeId, ScopeGroup>,
+    anchors: HashMap<ProcessScopeId, Anchor>,
     /// Serializes spawns per scope so the first process creates exactly one process group.
     scope_locks: HashMap<ProcessScopeId, Arc<tokio::sync::Mutex<()>>>,
 }
@@ -89,6 +171,11 @@ impl std::fmt::Debug for UnixProcessBackend {
 
 impl UnixProcessBackend {
     fn sample_sync(&self, target: &Spawned) -> Result<RawStats, StatsError> {
+        if matches!(target.os.reuse_token, ReuseToken::Unavailable) {
+            return Err(StatsError::Backend(
+                "no safe sample identity available".into(),
+            ));
+        }
         if !identity_still_matches(&target.os) {
             return Err(StatsError::Backend(
                 "process identity no longer matches".into(),
@@ -222,12 +309,101 @@ impl UnixProcessBackend {
             .clone()
     }
 
-    fn forget_group(&self, scope: ProcessScopeId) {
-        self.state
-            .lock()
-            .expect("unix backend mutex")
-            .scope_groups
-            .remove(&scope);
+    fn ensure_anchor(&self, scope: ProcessScopeId) -> Result<(), SpawnError> {
+        if self.containment() != Containment::ProcessGroup {
+            return Ok(());
+        }
+        {
+            let mut state = self.state.lock().expect("unix backend mutex");
+            if let Some(anchor) = state.anchors.get(&scope) {
+                if anchor.kill_issued {
+                    return Err(SpawnError::ScopeClosed(scope));
+                }
+                let exit = anchor.exit.borrow().clone();
+                match exit {
+                    None => return Ok(()),
+                    Some(Err(error)) => {
+                        return Err(SpawnError::Os(format!("anchor reap failed: {error}")))
+                    }
+                    Some(Ok(())) => {}
+                }
+                let group = state.scope_groups.get(&scope).expect("anchor group");
+                // Reaping releases the PID pin. Never join or signal a possibly recycled
+                // group. Only replace a group after proving that its number is absent.
+                if group.live != 0
+                    || killpg(Pid::from_raw(group.pgid), None) != Err(nix::errno::Errno::ESRCH)
+                {
+                    return Err(SpawnError::Os(
+                        "scope anchor exited while its group may still exist; cleanup required"
+                            .into(),
+                    ));
+                }
+                state.anchors.remove(&scope);
+                state.scope_groups.remove(&scope);
+            }
+        }
+        // A shell blocked in its builtin read creates no extra child. Its stdin is private.
+        // Keeping this group leader alive pins the PGID across natural root exits.
+        let changes = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+            .map_err(|error| SpawnError::Os(error.to_string()))?;
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "trap '' HUP INT TERM; read shepherd_scope_anchor"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = libc::SIG_IGN;
+                libc::sigemptyset(&mut action.sa_mask);
+                for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+                    if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|e| SpawnError::Os(e.to_string()))?;
+        let pgid = child.id() as i32;
+        let input = child.stdin.take().expect("anchor stdin");
+        let (exit, _) = watch::channel(None);
+        let mut worker = AnchorWait {
+            child: NativeChild {
+                child: Some(child),
+                changes,
+            },
+            state: Arc::downgrade(&self.state),
+            exit: exit.clone(),
+            scope,
+            pgid,
+            armed: true,
+        };
+        tokio::spawn(async move {
+            std::future::poll_fn(|cx| worker.poll_exit(cx)).await;
+        });
+        let mut state = self.state.lock().expect("unix backend mutex");
+        state.anchors.insert(
+            scope,
+            Anchor {
+                _input: input,
+                exit,
+                kill_issued: false,
+            },
+        );
+        state.scope_groups.insert(
+            scope,
+            ScopeGroup {
+                pgid,
+                live: 0,
+                wait_failed: false,
+            },
+        );
+        Ok(())
     }
 
     fn register_child(
@@ -243,9 +419,9 @@ impl UnixProcessBackend {
         state.children.insert(
             child_key(&os),
             ChildSlot {
+                scope,
                 output,
                 sampling: Arc::default(),
-                scope,
                 sender: channels.sender,
                 _keep: channels.keep,
                 retry: channels.retry,
@@ -364,24 +540,42 @@ impl ProcessBackend for UnixProcessBackend {
             .map(|c| c.membership(scope))
             .transpose()
             .map_err(|e| SpawnError::Os(e.to_string()))?;
-        // Serialize quarantine publication with the actual fork/exec admission.
-        let (mut child, new_group) = {
+        let (mut child, new_group) = loop {
+            self.ensure_anchor(scope)?;
             let mut state = self.state.lock().expect("unix backend mutex");
-            let existing_pgid = match state.scope_groups.get(&scope) {
-                Some(group) if group.wait_failed => return Err(SpawnError::ScopeClosed(scope)),
-                Some(group) if group.live > 0 => Some(group.pgid),
-                _ => None,
-            };
-            match self.spawn_in_group(
+            if state
+                .scope_groups
+                .get(&scope)
+                .is_some_and(|group| group.wait_failed)
+            {
+                return Err(SpawnError::ScopeClosed(scope));
+            }
+            if state
+                .anchors
+                .get(&scope)
+                .is_some_and(|a| a.kill_issued || a.exit.borrow().is_some())
+            {
+                // The anchor reaped between ensure_anchor and this lock acquisition.
+                // Recheck recovery before choosing a numeric group to join.
+                drop(state);
+                continue;
+            }
+            let existing_pgid = state
+                .scope_groups
+                .get(&scope)
+                .and_then(|g| (g.live > 0 || state.anchors.contains_key(&scope)).then_some(g.pgid));
+            // Keep the PID pin until setpgid has executed in the new child. The
+            // anchor's wait task takes this same mutex before reaping it.
+            let spawned = self.spawn_in_group(
                 spec,
                 existing_pgid.unwrap_or(0),
                 #[cfg(target_os = "linux")]
                 membership.as_ref(),
-            ) {
+            );
+            break match spawned {
                 Ok(child) => (child, existing_pgid.is_none()),
-                Err(_err) if existing_pgid.is_some() => {
-                    // The recorded group is gone (last member exited; kernel recycled the pgid).
-                    // Forget it and create a fresh group for this still-open scope.
+                Err(_) if existing_pgid.is_some() && !state.anchors.contains_key(&scope) => {
+                    // Cgroup containment also owns all descendants of the old group.
                     state.scope_groups.remove(&scope);
                     (
                         self.spawn_in_group(
@@ -393,8 +587,8 @@ impl ProcessBackend for UnixProcessBackend {
                         true,
                     )
                 }
-                Err(err) => return Err(err),
-            }
+                Err(error) => return Err(error),
+            };
         };
 
         let pid = child
@@ -507,6 +701,15 @@ impl ProcessBackend for UnixProcessBackend {
     }
 
     async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+        if !self
+            .state
+            .lock()
+            .expect("unix backend mutex")
+            .children
+            .contains_key(&child_key(&target.os))
+        {
+            return Ok(());
+        }
         #[cfg(target_os = "linux")]
         {
             // Hold the lock across the syscall so the pidfd cannot be closed underneath us.
@@ -516,20 +719,20 @@ impl ProcessBackend for UnixProcessBackend {
                 .get(&child_key(&target.os))
                 .and_then(|slot| slot.pidfd.as_ref())
             {
-                return pidfd_kill(fd.as_raw_fd(), to_nix(signal));
+                return pidfd_kill(fd.as_raw_fd(), to_nix(signal)?);
             }
         }
 
         if matches!(target.os.reuse_token, ReuseToken::Unavailable) {
             return Err(TerminateError::Signal(
-                "no safe signal identity available".into(),
+                "no safe process identity available".into(),
             ));
         }
         if !identity_still_matches(&target.os) {
             return Ok(());
         }
         let pid = Pid::from_raw(i32::try_from(target.os.pid).unwrap_or(0));
-        match kill(pid, Some(to_nix(signal))) {
+        match kill(pid, Some(to_nix(signal)?)) {
             Ok(()) => Ok(()),
             Err(nix::errno::Errno::ESRCH) => Ok(()),
             Err(e) => Err(TerminateError::Signal(e.to_string())),
@@ -541,43 +744,24 @@ impl ProcessBackend for UnixProcessBackend {
         scope: ProcessScopeId,
         signal: Signal,
     ) -> Result<(), TerminateError> {
-        let result = (|| {
-            #[cfg(target_os = "linux")]
-            if let Some(cgroups) = &self.cgroups {
-                if signal == Signal::Kill {
-                    return cgroups
-                        .kill(scope)
-                        .map_err(|e| TerminateError::Signal(e.to_string()));
+        #[cfg(target_os = "linux")]
+        if let Some(cgroups) = &self.cgroups {
+            if signal == Signal::Kill {
+                let result = cgroups
+                    .kill(scope)
+                    .map_err(|e| TerminateError::Signal(e.to_string()));
+                let state = self.state.lock().expect("unix backend mutex");
+                for slot in state.children.values().filter(|slot| slot.scope == scope) {
+                    let _ = slot.retry.try_send(());
                 }
+                return result;
             }
-            let mut state = self.state.lock().expect("unix backend mutex");
-            if state
-                .scope_groups
-                .get(&scope)
-                .is_some_and(|group| group.wait_failed)
-            {
-                if signal == Signal::Kill {
-                    kill_registered_roots(&state, scope);
-                }
-                return Err(TerminateError::Signal(
-                    "scope group identity unverified after wait failure".into(),
-                ));
-            }
-            let pgid = state.scope_groups.get(&scope).map(|group| group.pgid);
-            let Some(pgid) = pgid else {
-                return Ok(());
-            };
-            match killpg(Pid::from_raw(pgid), Some(to_nix(signal))) {
-                Ok(()) => Ok(()),
-                Err(nix::errno::Errno::ESRCH) => {
-                    state.scope_groups.remove(&scope);
-                    Ok(())
-                }
-                Err(e) => Err(TerminateError::Signal(e.to_string())),
-            }
-        })();
+        }
+        let mut state = self.state.lock().expect("unix backend mutex");
+        let result = signal_group(&mut state, scope, to_nix(signal)?);
         if signal == Signal::Kill {
-            let state = self.state.lock().expect("unix backend mutex");
+            // Queue even if failure publication is still in flight; capacity one
+            // coalesces concurrent cleanup callers without losing the reap wakeup.
             for slot in state.children.values().filter(|slot| slot.scope == scope) {
                 let _ = slot.retry.try_send(());
             }
@@ -625,22 +809,13 @@ impl ProcessBackend for UnixProcessBackend {
                 return Err(WaitError::Backend("waiter channel closed".into()));
             }
         };
-        // A waiter error is not proof that the root exited or was reaped. Keep its
-        // identity (including pidfd) available to the synchronous kill backstop.
-        // A later successful wait can consume a recovered reap observation.
+        // Failed wait is not reap evidence; retain exact identity for kill backstops.
         if exit.is_ok() {
-            self.state
-                .lock()
-                .expect("unix backend mutex")
-                .children
-                .remove(&key);
+            let mut state = self.state.lock().expect("unix backend mutex");
+            state.children.remove(&key);
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            state.cpu_samples.remove(&key);
         }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        self.state
-            .lock()
-            .expect("unix backend mutex")
-            .cpu_samples
-            .remove(&key);
         exit.map_err(WaitError::Backend)
     }
 
@@ -653,12 +828,34 @@ impl ProcessBackend for UnixProcessBackend {
                 .await
                 .map_err(|e| TerminateError::Signal(e.to_string()))?;
         }
-        self.forget_group(scope);
-        self.state
+        let anchor = self
+            .state
             .lock()
             .expect("unix backend mutex")
-            .scope_locks
-            .remove(&scope);
+            .anchors
+            .get(&scope)
+            .map(|a| a.exit.subscribe());
+        if let Some(mut receiver) = anchor {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(result) = receiver.borrow_and_update().clone() {
+                        return result.map_err(TerminateError::Signal);
+                    }
+                    receiver
+                        .changed()
+                        .await
+                        .map_err(|_| TerminateError::Signal("anchor waiter closed".into()))?;
+                }
+            })
+            .await
+            .map_err(|_| TerminateError::Signal("anchor reap timed out".into()))??;
+        }
+        // Never expose a group entry without its anchor after the PID was reaped.
+        // Synchronous owner Drop may signal scopes concurrently with this cleanup.
+        let mut state = self.state.lock().expect("unix backend mutex");
+        state.anchors.remove(&scope);
+        state.scope_groups.remove(&scope);
+        state.scope_locks.remove(&scope);
         Ok(())
     }
 
@@ -699,39 +896,203 @@ impl ProcessBackend for UnixProcessBackend {
         }
     }
 
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        #[cfg(target_os = "linux")]
+        if let Some(cgroups) = &self.cgroups {
+            if let Err(error) = cgroups.kill(scope) {
+                tracing::error!(%scope, %error, "cgroup hard kill failed; attempting registered roots only");
+            }
+            let state = self.state.lock().expect("unix backend mutex");
+            kill_registered_roots(&state, Some(scope));
+            return;
+        }
+        let mut state = self.state.lock().expect("unix backend mutex");
+        if let Err(error) = signal_group(&mut state, scope, NixSignal::SIGKILL) {
+            tracing::error!(%error, "cannot safely signal scope group after anchor loss");
+        }
+        // Cleanup may have retired the group while a failed reap retained a root.
+        kill_registered_roots(&state, Some(scope));
+    }
+
     fn hard_kill_all(&self) {
         #[cfg(target_os = "linux")]
         if let Some(cgroups) = &self.cgroups {
             let _ = cgroups.kill_all();
             let state = self.state.lock().expect("unix backend mutex");
-            // Retained roots remain reachable even after a containment entry was
-            // removed: containment cleanup alone does not prove root reap.
-            for scope in state
-                .children
-                .values()
-                .map(|slot| slot.scope)
-                .collect::<std::collections::HashSet<_>>()
-            {
-                kill_registered_roots(&state, scope);
-            }
+            kill_registered_roots(&state, None);
             return;
         }
-        let state = self.state.lock().expect("unix backend mutex");
-        for group in state
-            .scope_groups
-            .values()
-            .filter(|group| !group.wait_failed)
-        {
-            let _ = killpg(Pid::from_raw(group.pgid), Some(NixSignal::SIGKILL));
+        let mut state = self.state.lock().expect("unix backend mutex");
+        let scopes: Vec<_> = state.scope_groups.keys().copied().collect();
+        for scope in scopes {
+            if let Err(error) = signal_group(&mut state, scope, NixSignal::SIGKILL) {
+                tracing::error!(%error, "cannot safely signal scope group after anchor loss");
+            }
         }
-        for scope in state
-            .children
-            .values()
-            .map(|slot| slot.scope)
-            .collect::<std::collections::HashSet<_>>()
-        {
-            kill_registered_roots(&state, scope);
+        kill_registered_roots(&state, None);
+    }
+}
+
+fn signal_group(
+    state: &mut State,
+    scope: ProcessScopeId,
+    signal: NixSignal,
+) -> Result<(), TerminateError> {
+    let Some(group) = state.scope_groups.get(&scope) else {
+        return Ok(());
+    };
+    if group.wait_failed && !state.anchors.contains_key(&scope) {
+        return Err(TerminateError::Signal(
+            "scope group identity unverified after wait failure".into(),
+        ));
+    }
+    let pgid = Pid::from_raw(group.pgid);
+    if let Some(anchor) = state.anchors.get(&scope) {
+        if anchor.kill_issued {
+            return Ok(());
         }
+        if anchor.exit.borrow().is_some() {
+            if killpg(pgid, None) == Err(nix::errno::Errno::ESRCH) {
+                return Ok(());
+            }
+            return Err(TerminateError::Signal(
+                "scope anchor was reaped; refusing to signal an unpinned group".into(),
+            ));
+        }
+    }
+    match killpg(pgid, Some(signal)) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {
+            if signal == NixSignal::SIGKILL {
+                if let Some(anchor) = state.anchors.get_mut(&scope) {
+                    anchor.kill_issued = true;
+                }
+            }
+            Ok(())
+        }
+        Err(error) => Err(TerminateError::Signal(error.to_string())),
+    }
+}
+
+fn kill_registered_roots(state: &State, scope: Option<ProcessScopeId>) {
+    for ((pid, token), slot) in state
+        .children
+        .iter()
+        .filter(|(_, slot)| scope.is_none_or(|scope| slot.scope == scope))
+    {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &slot.pidfd {
+            let _ = pidfd_kill(fd.as_raw_fd(), NixSignal::SIGKILL);
+            let _ = slot.retry.try_send(());
+            continue;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = slot;
+        if *token != 0 && read_start_time(*pid) == Some(*token) {
+            let _ = kill(Pid::from_raw(*pid as i32), Some(NixSignal::SIGKILL));
+        }
+        let _ = slot.retry.try_send(());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod cgroup_backstop_tests {
+    use super::*;
+    use std::fs::File;
+    use std::time::Duration;
+
+    async fn failed_kill_file_preserves_root_backstop(all: bool) {
+        let delegated = std::env::var_os("SHEPHERD_CGROUP_ROOT")
+            .expect("set a writable delegated cgroup v2 ancestor");
+        let backend = UnixProcessBackend::with_cgroup_root(delegated).unwrap();
+        let scope = ProcessScopeId::new(1);
+        let other = ProcessScopeId::new(2);
+        let spec = ProcessSpec::new("/bin/sleep").arg("30");
+        let root = backend.spawn(scope, &spec).await.unwrap();
+        let survivor = backend.spawn(other, &spec).await.unwrap();
+        assert!(
+            backend.state.lock().unwrap().children[&child_key(&root.os)]
+                .pidfd
+                .is_some(),
+            "privileged Linux regression requires a real pidfd"
+        );
+        let cgroups = backend.cgroups.as_ref().unwrap();
+        // Inject an actual write error into the retained descriptor; normal cgroup
+        // creation, membership, the OS child, and its pidfd are all real.
+        let saved = cgroups.replace_kill_file(scope, File::open("/dev/null").unwrap());
+        assert_eq!(
+            cgroups.kill(scope).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        let sender = backend.state.lock().unwrap().children[&child_key(&root.os)]
+            .sender
+            .clone();
+        backend.publish_wait_result(scope, &sender, Err("injected wait failure".into()));
+        assert!(matches!(&*sender.borrow(), Some(Err(_))));
+        assert!(backend.state.lock().unwrap().children[&child_key(&root.os)]
+            .pidfd
+            .is_some());
+        let mut recovered = sender.subscribe();
+        if all {
+            backend.hard_kill_all();
+        } else {
+            backend.hard_kill_scope(scope);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(&*recovered.borrow_and_update(), Some(Ok(_))) {
+                    break;
+                }
+                recovered.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("failed wait discarded root kill identity");
+        let exit = tokio::time::timeout(Duration::from_secs(5), backend.wait(&root))
+            .await
+            .expect("failed cgroup write abandoned its registered root")
+            .unwrap();
+        assert_eq!(exit.signal, Some(Signal::Kill));
+        // Root reap does not establish descendant containment. The failed cgroup
+        // interface must still cause explicit cleanup to return an error.
+        assert!(backend.cleanup_scope(scope).await.is_err());
+        assert_eq!(
+            backend.capabilities().descendant_containment,
+            Containment::CgroupV2
+        );
+        if !all {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), backend.wait(&survivor))
+                    .await
+                    .is_err(),
+                "scope-only fallback signalled another scope"
+            );
+            backend.cleanup_scope(other).await.unwrap();
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), backend.wait(&survivor))
+                .await
+                .unwrap()
+                .unwrap()
+                .signal,
+            Some(Signal::Kill)
+        );
+        if all {
+            backend.cleanup_scope(other).await.unwrap();
+        }
+        drop(cgroups.replace_kill_file(scope, saved));
+        backend.cleanup_scope(scope).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires delegated cgroup v2; privileged CI runs this fail-closed"]
+    async fn scope_backstop_kills_roots_when_cgroup_write_fails() {
+        failed_kill_file_preserves_root_backstop(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires delegated cgroup v2; privileged CI runs this fail-closed"]
+    async fn all_backstop_kills_roots_when_one_cgroup_write_fails() {
+        failed_kill_file_preserves_root_backstop(true).await;
     }
 }
 
@@ -855,13 +1216,15 @@ fn apply_env(cmd: &mut tokio::process::Command, env: &EnvPolicy) {
     }
 }
 
-fn to_nix(signal: Signal) -> NixSignal {
-    match signal {
+fn to_nix(signal: Signal) -> Result<NixSignal, TerminateError> {
+    Ok(match signal {
         Signal::Term => NixSignal::SIGTERM,
         Signal::Kill => NixSignal::SIGKILL,
         Signal::Interrupt => NixSignal::SIGINT,
-        Signal::Custom(raw) => NixSignal::try_from(raw).unwrap_or(NixSignal::SIGTERM),
-    }
+        Signal::Custom(raw) => {
+            NixSignal::try_from(raw).map_err(|e| TerminateError::Signal(e.to_string()))?
+        }
+    })
 }
 
 fn signal_from_raw(raw: i32) -> Signal {
@@ -1036,149 +1399,358 @@ fn parse_state(field: &str) -> ProcessState {
     }
 }
 
-fn kill_registered_roots(state: &State, scope: ProcessScopeId) {
-    for ((pid, token), slot) in state
-        .children
-        .iter()
-        .filter(|(_, slot)| slot.scope == scope)
-    {
-        #[cfg(target_os = "linux")]
-        if let Some(fd) = &slot.pidfd {
-            let _ = pidfd_kill(fd.as_raw_fd(), NixSignal::SIGKILL);
-            // Buffer the reap request even if a concurrent failed observation has
-            // not been published yet. A successful waiter ignores this token.
-            let _ = slot.retry.try_send(());
-            continue;
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = slot;
-        if *token != 0 && read_start_time(*pid) == Some(*token) {
-            let _ = kill(Pid::from_raw(*pid as i32), Some(NixSignal::SIGKILL));
-        }
-        let _ = slot.retry.try_send(());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// The waiter task reaps as soon as the OS child exits. A late `wait()` — the
+    /// monitor not yet scheduled, or a caller that subscribed after reap — must still
+    /// observe the recorded exit instead of `WaitError` / `ReapFailed`.
     #[tokio::test]
-    async fn failed_wait_retains_identity_until_verified_reap() {
+    async fn late_wait_after_natural_exit_still_sees_status() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let spec = ProcessSpec::new("true");
+        let spawned = backend.spawn(scope, &spec).await.expect("spawn true");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let exit = backend
+            .wait(&spawned)
+            .await
+            .expect("late wait must not lose a reaped child");
+        assert_eq!(exit.code, Some(0));
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[tokio::test]
+    async fn mismatched_reuse_token_cannot_signal_a_live_child() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let child = backend
+            .spawn(scope, &ProcessSpec::new("sleep").arg("30"))
+            .await
+            .unwrap();
+        let wrong = Spawned {
+            os: OsIdentity::new(child.os.pid, ReuseToken::StartTime(u64::MAX)),
+        };
+        backend.signal(&wrong, Signal::Kill).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), backend.wait(&child))
+                .await
+                .is_err()
+        );
+        backend.signal(&child, Signal::Kill).await.unwrap();
+        assert_eq!(
+            backend.wait(&child).await.unwrap().signal,
+            Some(Signal::Kill)
+        );
+        backend.cleanup_scope(scope).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn anchor_reaped(backend: &UnixProcessBackend, scope: ProcessScopeId) {
+        let mut exit = backend.state.lock().unwrap().anchors[&scope]
+            .exit
+            .subscribe();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(result) = exit.borrow_and_update().clone() {
+                    result.unwrap();
+                    break;
+                }
+                exit.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::zombie_processes)] // Reaped explicitly by libc::waitpid to exercise ECHILD.
+    async fn externally_reaped_anchor_discards_numeric_wait_and_kill_ownership() {
+        let changes =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).unwrap();
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let mut sibling = std::process::Command::new("/bin/sleep");
+        sibling.arg("30");
+        unsafe {
+            sibling.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut sibling = sibling.spawn().unwrap();
+        let (exit, receiver) = watch::channel(None);
+        let mut worker = AnchorWait {
+            child: NativeChild {
+                child: Some(child),
+                changes,
+            },
+            state: Weak::new(),
+            exit,
+            scope: ProcessScopeId::new(1),
+            // Model the old numeric PGID being reassigned to an unrelated group.
+            pgid: sibling.id() as i32,
+            armed: true,
+        };
+        kill(Pid::from_raw(pid), Some(NixSignal::SIGKILL)).unwrap();
+        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) }, pid);
+        std::future::poll_fn(|cx| worker.poll_exit(cx)).await;
+        assert!(
+            worker.child.child.is_none(),
+            "ECHILD retained an orphan numeric wait"
+        );
+        assert!(!worker.armed);
+        assert!(receiver.borrow().as_ref().unwrap().is_err());
+        drop(worker);
+        let survived = sibling.try_wait().unwrap().is_none();
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+        assert!(
+            survived,
+            "ownership-lost anchor Drop signalled unrelated group"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_broadcast_does_not_poison_an_open_scope() {
+        for signal in ["TERM", "KILL"] {
+            let backend = UnixProcessBackend::new();
+            let scope = ProcessScopeId::new(1);
+            let child = backend
+                .spawn(
+                    scope,
+                    &ProcessSpec::new("/bin/sh").args(["-c", &format!("kill -{signal} 0")]),
+                )
+                .await
+                .unwrap();
+            let exit = backend.wait(&child).await.unwrap();
+            assert!(exit.signal.is_some());
+            if signal == "KILL" {
+                anchor_reaped(&backend, scope).await;
+            }
+            let next = backend
+                .spawn(scope, &ProcessSpec::new("true"))
+                .await
+                .expect("an empty open scope remains reusable after a group broadcast");
+            assert_eq!(backend.wait(&next).await.unwrap().code, Some(0));
+            backend.cleanup_scope(scope).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reaped_anchor_cannot_signal_a_recycled_group_number() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let other = ProcessScopeId::new(2);
+        let child = backend
+            .spawn(scope, &ProcessSpec::new("true"))
+            .await
+            .unwrap();
+        backend.wait(&child).await.unwrap();
+        let old_pgid = backend.state.lock().unwrap().scope_groups[&scope].pgid;
+        kill(Pid::from_raw(old_pgid), Some(NixSignal::SIGKILL)).unwrap();
+        anchor_reaped(&backend, scope).await;
+        let survivor = backend
+            .spawn(other, &ProcessSpec::new("/bin/sleep").arg("30"))
+            .await
+            .unwrap();
+        {
+            // Model reuse deterministically instead of exhausting the host PID namespace.
+            let mut state = backend.state.lock().unwrap();
+            state.scope_groups.get_mut(&scope).unwrap().pgid = state.scope_groups[&other].pgid;
+        }
+        assert!(backend.signal_scope(scope, Signal::Kill).await.is_err());
+        assert!(backend
+            .spawn(scope, &ProcessSpec::new("true"))
+            .await
+            .is_err());
+        backend.hard_kill_scope(scope);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), backend.wait(&survivor))
+                .await
+                .is_err()
+        );
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .scope_groups
+            .get_mut(&scope)
+            .unwrap()
+            .pgid = old_pgid;
+        backend.cleanup_scope(scope).await.unwrap();
+        backend.signal(&survivor, Signal::Kill).await.unwrap();
+        backend.wait(&survivor).await.unwrap();
+        backend.cleanup_scope(other).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_kill_rejects_new_admission_before_and_after_anchor_reap() {
         let backend = UnixProcessBackend::new();
         let scope = ProcessScopeId::new(1);
         let root = backend
             .spawn(scope, &ProcessSpec::new("/bin/sleep").arg("30"))
             .await
             .unwrap();
-        let key = child_key(&root.os);
-        let sender = backend.state.lock().unwrap().children[&key].sender.clone();
-        backend.publish_wait_result(scope, &sender, Err("injected wait failure".into()));
-        assert!(matches!(&*sender.borrow(), Some(Err(_))));
-        assert!(backend.state.lock().unwrap().children.contains_key(&key));
-        assert_eq!(backend.state.lock().unwrap().scope_groups[&scope].live, 1);
-        // The real OS waiter remains alive and replaces the injected failure only
-        // after it has actually reaped this process.
-        let mut recovered = sender.subscribe();
-        // Model a containment entry already retired independently of root reap.
-        #[cfg(target_os = "linux")]
-        backend.forget_group(scope);
         backend.hard_kill_all();
-        #[cfg(not(target_os = "linux"))]
-        backend.signal(&root, Signal::Kill).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if matches!(&*recovered.borrow_and_update(), Some(Ok(_))) {
-                    break;
-                }
-                recovered.changed().await.unwrap();
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            backend.wait(&root).await.unwrap().signal,
-            Some(Signal::Kill)
+        assert!(
+            matches!(backend.spawn(scope, &ProcessSpec::new("true")).await, Err(SpawnError::ScopeClosed(id)) if id == scope)
         );
-        assert!(!backend.state.lock().unwrap().children.contains_key(&key));
-        #[cfg(not(target_os = "linux"))]
-        assert!(backend.cleanup_scope(scope).await.is_err());
-        #[cfg(target_os = "linux")]
+        backend.wait(&root).await.unwrap();
+        anchor_reaped(&backend, scope).await;
+        assert!(
+            matches!(backend.spawn(scope, &ProcessSpec::new("true")).await, Err(SpawnError::ScopeClosed(id)) if id == scope)
+        );
         backend.cleanup_scope(scope).await.unwrap();
     }
 
-    #[tokio::test]
-    async fn failed_wait_quarantines_recycled_group() {
+    #[test]
+    fn runtime_drop_marks_anchor_pin_unverified_even_before_first_poll() {
+        for poll_waiter in [false, true] {
+            let backend = UnixProcessBackend::new();
+            let scope = ProcessScopeId::new(1);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                backend.ensure_anchor(scope).unwrap();
+                if poll_waiter {
+                    tokio::task::yield_now().await;
+                }
+            });
+            let pgid = backend.state.lock().unwrap().scope_groups[&scope].pgid;
+            drop(runtime);
+            {
+                let state = backend.state.lock().unwrap();
+                let anchor = &state.anchors[&scope];
+                assert!(anchor.kill_issued);
+                assert!(anchor.exit.borrow().as_ref().unwrap().is_err());
+            }
+            // A new runtime must receive an honest error, not trust a stale PID pin or hang.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                assert!(backend.cleanup_scope(scope).await.is_err());
+                assert!(matches!(
+                    backend.spawn(scope, &ProcessSpec::new("true")).await,
+                    Err(SpawnError::ScopeClosed(_))
+                ));
+            });
+            // The interrupted runtime cannot guarantee async reap. Reap this test's own
+            // anchor explicitly if Tokio's orphan reaper has not already consumed it.
+            let waited = unsafe { libc::waitpid(pgid, std::ptr::null_mut(), 0) };
+            assert!(
+                waited == pgid
+                    || (waited == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+            );
+        }
+    }
+
+    async fn removed_group_backstop(all: bool) {
         let backend = UnixProcessBackend::new();
         let scope = ProcessScopeId::new(1);
         let other = ProcessScopeId::new(2);
         let spec = ProcessSpec::new("/bin/sleep").arg("30");
         let root = backend.spawn(scope, &spec).await.unwrap();
         let sibling = backend.spawn(other, &spec).await.unwrap();
-        let sender = backend.state.lock().unwrap().children[&child_key(&root.os)]
-            .sender
-            .clone();
-        backend.publish_wait_result(scope, &sender, Err("injected wait failure".into()));
-        {
-            let mut state = backend.state.lock().unwrap();
-            state.scope_groups.get_mut(&scope).unwrap().pgid = sibling.os.pid as i32;
-        }
-        assert!(
-            matches!(backend.spawn(scope, &spec).await, Err(SpawnError::ScopeClosed(id)) if id == scope)
-        );
-        assert!(backend.signal_scope(scope, Signal::Kill).await.is_err());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), backend.wait(&sibling))
-                .await
-                .is_err()
-        );
-        // Remove the sibling group so the global sweep cannot legitimately signal it.
-        // Its registered root is intentionally removed only within this test model.
-        let sibling_slot = backend
+        let group = backend
             .state
             .lock()
             .unwrap()
-            .children
-            .remove(&child_key(&sibling.os))
+            .scope_groups
+            .remove(&scope)
             .unwrap();
-        backend.forget_group(other);
-        backend.hard_kill_all();
-        let mut sibling_exit = sibling_slot.sender.subscribe();
-        let sibling_alive = tokio::time::timeout(Duration::from_millis(30), async {
-            loop {
-                if sibling_exit.borrow_and_update().is_some() {
-                    break;
-                }
-                sibling_exit.changed().await.unwrap();
-            }
-        })
-        .await
-        .is_err();
+        if all {
+            backend.hard_kill_all();
+        } else {
+            backend.hard_kill_scope(scope);
+        }
+        let result = tokio::time::timeout(Duration::from_secs(2), backend.wait(&root)).await;
+        // Restore the real anchor's group before cleanup, including on regression failure.
         backend
             .state
             .lock()
             .unwrap()
-            .children
-            .insert(child_key(&sibling.os), sibling_slot);
-        backend.signal(&root, Signal::Kill).await.unwrap();
-        backend.signal(&sibling, Signal::Kill).await.unwrap();
-        let mut recovered = sender.subscribe();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if matches!(&*recovered.borrow_and_update(), Some(Ok(_))) {
-                    break;
-                }
-                recovered.changed().await.unwrap();
-            }
-        })
-        .await
-        .unwrap();
-        backend.wait(&root).await.unwrap();
-        backend.wait(&sibling).await.unwrap();
-        assert!(sibling_alive, "quarantined pgid killed another scope");
+            .scope_groups
+            .insert(scope, group);
+        let sibling_alive = identity_still_matches(&sibling.os);
+        backend.hard_kill_all();
+        if result.is_err() {
+            let _ = backend.wait(&root).await;
+        }
+        let sibling_exit = backend.wait(&sibling).await.unwrap();
+        backend.cleanup_scope(scope).await.unwrap();
+        backend.cleanup_scope(other).await.unwrap();
+        assert_eq!(
+            result
+                .expect("retained root was hidden by missing group")
+                .unwrap()
+                .signal,
+            Some(Signal::Kill)
+        );
+        assert_eq!(sibling_exit.signal, Some(Signal::Kill));
+        if !all {
+            assert!(sibling_alive, "scope backstop killed sibling scope");
+        }
     }
 
+    #[tokio::test]
+    async fn scope_backstop_reaches_root_after_group_removal() {
+        removed_group_backstop(false).await;
+    }
+
+    #[tokio::test]
+    async fn global_backstop_reaches_root_after_group_removal() {
+        removed_group_backstop(true).await;
+    }
+
+    #[tokio::test]
+    async fn lost_anchor_backstop_still_kills_registered_roots() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let root = backend
+            .spawn(scope, &ProcessSpec::new("/bin/sleep").arg("30"))
+            .await
+            .unwrap();
+        let pgid = backend.state.lock().unwrap().scope_groups[&scope].pgid;
+        kill(Pid::from_raw(pgid), Some(NixSignal::SIGKILL)).unwrap();
+        anchor_reaped(&backend, scope).await;
+        backend.hard_kill_all();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), backend.wait(&root))
+                .await
+                .unwrap()
+                .unwrap()
+                .signal,
+            Some(Signal::Kill)
+        );
+        backend.cleanup_scope(scope).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod failed_wait_tests {
+    use super::*;
+    use std::time::Duration;
     #[tokio::test]
     async fn actual_wait_failure_retries_and_reaps_child() {
         let backend = UnixProcessBackend::new();
@@ -1204,6 +1776,43 @@ mod tests {
             .unwrap()
             .children
             .contains_key(&child_key(&root.os)));
+    }
+
+    #[tokio::test]
+    async fn cleanup_scope_retries_failed_wait_without_touching_sibling() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let other = ProcessScopeId::new(2);
+        let spec = ProcessSpec::new("/bin/sleep").arg("30");
+        let root = backend.spawn(scope, &spec).await.unwrap();
+        let sibling = backend.spawn(other, &spec).await.unwrap();
+        let mut observation = {
+            let state = backend.state.lock().unwrap();
+            let slot = &state.children[&child_key(&root.os)];
+            slot.failures.store(1, std::sync::atomic::Ordering::SeqCst);
+            slot.sender.subscribe()
+        };
+        assert!(backend.wait(&root).await.is_err());
+        let cleaned = backend.cleanup_scope(scope).await;
+        // No explicit wait/retry request: cleanup must wake the retained Child owner.
+        let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(&*observation.borrow_and_update(), Some(Ok(_))) {
+                    break;
+                }
+                observation.changed().await.unwrap();
+            }
+        })
+        .await;
+        let sibling_alive = identity_still_matches(&sibling.os);
+        backend.hard_kill_all();
+        let root_exit = backend.wait(&root).await.unwrap();
+        backend.wait(&sibling).await.unwrap();
+        backend.cleanup_scope(other).await.unwrap();
+        assert!(cleaned.is_ok());
+        assert!(recovered.is_ok(), "scope cleanup left failed waiter parked");
+        assert_eq!(root_exit.signal, Some(Signal::Kill));
+        assert!(sibling_alive, "cleanup killed sibling scope");
     }
 
     #[tokio::test]
@@ -1414,61 +2023,64 @@ mod tests {
         drop(sender);
     }
 
-    /// The waiter task reaps as soon as the OS child exits. A late `wait()` — the
-    /// monitor not yet scheduled, or a caller that subscribed after reap — must still
-    /// observe the recorded exit instead of `WaitError` / `ReapFailed`.
     #[tokio::test]
-    async fn late_wait_after_natural_exit_still_sees_status() {
+    async fn unanchored_failed_group_cannot_signal_recycled_pgid() {
         let backend = UnixProcessBackend::new();
-        let scope = ProcessScopeId::new(1);
-        let spec = ProcessSpec::new("true");
-        let spawned = backend.spawn(scope, &spec).await.expect("spawn true");
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let exit = backend
-            .wait(&spawned)
-            .await
-            .expect("late wait must not lose a reaped child");
-        assert_eq!(exit.code, Some(0));
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod cgroup_backstop_tests {
-    use super::*;
-    use std::fs::File;
-    use std::time::Duration;
-
-    async fn failed_kill_file_preserves_root_backstop() {
-        let delegated = std::env::var_os("SHEPHERD_CGROUP_ROOT")
-            .expect("set a writable delegated cgroup v2 ancestor");
-        let backend = UnixProcessBackend::with_cgroup_root(delegated).unwrap();
         let scope = ProcessScopeId::new(1);
         let other = ProcessScopeId::new(2);
         let spec = ProcessSpec::new("/bin/sleep").arg("30");
         let root = backend.spawn(scope, &spec).await.unwrap();
-        let survivor = backend.spawn(other, &spec).await.unwrap();
+        let sibling = backend.spawn(other, &spec).await.unwrap();
+        let (anchor, original_pgid) = {
+            let mut state = backend.state.lock().unwrap();
+            let anchor = state.anchors.remove(&scope).unwrap();
+            let sibling_pgid = state.scope_groups[&other].pgid;
+            let group = state.scope_groups.get_mut(&scope).unwrap();
+            let original = group.pgid;
+            group.wait_failed = true;
+            group.pgid = sibling_pgid;
+            (anchor, original)
+        };
+        assert!(backend.signal_scope(scope, Signal::Kill).await.is_err());
+        backend.hard_kill_scope(scope);
         assert!(
-            backend.state.lock().unwrap().children[&child_key(&root.os)]
-                .pidfd
-                .is_some(),
-            "privileged Linux regression requires a real pidfd"
+            tokio::time::timeout(Duration::from_millis(30), backend.wait(&sibling))
+                .await
+                .is_err()
         );
-        let cgroups = backend.cgroups.as_ref().unwrap();
-        // Inject an actual write error into the retained descriptor; normal cgroup
-        // creation, membership, the OS child, and its pidfd are all real.
-        let saved = cgroups.replace_kill_file(scope, File::open("/dev/null").unwrap());
-        assert_eq!(
-            cgroups.kill(scope).unwrap_err().raw_os_error(),
-            Some(libc::EBADF)
-        );
-        let sender = backend.state.lock().unwrap().children[&child_key(&root.os)]
-            .sender
-            .clone();
-        sender.send_replace(Some(Err("injected wait failure".into())));
+        backend.wait(&root).await.unwrap();
+        {
+            let mut state = backend.state.lock().unwrap();
+            state.anchors.insert(scope, anchor);
+            state.scope_groups.get_mut(&scope).unwrap().pgid = original_pgid;
+        }
+        backend.cleanup_scope(scope).await.unwrap();
+        backend.cleanup_scope(other).await.unwrap();
+        backend.wait(&sibling).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_wait_retains_identity_until_verified_reap() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let root = backend
+            .spawn(scope, &ProcessSpec::new("/bin/sleep").arg("30"))
+            .await
+            .unwrap();
+        let key = child_key(&root.os);
+        let sender = backend.state.lock().unwrap().children[&key].sender.clone();
+        backend.publish_wait_result(scope, &sender, Err("injected wait failure".into()));
         assert!(matches!(&*sender.borrow(), Some(Err(_))));
-        assert!(backend.state.lock().unwrap().children[&child_key(&root.os)]
-            .pidfd
-            .is_some());
+        assert!(backend.state.lock().unwrap().children.contains_key(&key));
+        assert_eq!(backend.state.lock().unwrap().scope_groups[&scope].live, 1);
+        assert!(
+            matches!(backend.spawn(scope, &ProcessSpec::new("true")).await,
+            Err(SpawnError::ScopeClosed(id)) if id == scope)
+        );
+        // F retains a separate live anchor, so group signalling is still safe.
+        backend.signal_scope(scope, Signal::Kill).await.unwrap();
+        // The real OS waiter remains alive and replaces the injected failure only
+        // after it has actually reaped this process.
         let mut recovered = sender.subscribe();
         backend.hard_kill_all();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1480,36 +2092,13 @@ mod cgroup_backstop_tests {
             }
         })
         .await
-        .expect("failed wait discarded the root kill identity");
-        let exit = tokio::time::timeout(Duration::from_secs(5), backend.wait(&root))
-            .await
-            .expect("failed cgroup write abandoned its registered root")
-            .unwrap();
-        assert_eq!(exit.signal, Some(Signal::Kill));
-        // Root reap does not establish descendant containment. The failed cgroup
-        // interface must still cause explicit cleanup to return an error.
-        assert!(backend.cleanup_scope(scope).await.is_err());
+        .unwrap();
         assert_eq!(
-            backend.capabilities().descendant_containment,
-            Containment::CgroupV2
-        );
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), backend.wait(&survivor))
-                .await
-                .unwrap()
-                .unwrap()
-                .signal,
+            backend.wait(&root).await.unwrap().signal,
             Some(Signal::Kill)
         );
-        backend.cleanup_scope(other).await.unwrap();
-        drop(cgroups.replace_kill_file(scope, saved));
+        assert!(!backend.state.lock().unwrap().children.contains_key(&key));
         backend.cleanup_scope(scope).await.unwrap();
-    }
-
-    #[tokio::test]
-    #[ignore = "requires delegated cgroup v2; privileged CI runs this fail-closed"]
-    async fn all_backstop_kills_roots_when_one_cgroup_write_fails() {
-        failed_kill_file_preserves_root_backstop().await;
     }
 }
 
@@ -1533,7 +2122,7 @@ mod signal_identity_tests {
         let survived = unrelated.try_wait().unwrap().is_none();
         let _ = unrelated.kill();
         let _ = unrelated.wait();
-        assert!(result.is_err(), "unverified raw PID signal was accepted");
+        assert!(result.is_ok(), "an unregistered target must remain a no-op");
         assert!(survived, "unverified identity killed unrelated process");
     }
 

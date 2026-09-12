@@ -132,3 +132,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p shepherd-fixtures --test output_integration -- --nocapture
+
+  properties-concurrency:
+    name: generated invariants + registry and waiter interleavings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p shepherd --test properties --test adversarial --test scoped
+      - run: cargo test -p shepherd-app --lib loom_
+      - name: Model the actual waiter registration/publication lock
+        env:
+          RUSTFLAGS: --cfg shepherd_loom
+        run: cargo test -p shepherd-infra --lib loom_
+
+  leak-inspection:
+    name: in-process FD or handle counts + owned zombie inspection (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p shepherd-fixtures --test leak_stress -- --nocapture

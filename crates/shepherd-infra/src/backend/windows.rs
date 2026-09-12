@@ -497,6 +497,21 @@ impl ProcessBackend for WindowsJobBackend {
             force_termination: true,
         }
     }
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        let state = self.state.lock().expect("job mutex");
+        for slot in state.children.values().filter(|s| s.scope == scope) {
+            slot.killed.store(true, Ordering::SeqCst);
+        }
+        if let Some(job) = state.jobs.get(&scope) {
+            let _ = unsafe { TerminateJobObject(raw(job), KILLED) };
+        }
+        for slot in state.children.values().filter(|slot| slot.scope == scope) {
+            // Cover a wait failure published just after the kill, as well as one
+            // already parked. The capacity-one request queue coalesces callers.
+            let _ = slot.retry.try_send(());
+        }
+    }
+
     fn hard_kill_all(&self) {
         let state = self.state.lock().expect("job mutex");
         for slot in state.children.values() {
@@ -601,6 +616,47 @@ mod tests {
             Some(Signal::Kill)
         );
         backend.cleanup_scope(scope).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scoped_hard_kill_reaps_failed_waiter_without_touching_sibling() {
+        let backend = WindowsJobBackend::new();
+        backend.fail_first_wait.store(true, Ordering::SeqCst);
+        let scope = ProcessScopeId::new(1);
+        let other = ProcessScopeId::new(2);
+        let spec = ProcessSpec::new("cmd.exe").args(["/C", "ping -n 60 127.0.0.1 >NUL"]);
+        let root = backend.spawn(scope, &spec).await.unwrap();
+        let sibling = backend.spawn(other, &spec).await.unwrap();
+        wait_failed(&backend, &root).await;
+        let (mut exit, sibling_handle) = {
+            let state = backend.state.lock().unwrap();
+            (
+                state.children[&key(&root)].exit.subscribe(),
+                state.children[&key(&sibling)].process.clone(),
+            )
+        };
+        backend.hard_kill_scope(scope);
+        // Observe publication directly: backend.wait must not supply the wakeup.
+        let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(&*exit.borrow_and_update(), Some(Ok(_))) {
+                    break;
+                }
+                exit.changed().await.unwrap();
+            }
+        })
+        .await;
+        let sibling_alive = unsafe { WaitForSingleObject(raw(&sibling_handle), 0) }
+            == windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        // Always finish both jobs before reporting a regression failure.
+        backend.hard_kill_all();
+        let root_exit = backend.wait(&root).await.unwrap();
+        backend.wait(&sibling).await.unwrap();
+        backend.cleanup_scope(scope).await.unwrap();
+        backend.cleanup_scope(other).await.unwrap();
+        assert!(recovered.is_ok(), "scoped kill left failed waiter parked");
+        assert_eq!(root_exit.signal, Some(Signal::Kill));
+        assert!(sibling_alive, "scoped backstop killed sibling scope");
     }
 
     #[tokio::test]

@@ -109,12 +109,12 @@ struct Inner {
     scope_operations: Mutex<HashMap<ProcessScopeId, Arc<ScopeOperation>>>,
     samples: Mutex<HashMap<ProcessId, Result<ProcessStats, StatsError>>>,
     sampler_started: AtomicBool,
+    sampler_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     outputs: Mutex<HashMap<ProcessId, crate::output::ProcessOutput>>,
     scope_results: Mutex<HashMap<ProcessScopeId, ScopeCleanupSender>>,
     completed_scope_results: Mutex<VecDeque<ProcessScopeId>>,
-    completed: Mutex<VecDeque<ProcessId>>,
-    sampler_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     stats_interval: Duration,
+    completed: Mutex<VecDeque<ProcessId>>,
     reports: Mutex<HashMap<ProcessScopeId, ScopeTerminationReport>>,
     pending_outcomes: Mutex<HashMap<ProcessScopeId, HashMap<ProcessId, TerminationOutcome>>>,
     completed_scopes: Mutex<VecDeque<ProcessScopeId>>,
@@ -187,12 +187,12 @@ impl ProcessSupervisor {
                 scope_operations: Mutex::new(HashMap::new()),
                 samples: Mutex::new(HashMap::new()),
                 sampler_started: AtomicBool::new(false),
+                sampler_task: tokio::sync::Mutex::new(None),
                 outputs: Mutex::new(HashMap::new()),
                 scope_results: Mutex::new(HashMap::new()),
                 completed_scope_results: Mutex::new(VecDeque::new()),
-                completed: Mutex::new(VecDeque::new()),
-                sampler_task: tokio::sync::Mutex::new(None),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
+                completed: Mutex::new(VecDeque::new()),
                 reports: Mutex::new(HashMap::new()),
                 pending_outcomes: Mutex::new(HashMap::new()),
                 completed_scopes: Mutex::new(VecDeque::new()),
@@ -328,6 +328,8 @@ impl ProcessSupervisor {
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return Err(SpawnError::ScopeClosed(scope));
         }
+        // Cleanup can publish its report and remove the scope while this spawn
+        // waits on the old operation lock. Preserve the closed-scope error then.
         if self
             .inner
             .reports
@@ -448,16 +450,28 @@ impl ProcessSupervisor {
                 .insert(scope, report_tx.clone());
         });
         let worker = self.worker();
-        let worker_report = report_tx.clone();
+        let backstop = ScopeCleanupBackstop {
+            backend: self.inner.backend.clone(),
+            scope,
+            report: report_tx.clone(),
+            armed: true,
+        };
         let cleanup = tokio::spawn(async move {
+            let mut backstop = backstop;
             let _ = finished.await;
-            worker
-                .cleanup_and_publish_scope(scope, opts, worker_report)
-                .await;
+            let retained = backstop.verified_report();
+            let result = match retained {
+                Some(report) => Ok(report),
+                None => worker.terminate_scope(scope, opts).await,
+            };
+            let result = backstop.verified_report().map(Ok).unwrap_or(result);
+            if !result.as_ref().is_ok_and(|r| r.all_verified()) {
+                backstop.backend.hard_kill_scope(scope);
+            }
+            // Publish within this task: the runtime may stop before its observer runs.
+            backstop.complete(result);
         });
         tokio::spawn(async move {
-            // A normal worker publishes before returning. This observer only handles
-            // failures, so runtime shutdown cannot lose an already completed result.
             if let Err(error) = cleanup.await {
                 publish_scope_cleanup_result(
                     &report_tx,
@@ -504,31 +518,6 @@ impl ProcessSupervisor {
             result,
             termination,
         }
-    }
-
-    async fn cleanup_and_publish_scope(
-        &self,
-        scope: ProcessScopeId,
-        opts: TerminateOptions,
-        report_tx: ScopeCleanupSender,
-    ) {
-        let published = report_tx.borrow().clone();
-        let result = if let Some(Ok(report)) =
-            published.filter(|result| result.as_ref().is_ok_and(|report| report.all_verified()))
-        {
-            Ok(report)
-        } else {
-            let result = self.terminate_scope(scope, opts).await;
-            // External cleanup can complete while this worker waits, then its general
-            // report can expire. Our channel retains that verified result independently.
-            match report_tx.borrow().clone() {
-                Some(Ok(report)) if report.all_verified() => Ok(report),
-                _ => result,
-            }
-        };
-        // terminate_scope commits verified publication and bounded history together.
-        // Publish errors here without replacing a concurrently verified external result.
-        publish_scope_cleanup_result(&report_tx, result);
     }
 
     /// Waits for the retained report of a with_scope block, including after cancellation.
@@ -686,13 +675,22 @@ impl ProcessSupervisor {
         if let Some(exit) = self.inner.waiters.try_get(pid) {
             return Ok(exit);
         }
-        {
+        let future = {
             let registry = self.lock_registry();
-            if registry.scope_of(pid).is_none() {
-                return Err(WaitError::UnknownProcess(pid));
+            let Some(scope) = registry.scope_of(pid).and_then(|id| registry.get(id)) else {
+                return self
+                    .inner
+                    .waiters
+                    .try_get(pid)
+                    .ok_or(WaitError::UnknownProcess(pid));
+            };
+            if let Some(exit) = scope.get(pid).and_then(|p| p.exit()) {
+                return Ok(exit);
             }
-        }
-        Ok(self.inner.waiters.wait(pid).await)
+            // Register under ownership lock before a completion can be pruned/evicted.
+            self.inner.waiters.wait(pid)
+        };
+        Ok(future.await)
     }
 
     /// Terminates a single process with a verified two-phase teardown.
@@ -715,11 +713,15 @@ impl ProcessSupervisor {
             return Ok(exit);
         }
 
-        let (scope, spawned, graceful, request_events, quarantined) = {
+        let (scope, spawned, graceful, request_events, quarantined, mut exit_future) = {
             let mut registry = self.lock_registry();
-            let scope = registry
-                .scope_of(pid)
-                .ok_or(TerminateError::UnknownProcess(pid))?;
+            let Some(scope) = registry.scope_of(pid) else {
+                return self
+                    .inner
+                    .waiters
+                    .try_get(pid)
+                    .ok_or(TerminateError::UnknownProcess(pid));
+            };
             let s = registry.get_mut(scope).expect("scope exists");
             let process = s.get(pid).ok_or(TerminateError::UnknownProcess(pid))?;
             if let Some(exit) = process.exit() {
@@ -733,7 +735,14 @@ impl ProcessSupervisor {
             };
             let graceful = process.spec().graceful_signal;
             let events = s.request_termination(pid)?;
-            (scope, spawned, graceful, events, quarantined)
+            (
+                scope,
+                spawned,
+                graceful,
+                events,
+                quarantined,
+                self.inner.waiters.wait(pid),
+            )
         };
         if quarantined {
             return self
@@ -754,7 +763,7 @@ impl ProcessSupervisor {
         // Graceful phase.
         let _ = self.inner.backend.signal(&spawned, graceful).await;
         tokio::select! {
-            exit = self.inner.waiters.wait(pid) => return Ok(exit),
+            exit = &mut exit_future => return Ok(exit),
             () = self.inner.clock.sleep(opts.grace.as_duration()) => {}
         }
 
@@ -769,7 +778,7 @@ impl ProcessSupervisor {
 
         let exit = match opts.force_timeout {
             Some(timeout) => tokio::select! {
-                exit = self.inner.waiters.wait(pid) => exit,
+                exit = &mut exit_future => exit,
                 () = self.inner.clock.sleep(timeout) => ProcessExit {
                     pid,
                     code: None,
@@ -780,7 +789,7 @@ impl ProcessSupervisor {
                     forced: true,
                 },
             },
-            None => self.inner.waiters.wait(pid).await,
+            None => exit_future.await,
         };
         Ok(exit)
     }
@@ -796,7 +805,16 @@ impl ProcessSupervisor {
         opts: TerminateOptions,
     ) -> Result<ProcessExit, TerminateError> {
         let _ = self.inner.backend.signal(&spawned, graceful).await;
-        let mut observation = self.inner.backend.wait(&spawned);
+        let observe = || {
+            std::panic::AssertUnwindSafe(self.inner.backend.wait(&spawned))
+                .catch_unwind()
+                .map(|result| {
+                    result
+                        .unwrap_or_else(|_| Err(WaitError::Backend("retry waiter panicked".into())))
+                })
+                .boxed()
+        };
+        let mut observation = observe();
         let grace = self.inner.clock.sleep(opts.grace.as_duration());
         tokio::pin!(grace);
         let observed = tokio::select! {
@@ -812,7 +830,7 @@ impl ProcessSupervisor {
         }
         let _ = self.inner.backend.signal(&spawned, Signal::Kill).await;
         if observed.is_some() {
-            observation = self.inner.backend.wait(&spawned);
+            observation = observe();
         }
         let result = match opts.force_timeout {
             Some(timeout) => tokio::select! {
@@ -915,7 +933,7 @@ impl ProcessSupervisor {
         let operation = match self.scope_operation(scope) {
             Some(operation) => operation,
             None => {
-                // Cleanup may have published and removed its lock since the first read.
+                // Cleanup may have published and removed its lock since our first read.
                 return self
                     .inner
                     .reports
@@ -978,15 +996,41 @@ impl ProcessSupervisor {
                     retained.entry(pid).or_insert(outcome);
                 }
             }
-            (events, live)
+            let processes = s
+                .process_ids()
+                .into_iter()
+                .map(|pid| {
+                    let observer: crate::ports::WaitFuture = match s.get(pid).and_then(|p| p.exit())
+                    {
+                        Some(exit) => Box::pin(std::future::ready(exit)),
+                        None => self.inner.waiters.wait(pid),
+                    };
+                    (pid, observer)
+                })
+                .collect::<Vec<_>>();
+            (events, processes)
         };
         events.retain(|event| !matches!(event, shepherd_domain::DomainEvent::ScopeClosed { .. }));
         self.inner.dispatcher.dispatch(&events).await;
 
         let mut set = tokio::task::JoinSet::new();
-        for pid in live {
+        for (pid, observer) in live {
             let this = self.worker();
-            set.spawn(async move { (pid, this.terminate(pid, opts).await) });
+            set.spawn(async move {
+                let termination = this.terminate(pid, opts);
+                tokio::pin!(termination);
+                let result = tokio::select! { biased;
+                    exit = observer => {
+                        if exit.outcome.is_verified() {
+                            Ok(exit)
+                        } else {
+                            termination.await
+                        }
+                    },
+                    result = &mut termination => result,
+                };
+                (pid, result)
+            });
         }
 
         while let Some(joined) = set.join_next().await {
@@ -1020,7 +1064,6 @@ impl ProcessSupervisor {
         // Sweep any descendants that outlived their roots: a whole-group kill catches
         // grandchildren the per-root path does not track individually.
         self.inner.backend.cleanup_scope(scope).await?;
-
         let mut outcomes: Vec<_> = self
             .inner
             .pending_outcomes
@@ -1030,6 +1073,43 @@ impl ProcessSupervisor {
             .into_iter()
             .flat_map(|outcomes| outcomes.iter().map(|(pid, outcome)| (*pid, *outcome)))
             .collect();
+        // A containment sweep can finish roots whose individual signal failed or timed out.
+        // Re-observe their monitor outcome; a sweep itself is never evidence of reap.
+        for (pid, outcome) in &mut outcomes {
+            if !outcome.is_verified() {
+                let waited = match opts.force_timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, self.wait(*pid)).await.ok(),
+                    None => Some(self.wait(*pid).await),
+                };
+                if let Some(Ok(exit)) = waited {
+                    *outcome = exit.outcome;
+                }
+            }
+        }
+
+        // Keep a verified monitor result if it arrived while a retry observer waited.
+        {
+            let mut pending = self
+                .inner
+                .pending_outcomes
+                .lock()
+                .expect("pending outcomes mutex");
+            let retained = pending.entry(scope).or_default();
+            for (pid, outcome) in outcomes {
+                retained
+                    .entry(pid)
+                    .and_modify(|previous| {
+                        if !previous.is_verified() {
+                            *previous = outcome;
+                        }
+                    })
+                    .or_insert(outcome);
+            }
+            outcomes = retained
+                .iter()
+                .map(|(pid, outcome)| (*pid, *outcome))
+                .collect();
+        }
         outcomes.sort_by_key(|(pid, _)| *pid);
         let report = ScopeTerminationReport { scope, outcomes };
         if report.all_verified() {
@@ -1181,7 +1261,10 @@ impl ProcessSupervisor {
     fn start_monitor(&self, scope: ProcessScopeId, pid: ProcessId, spawned: Spawned) {
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            let wait_result = inner.backend.wait(&spawned).await;
+            let wait_result = std::panic::AssertUnwindSafe(inner.backend.wait(&spawned))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(WaitError::Backend("waiter panicked".into())));
             let verified_reap = wait_result.is_ok();
             let events = {
                 let mut registry = inner.registry.lock().expect("registry mutex");
@@ -1313,35 +1396,421 @@ impl ScopedProcesses {
     pub fn processes(&self) -> &[ProcessId] {
         &self.processes
     }
+    // Retain authorization while any owned process or bounded observation remains.
+    // The lock order extends the supervisor's registry -> outputs/waiters order; no
+    // supervisor operation takes the per-handle owned lock in the other direction.
+    fn observable_owned(&self) -> std::sync::MutexGuard<'_, HashSet<ProcessId>> {
+        let mut owned = self.owned.lock().expect("scoped processes mutex");
+        let registry = self.supervisor.lock_registry();
+        let scope = registry.get(self.scope);
+        let outputs = self.supervisor.inner.outputs.lock().expect("outputs mutex");
+        owned.retain(|pid| {
+            scope.is_some_and(|s| s.contains(*pid))
+                || outputs.contains_key(pid)
+                || self.supervisor.inner.waiters.try_get(*pid).is_some()
+        });
+        owned
+    }
+
     pub async fn spawn(&self, spec: ProcessSpec) -> Result<ProcessId, SpawnError> {
         let pid = self.supervisor.spawn(self.scope, spec).await?;
-        self.owned
-            .lock()
-            .expect("scoped processes mutex")
-            .insert(pid);
+        self.observable_owned().insert(pid);
         Ok(pid)
     }
     pub async fn wait(&self, pid: ProcessId) -> Result<ProcessExit, WaitError> {
-        if !self
-            .owned
-            .lock()
-            .expect("scoped processes mutex")
-            .contains(&pid)
-        {
+        if !self.observable_owned().contains(&pid) {
             return Err(WaitError::UnknownProcess(pid));
         }
-        self.supervisor.wait(pid).await
+        let result = self.supervisor.wait(pid).await;
+        drop(self.observable_owned());
+        result
     }
     pub fn take_output(&self, pid: ProcessId) -> Option<crate::output::ProcessOutput> {
-        if !self
-            .owned
-            .lock()
-            .expect("scoped processes mutex")
-            .contains(&pid)
-        {
+        if !self.observable_owned().contains(&pid) {
             return None;
         }
-        self.supervisor.take_output(pid)
+        let output = self.supervisor.take_output(pid);
+        drop(self.observable_owned());
+        output
+    }
+}
+
+struct ScopeCleanupBackstop {
+    backend: Arc<dyn ProcessBackend>,
+    scope: ProcessScopeId,
+    report: ScopeCleanupSender,
+    armed: bool,
+}
+impl ScopeCleanupBackstop {
+    fn verified_report(&self) -> Option<ScopeTerminationReport> {
+        self.report
+            .borrow()
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .filter(|report| report.all_verified())
+            .cloned()
+    }
+    fn complete(&mut self, result: Result<ScopeTerminationReport, TerminateError>) {
+        // No suspension point may separate result publication from disarming.
+        publish_scope_cleanup_result(&self.report, result);
+        self.armed = false;
+    }
+}
+impl Drop for ScopeCleanupBackstop {
+    fn drop(&mut self) {
+        if self.armed && self.verified_report().is_none() {
+            self.backend.hard_kill_scope(self.scope);
+            publish_scope_cleanup_result(
+                &self.report,
+                Err(TerminateError::Signal(
+                    "scope cleanup interrupted or unverified; synchronous backstop issued".into(),
+                )),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod spawn_cleanup_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::future::Future;
+    use std::task::Context;
+
+    // This regression closes an empty scope: no process operation should be reached.
+    struct EmptyPorts;
+    #[async_trait]
+    impl ProcessBackend for EmptyPorts {
+        async fn spawn(&self, _: ProcessScopeId, _: &ProcessSpec) -> Result<Spawned, SpawnError> {
+            panic!("a queued spawn must not reach the backend after scope cleanup")
+        }
+        async fn signal(&self, _: &Spawned, _: Signal) -> Result<(), TerminateError> {
+            unreachable!()
+        }
+        async fn signal_scope(&self, _: ProcessScopeId, _: Signal) -> Result<(), TerminateError> {
+            Ok(())
+        }
+        async fn wait(&self, _: &Spawned) -> Result<shepherd_domain::RawExit, WaitError> {
+            unreachable!()
+        }
+        async fn sample(&self, _: &Spawned) -> Result<shepherd_domain::RawStats, StatsError> {
+            unreachable!()
+        }
+        fn capabilities(&self) -> shepherd_domain::Capabilities {
+            unreachable!()
+        }
+        fn hard_kill_all(&self) {}
+        fn hard_kill_scope(&self, _: ProcessScopeId) {}
+    }
+    #[async_trait]
+    impl Clock for EmptyPorts {
+        fn now(&self) -> Instant {
+            unreachable!()
+        }
+        async fn sleep(&self, _: Duration) {
+            unreachable!()
+        }
+    }
+    impl Waiters for EmptyPorts {
+        fn signal_exit(&self, _: ProcessId, _: ProcessExit) {
+            unreachable!()
+        }
+        fn try_get(&self, _: ProcessId) -> Option<ProcessExit> {
+            unreachable!()
+        }
+        fn wait(&self, _: ProcessId) -> crate::ports::WaitFuture {
+            unreachable!()
+        }
+    }
+    #[async_trait]
+    impl IntegrationEventPublisher for EmptyPorts {
+        async fn publish(&self, _: shepherd_domain::IntegrationEvent) {}
+    }
+
+    #[tokio::test]
+    async fn spawn_queued_behind_cleanup_reports_scope_closed() {
+        let ports = Arc::new(EmptyPorts);
+        let sup = ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports);
+        let scope = sup.create_scope();
+        let operation = sup.scope_operation(scope).unwrap();
+        let held = operation.lock().await;
+        let mut cleanup = std::pin::pin!(sup.terminate_scope(scope, TerminateOptions::default()));
+        let mut spawn = std::pin::pin!(sup.spawn_owned(scope, ProcessSpec::new("unused")));
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        // Explicit polls establish FIFO lock order, with spawn retaining the old lock
+        // while cleanup will remove both the registry entry and its lock-map entry.
+        assert!(cleanup.as_mut().poll(&mut cx).is_pending());
+        assert!(spawn.as_mut().poll(&mut cx).is_pending());
+        drop(held);
+        assert!(cleanup.await.unwrap().all_verified());
+        assert!(sup.processes(scope).is_none());
+        assert!(matches!(spawn.await, Err(SpawnError::ScopeClosed(id)) if id == scope));
+    }
+}
+
+#[cfg(test)]
+mod scoped_history_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::AtomicU32;
+    use tokio::sync::watch;
+
+    #[derive(Default)]
+    struct ExitHistory {
+        exits: HashMap<ProcessId, watch::Sender<Option<ProcessExit>>>,
+        completed: VecDeque<ProcessId>,
+    }
+    // Immediate roots and a bounded waiter adapter exercise the real supervisor's
+    // monitor, output eviction and scoped APIs without an infrastructure dependency.
+    #[derive(Default)]
+    struct HistoryPorts {
+        next: AtomicU32,
+        history: Mutex<ExitHistory>,
+    }
+    #[async_trait]
+    impl ProcessBackend for HistoryPorts {
+        async fn spawn(&self, _: ProcessScopeId, _: &ProcessSpec) -> Result<Spawned, SpawnError> {
+            let pid = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(Spawned {
+                os: shepherd_domain::OsIdentity::new(
+                    pid,
+                    shepherd_domain::ReuseToken::StartTime(u64::from(pid)),
+                ),
+            })
+        }
+        async fn signal(&self, _: &Spawned, _: Signal) -> Result<(), TerminateError> {
+            Ok(())
+        }
+        async fn signal_scope(&self, _: ProcessScopeId, _: Signal) -> Result<(), TerminateError> {
+            Ok(())
+        }
+        async fn wait(&self, target: &Spawned) -> Result<shepherd_domain::RawExit, WaitError> {
+            if target.os.pid == 1 {
+                return Err(WaitError::Backend("quarantined root".into()));
+            }
+            Ok(shepherd_domain::RawExit {
+                code: Some(0),
+                signal: None,
+                core_dumped: false,
+            })
+        }
+        async fn sample(&self, _: &Spawned) -> Result<shepherd_domain::RawStats, StatsError> {
+            Err(StatsError::Backend("unused sampler".into()))
+        }
+        fn output(&self, _: &Spawned) -> Option<crate::output::ProcessOutput> {
+            Some(crate::output::ProcessOutput(Arc::new(EmptyOutput)))
+        }
+        fn capabilities(&self) -> shepherd_domain::Capabilities {
+            unreachable!("this regression does not query backend capabilities")
+        }
+        fn hard_kill_all(&self) {}
+        fn hard_kill_scope(&self, _: ProcessScopeId) {}
+    }
+    #[async_trait]
+    impl Clock for HistoryPorts {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+        async fn sleep(&self, duration: Duration) {
+            tokio::time::sleep(duration).await;
+        }
+    }
+    impl Waiters for HistoryPorts {
+        fn signal_exit(&self, pid: ProcessId, exit: ProcessExit) {
+            let mut history = self.history.lock().unwrap();
+            history
+                .exits
+                .entry(pid)
+                .or_insert_with(|| watch::channel(None).0)
+                .send_replace(Some(exit));
+            history.completed.push_back(pid);
+            while history.completed.len() > 128 {
+                let old = history.completed.pop_front().unwrap();
+                history.exits.remove(&old);
+            }
+        }
+        fn try_get(&self, pid: ProcessId) -> Option<ProcessExit> {
+            self.history
+                .lock()
+                .unwrap()
+                .exits
+                .get(&pid)
+                .and_then(|exit| *exit.borrow())
+        }
+        fn wait(&self, pid: ProcessId) -> crate::ports::WaitFuture {
+            let mut receiver = self
+                .history
+                .lock()
+                .unwrap()
+                .exits
+                .entry(pid)
+                .or_insert_with(|| watch::channel(None).0)
+                .subscribe();
+            Box::pin(async move {
+                loop {
+                    if let Some(exit) = *receiver.borrow_and_update() {
+                        return exit;
+                    }
+                    receiver.changed().await.unwrap();
+                }
+            })
+        }
+    }
+    #[async_trait]
+    impl IntegrationEventPublisher for HistoryPorts {
+        async fn publish(&self, _: shepherd_domain::IntegrationEvent) {}
+    }
+    #[derive(Default)]
+    struct RecoveringBackend {
+        panic_attempts: u32,
+        waits: AtomicU32,
+        signals: Mutex<Vec<Signal>>,
+        released: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl ProcessBackend for RecoveringBackend {
+        async fn spawn(&self, _: ProcessScopeId, _: &ProcessSpec) -> Result<Spawned, SpawnError> {
+            Ok(Spawned {
+                os: shepherd_domain::OsIdentity::new(
+                    42,
+                    shepherd_domain::ReuseToken::StartTime(42),
+                ),
+            })
+        }
+        async fn signal(&self, _: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+            self.signals.lock().unwrap().push(signal);
+            self.released.notify_one();
+            Ok(())
+        }
+        async fn signal_scope(&self, _: ProcessScopeId, _: Signal) -> Result<(), TerminateError> {
+            Ok(())
+        }
+        async fn wait(&self, _: &Spawned) -> Result<shepherd_domain::RawExit, WaitError> {
+            if self.waits.fetch_add(1, Ordering::SeqCst) < self.panic_attempts {
+                panic!("injected backend wait panic");
+            }
+            self.released.notified().await;
+            Ok(shepherd_domain::RawExit {
+                code: None,
+                signal: Some(Signal::Term),
+                core_dumped: false,
+            })
+        }
+        async fn sample(&self, _: &Spawned) -> Result<shepherd_domain::RawStats, StatsError> {
+            Err(StatsError::Backend("unused".into()))
+        }
+        fn capabilities(&self) -> shepherd_domain::Capabilities {
+            unreachable!()
+        }
+        fn hard_kill_all(&self) {}
+        fn hard_kill_scope(&self, _: ProcessScopeId) {}
+    }
+
+    async fn run_scope_retry(panic_attempts: u32) {
+        let backend = Arc::new(RecoveringBackend {
+            panic_attempts,
+            ..Default::default()
+        });
+        let ports = Arc::new(HistoryPorts::default());
+        let supervisor =
+            ProcessSupervisor::new(backend.clone(), ports.clone(), ports.clone(), ports);
+        let scope = supervisor.create_scope();
+        let pid = supervisor
+            .spawn(scope, ProcessSpec::new("recovering"))
+            .await
+            .unwrap();
+        let initial = supervisor.wait(pid).await.unwrap();
+        assert_eq!(
+            initial.outcome,
+            TerminationOutcome::CleanupUnverified(UnverifiedReason::ReapFailed)
+        );
+        let report = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.terminate_scope(
+                scope,
+                TerminateOptions {
+                    grace: shepherd_domain::GracePeriod::new(Duration::from_millis(1)),
+                    force_timeout: Some(Duration::from_millis(100)),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.all_verified(), panic_attempts < 3);
+        assert!(backend.waits.load(Ordering::SeqCst) >= 2);
+        let signals = backend.signals.lock().unwrap().clone();
+        assert_eq!(signals.first(), Some(&Signal::Term));
+        if panic_attempts > 1 {
+            assert!(
+                signals.contains(&Signal::Kill),
+                "panic skipped forced attempt"
+            );
+        }
+        assert_eq!(
+            supervisor.wait(pid).await.unwrap().outcome.is_verified(),
+            panic_attempts < 3
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_retry_does_not_short_circuit_on_cached_failed_reap() {
+        run_scope_retry(1).await;
+    }
+
+    #[tokio::test]
+    async fn scope_retry_catches_panics_in_both_fresh_wait_attempts() {
+        run_scope_retry(2).await;
+        run_scope_retry(3).await;
+    }
+
+    struct EmptyOutput;
+    impl crate::output::OutputSink for EmptyOutput {
+        fn push(&self, _: crate::output::OutputStream, _: &[u8]) {}
+        fn close(&self, _: crate::output::OutputStream, _: Option<String>) {}
+        fn read(&self) -> crate::output::OutputSnapshot {
+            unreachable!("the regression transfers output handles without reading bytes")
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_dynamic_membership_expires_history_but_keeps_quarantine_and_observations() {
+        let ports = Arc::new(HistoryPorts::default());
+        let supervisor = ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports);
+        let result = supervisor
+            .with_scope(vec![], |scope| async move {
+                let quarantined = scope.spawn(ProcessSpec::new("unverified")).await.unwrap();
+                assert!(!scope.wait(quarantined).await.unwrap().outcome.is_verified());
+                let mut first_completed = None;
+                let mut latest = quarantined;
+                let mut output_only = None;
+                for index in 0..650 {
+                    latest = scope.spawn(ProcessSpec::new("immediate")).await.unwrap();
+                    first_completed.get_or_insert(latest);
+                    if index == 450 {
+                        output_only = Some(latest);
+                    }
+                    assert!(scope.wait(latest).await.unwrap().outcome.is_verified());
+                    assert!(
+                        scope.owned.lock().unwrap().len() <= 257,
+                        "dynamic membership retained expired completed IDs"
+                    );
+                }
+                let expired = first_completed.unwrap();
+                assert!(matches!(scope.wait(expired).await, Err(WaitError::UnknownProcess(id)) if id == expired));
+                assert!(scope.take_output(expired).is_none());
+                let output_only = output_only.unwrap();
+                assert!(scope.supervisor.inner.waiters.try_get(output_only).is_none());
+                assert!(scope.take_output(output_only).is_some());
+                assert!(scope.take_output(latest).is_some());
+                assert!(scope.wait(latest).await.unwrap().outcome.is_verified());
+                // Both completed caches have evicted this root; registry quarantine
+                // must still authorize observing its unverified outcome.
+                assert!(!scope.wait(quarantined).await.unwrap().outcome.is_verified());
+            })
+            .await;
+        assert!(result.result.is_ok());
+        assert!(!result.termination.unwrap().all_verified());
     }
 }
 
@@ -1374,6 +1843,7 @@ mod scope_operation_tests {
         fn capabilities(&self) -> shepherd_domain::Capabilities {
             unreachable!()
         }
+        fn hard_kill_scope(&self, _: ProcessScopeId) {}
         fn hard_kill_all(&self) {}
     }
     #[async_trait]
@@ -1594,6 +2064,20 @@ mod scope_operation_tests {
             &sender,
             Err(TerminateError::Signal("worker panicked".into())),
         );
+        let mut completed = ScopeCleanupBackstop {
+            backend: supervisor.inner.backend.clone(),
+            scope,
+            report: sender.clone(),
+            armed: true,
+        };
+        completed.complete(Err(TerminateError::UnknownScope(scope)));
+        drop(completed);
+        drop(ScopeCleanupBackstop {
+            backend: supervisor.inner.backend.clone(),
+            scope,
+            report: sender.clone(),
+            armed: true,
+        });
         assert!(receiver
             .borrow()
             .as_ref()
@@ -1601,6 +2085,55 @@ mod scope_operation_tests {
             .as_ref()
             .unwrap()
             .all_verified());
+    }
+
+    #[tokio::test]
+    async fn ordinary_scope_history_does_not_evict_scoped_cleanup_results() {
+        let supervisor = supervisor();
+        let first = supervisor.with_scope(Vec::new(), |_| async {}).await;
+        assert!(first.termination.unwrap().all_verified());
+        for _ in 0..650 {
+            let scope = supervisor.create_scope();
+            supervisor
+                .terminate_scope(scope, Default::default())
+                .await
+                .unwrap();
+        }
+        assert!(supervisor
+            .wait_scope_cleanup(first.scope)
+            .await
+            .unwrap()
+            .all_verified());
+        assert_eq!(
+            supervisor
+                .inner
+                .completed_scope_results
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
+        for _ in 0..256 {
+            assert!(supervisor
+                .with_scope(Vec::new(), |_| async {})
+                .await
+                .termination
+                .unwrap()
+                .all_verified());
+        }
+        assert!(
+            matches!(supervisor.wait_scope_cleanup(first.scope).await, Err(TerminateError::UnknownScope(id)) if id == first.scope)
+        );
+        assert_eq!(supervisor.inner.scope_results.lock().unwrap().len(), 256);
+        assert_eq!(
+            supervisor
+                .inner
+                .completed_scope_results
+                .lock()
+                .unwrap()
+                .len(),
+            256
+        );
     }
 
     #[tokio::test]
@@ -1614,12 +2147,21 @@ mod scope_operation_tests {
                     .await
                     .unwrap();
                 assert!(report.all_verified());
+                let receiver = external
+                    .inner
+                    .scope_results
+                    .lock()
+                    .unwrap()
+                    .get(&scope.id())
+                    .unwrap()
+                    .subscribe();
                 for _ in 0..650 {
-                    let old = external.create_scope();
-                    external
-                        .terminate_scope(old, Default::default())
+                    assert!(external
+                        .with_scope(Vec::new(), |_| async {})
                         .await
-                        .unwrap();
+                        .termination
+                        .unwrap()
+                        .all_verified());
                 }
                 assert!(!external
                     .inner
@@ -1627,31 +2169,21 @@ mod scope_operation_tests {
                     .lock()
                     .unwrap()
                     .contains_key(&scope.id()));
-                // Match F's global history eviction as well: both active participants
-                // must use their own channel, independently of lookup retention.
-                let receiver = external
+                assert!(!external
                     .inner
                     .scope_results
                     .lock()
                     .unwrap()
-                    .remove(&scope.id())
-                    .unwrap()
-                    .subscribe();
+                    .contains_key(&scope.id()));
                 (42, receiver)
             })
             .await;
         let (value, receiver) = result.result.unwrap();
         assert_eq!(value, 42);
         assert!(result.termination.unwrap().all_verified());
-        // Wait for the worker's history update, proving it also retained success.
+        // The worker owns Inner until it finishes; no lookup entry remains to help it.
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !supervisor
-                .inner
-                .completed_scope_results
-                .lock()
-                .unwrap()
-                .contains(&result.scope)
-            {
+            while Arc::strong_count(&supervisor.inner) != 1 {
                 tokio::task::yield_now().await;
             }
         })
@@ -1667,47 +2199,52 @@ mod scope_operation_tests {
     }
 
     #[test]
-    fn completed_cleanup_is_published_without_join_observer_before_runtime_drop() {
+    fn completed_cleanup_is_observable_after_runtime_drop_without_join_observer() {
         let supervisor = supervisor();
         let scope = supervisor.create_scope();
-        let (report, _) = tokio::sync::watch::channel(None);
+        let (sender, _) = tokio::sync::watch::channel(None);
         supervisor
             .inner
             .scope_results
             .lock()
             .unwrap()
-            .insert(scope, report.clone());
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        // Drive the worker body to completion without ever starting its JoinHandle
-        // observer, then destroy the runtime that performed cleanup.
-        runtime.block_on(supervisor.worker().cleanup_and_publish_scope(
+            .insert(scope, sender.clone());
+        let worker = supervisor.worker();
+        let mut backstop = ScopeCleanupBackstop {
+            backend: supervisor.inner.backend.clone(),
             scope,
-            Default::default(),
-            report,
-        ));
-        drop(runtime);
+            report: sender,
+            armed: true,
+        };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let result = runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(1), supervisor.wait_scope_cleanup(scope))
-                .await
-                .expect("completed worker left report publication to an unpolled observer")
+        // Run the worker completion operation without ever scheduling a join observer.
+        runtime.block_on(async move {
+            tokio::spawn(async move {
+                let result = worker.terminate_scope(scope, Default::default()).await;
+                backstop.complete(result);
+            })
+            .await
+            .unwrap();
         });
-        assert!(result.unwrap().all_verified());
-        assert_eq!(
-            supervisor
-                .inner
-                .completed_scope_results
-                .lock()
-                .unwrap()
-                .len(),
-            1
-        );
+        drop(runtime);
+        let next = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = next.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                supervisor.wait_scope_cleanup(scope),
+            )
+            .await
+            .expect("worker completed without publishing its result")
+            .unwrap()
+        });
+        assert_eq!(report.scope, scope);
+        assert!(report.all_verified());
     }
 
     #[test]
@@ -1853,6 +2390,7 @@ mod sampler_shutdown_tests {
         fn capabilities(&self) -> shepherd_domain::Capabilities {
             unreachable!()
         }
+        fn hard_kill_scope(&self, _: ProcessScopeId) {}
         fn hard_kill_all(&self) {}
     }
     #[async_trait]

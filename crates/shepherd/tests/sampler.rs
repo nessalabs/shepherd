@@ -93,6 +93,9 @@ impl ProcessBackend for Backend {
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
     }
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.inner.hard_kill_scope(scope);
+    }
     fn hard_kill_all(&self) {
         self.kills.fetch_add(1, Ordering::SeqCst);
         self.inner.hard_kill_all();

@@ -142,8 +142,7 @@ transitions and dispatched to same-context handlers.
 **Domain Event.** A process was observed to have exited (before reaping).
 
 ### ProcessReaped
-**Domain Event.** An exited process's OS resources were reaped; its terminal state is
-confirmed.
+**Domain Event.** A monitor terminal outcome is available. Inspect its `TerminationOutcome`: a failed wait carries `CleanupUnverified(ReapFailed)` and is not proof of OS reap.
 
 ### ScopeClosed
 **Domain Event.** A scope reached the Closed state; all its processes are reaped.
@@ -165,8 +164,8 @@ monitor task, not a handler (see `docs/decisions/0008-monitor-owned-wait.md`).
 **Handler.** On `ProcessReaped`, wakes pending `wait(pid)` callers via `Waiters`.
 
 ### RegistryPruneHandler
-**Handler.** On `ProcessReaped`/`ScopeClosed`, prunes bookkeeping and releases the scope's
-containment resource.
+**Handler.** Prunes verified terminal process records. The supervisor releases the scope
+and containment resource only after final cleanup verification; failed reaps stay quarantined.
 
 ### IntegrationTranslator
 **Handler.** Maps the externally-meaningful subset of domain events into `IntegrationEvent`s
