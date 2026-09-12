@@ -105,6 +105,7 @@ struct Inner {
     completed: Mutex<VecDeque<ProcessId>>,
     stats_interval: Duration,
     reports: Mutex<HashMap<ProcessScopeId, ScopeTerminationReport>>,
+    pending_outcomes: Mutex<HashMap<ProcessScopeId, HashMap<ProcessId, TerminationOutcome>>>,
     completed_scopes: Mutex<VecDeque<ProcessScopeId>>,
     shutdown_serial: tokio::sync::Mutex<()>,
 }
@@ -161,6 +162,7 @@ impl ProcessSupervisor {
                 completed: Mutex::new(VecDeque::new()),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
                 reports: Mutex::new(HashMap::new()),
+                pending_outcomes: Mutex::new(HashMap::new()),
                 completed_scopes: Mutex::new(VecDeque::new()),
                 shutdown_serial: tokio::sync::Mutex::new(()),
                 shutting_down: Arc::clone(&shutting_down),
@@ -506,13 +508,14 @@ impl ProcessSupervisor {
         {
             return Ok(report);
         }
-        let (events, live) = {
+        let (mut events, live) = {
             let mut registry = self.lock_registry();
             let s = registry
                 .get_mut(scope)
                 .ok_or(TerminateError::UnknownScope(scope))?;
             (s.begin_scope_termination(), s.process_ids())
         };
+        events.retain(|event| !matches!(event, shepherd_domain::DomainEvent::ScopeClosed { .. }));
         self.inner.dispatcher.dispatch(&events).await;
 
         let mut set = tokio::task::JoinSet::new();
@@ -521,26 +524,48 @@ impl ProcessSupervisor {
             set.spawn(async move { (pid, this.terminate(pid, opts).await) });
         }
 
-        let mut outcomes = Vec::new();
         while let Some(joined) = set.join_next().await {
-            match joined {
-                Ok((pid, Ok(exit))) => outcomes.push((pid, exit.outcome)),
-                Ok((pid, Err(_))) => outcomes.push((
+            let (pid, outcome) = match joined {
+                Ok((pid, Ok(exit))) => (pid, exit.outcome),
+                Ok((pid, Err(_))) => (
                     pid,
                     TerminationOutcome::CleanupUnverified(UnverifiedReason::ProcessDisappeared),
-                )),
+                ),
                 Err(error) => {
                     return Err(TerminateError::Signal(format!(
                         "termination worker failed: {error}"
                     )))
                 }
-            }
+            };
+            self.inner
+                .pending_outcomes
+                .lock()
+                .expect("pending outcomes mutex")
+                .entry(scope)
+                .or_default()
+                .entry(pid)
+                .and_modify(|previous| {
+                    if !previous.is_verified() {
+                        *previous = outcome;
+                    }
+                })
+                .or_insert(outcome);
         }
 
         // Sweep any descendants that outlived their roots: a whole-group kill catches
         // grandchildren the per-root path does not track individually.
         self.inner.backend.cleanup_scope(scope).await?;
 
+        let mut outcomes: Vec<_> = self
+            .inner
+            .pending_outcomes
+            .lock()
+            .expect("pending outcomes mutex")
+            .get(&scope)
+            .into_iter()
+            .flat_map(|outcomes| outcomes.iter().map(|(pid, outcome)| (*pid, *outcome)))
+            .collect();
+        outcomes.sort_by_key(|(pid, _)| *pid);
         let report = ScopeTerminationReport { scope, outcomes };
         if report.all_verified() {
             self.inner
@@ -549,6 +574,11 @@ impl ProcessSupervisor {
                 .expect("reports mutex")
                 .insert(scope, report.clone());
             self.lock_registry().remove(scope);
+            self.inner
+                .pending_outcomes
+                .lock()
+                .expect("pending outcomes mutex")
+                .remove(&scope);
             let mut completed = self
                 .inner
                 .completed_scopes
@@ -564,6 +594,16 @@ impl ProcessSupervisor {
                         .remove(&old);
                 }
             }
+            drop(completed);
+            // Commit the report before scheduling exactly one terminal notification.
+            // This observer task holds no supervisor/backend/cleanup guard, and a caller
+            // cancelling after cleanup cannot cancel its best-effort publication.
+            let dispatcher = self.inner.dispatcher.clone();
+            tokio::spawn(async move {
+                dispatcher
+                    .dispatch(&[shepherd_domain::DomainEvent::ScopeClosed { scope }])
+                    .await;
+            });
         }
         Ok(report)
     }
@@ -658,6 +698,20 @@ impl ProcessSupervisor {
                 };
                 let mut events = s.record_exit(pid).unwrap_or_default();
                 events.extend(s.record_reaped(pid, exit).unwrap_or_default());
+                // Persist before dispatch can prune the root or suspend on a publisher.
+                // The operation's caller may already have cancelled its JoinSet.
+                if !s.is_open() {
+                    inner
+                        .pending_outcomes
+                        .lock()
+                        .expect("pending outcomes mutex")
+                        .entry(scope)
+                        .or_default()
+                        .insert(pid, outcome);
+                }
+                events.retain(|event| {
+                    !matches!(event, shepherd_domain::DomainEvent::ScopeClosed { .. })
+                });
                 events
             };
             inner.samples.lock().expect("samples mutex").remove(&pid);
