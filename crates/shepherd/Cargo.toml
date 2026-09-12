@@ -14,6 +14,7 @@ shepherd-infra = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+proptest = { version = "=1.6.0", default-features = false, features = ["std"] }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
 async-trait = "0.1"
 shepherd-domain = { workspace = true }

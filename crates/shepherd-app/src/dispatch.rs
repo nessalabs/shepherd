@@ -109,7 +109,8 @@ impl EventHandler for RegistryPruneHandler {
                     scope.prune(*pid);
                 }
             }
-            DomainEvent::ScopeClosed { scope } => registry.remove(*scope),
+            // The supervisor releases a scope only after containment verification.
+            DomainEvent::ScopeClosed { .. } => {}
             _ => {}
         }
         Ok(())
@@ -124,39 +125,57 @@ impl EventHandler for RegistryPruneHandler {
 /// publishes them via the outbound port.
 pub struct IntegrationTranslator {
     publisher: Arc<dyn IntegrationEventPublisher>,
+    sender: tokio::sync::mpsc::Sender<IntegrationEvent>,
+    receiver: Mutex<Option<tokio::sync::mpsc::Receiver<IntegrationEvent>>>,
 }
-
 impl IntegrationTranslator {
-    /// Creates the translator with an injected outbound publisher.
     #[must_use]
     pub fn new(publisher: Arc<dyn IntegrationEventPublisher>) -> Self {
-        Self { publisher }
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        Self {
+            publisher,
+            sender,
+            receiver: Mutex::new(Some(receiver)),
+        }
     }
 }
-
 #[async_trait]
 impl EventHandler for IntegrationTranslator {
     async fn handle(&self, event: &DomainEvent) -> Result<(), HandlerError> {
-        match event {
+        let event = match event {
             DomainEvent::ProcessReaped { scope, pid, exit } => {
-                self.publisher
-                    .publish(IntegrationEvent::ProcessTerminated {
-                        scope: *scope,
-                        pid: *pid,
-                        outcome: exit.outcome,
-                    })
-                    .await;
+                IntegrationEvent::ProcessTerminated {
+                    scope: *scope,
+                    pid: *pid,
+                    outcome: exit.outcome,
+                }
             }
             DomainEvent::ScopeClosed { scope } => {
-                self.publisher
-                    .publish(IntegrationEvent::ScopeTerminated { scope: *scope })
-                    .await;
+                IntegrationEvent::ScopeTerminated { scope: *scope }
             }
-            _ => {}
+            _ => return Ok(()),
+        };
+        if let Some(mut receiver) = self.receiver.lock().expect("publisher mutex").take() {
+            let publisher = self.publisher.clone();
+            tokio::spawn(async move {
+                while let Some(event) = receiver.recv().await {
+                    if tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        publisher.publish(event),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!("integration publisher timed out; event dropped");
+                    }
+                }
+            });
+        }
+        if self.sender.try_send(event).is_err() {
+            tracing::warn!("integration publisher queue full or closed; event dropped");
         }
         Ok(())
     }
-
     fn name(&self) -> &'static str {
         "IntegrationTranslator"
     }

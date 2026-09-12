@@ -1,9 +1,11 @@
 //! The `ProcessSupervisor` application service.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use futures_util::FutureExt;
 
 use shepherd_domain::{
     ProcessExit, ProcessId, ProcessScopeId, ProcessSpec, ProcessStats, Signal, TerminationOutcome,
@@ -101,6 +103,10 @@ struct Inner {
     outputs: Mutex<HashMap<ProcessId, crate::output::ProcessOutput>>,
     scope_results: Mutex<HashMap<ProcessScopeId, ScopeCleanupSender>>,
     stats_interval: Duration,
+    completed: Mutex<VecDeque<ProcessId>>,
+    reports: Mutex<HashMap<ProcessScopeId, ScopeTerminationReport>>,
+    completed_scopes: Mutex<VecDeque<ProcessScopeId>>,
+    shutdown_serial: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for ProcessSupervisor {
@@ -154,6 +160,10 @@ impl ProcessSupervisor {
                 outputs: Mutex::new(HashMap::new()),
                 scope_results: Mutex::new(HashMap::new()),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
+                completed: Mutex::new(VecDeque::new()),
+                reports: Mutex::new(HashMap::new()),
+                completed_scopes: Mutex::new(VecDeque::new()),
+                shutdown_serial: tokio::sync::Mutex::new(()),
                 shutting_down: Arc::clone(&shutting_down),
             }),
             cleanup: Some(Arc::new(CleanupGuard {
@@ -173,7 +183,13 @@ impl ProcessSupervisor {
 
     /// Creates a new, open scope and returns its id.
     pub fn create_scope(&self) -> ProcessScopeId {
-        self.lock_registry().create_scope()
+        let scope = self.lock_registry().create_scope();
+        self.inner
+            .scope_operations
+            .lock()
+            .expect("scope operations mutex")
+            .insert(scope, Arc::new(tokio::sync::Mutex::new(())));
+        scope
     }
 
     /// Runtime capabilities of the selected backend.
@@ -181,14 +197,13 @@ impl ProcessSupervisor {
         self.inner.backend.capabilities()
     }
 
-    fn scope_operation(&self, scope: ProcessScopeId) -> Arc<tokio::sync::Mutex<()>> {
+    fn scope_operation(&self, scope: ProcessScopeId) -> Option<Arc<tokio::sync::Mutex<()>>> {
         self.inner
             .scope_operations
             .lock()
             .expect("scope operations mutex")
-            .entry(scope)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+            .get(&scope)
+            .cloned()
     }
 
     /// The ids of live processes in a scope, or `None` if the scope is unknown.
@@ -221,7 +236,19 @@ impl ProcessSupervisor {
         scope: ProcessScopeId,
         spec: ProcessSpec,
     ) -> Result<ProcessId, SpawnError> {
-        let operation = self.scope_operation(scope);
+        let operation = self.scope_operation(scope).ok_or_else(|| {
+            if self
+                .inner
+                .reports
+                .lock()
+                .expect("reports mutex")
+                .contains_key(&scope)
+            {
+                SpawnError::ScopeClosed(scope)
+            } else {
+                SpawnError::UnknownScope(scope)
+            }
+        })?;
         let _serial = operation.lock().await;
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return Err(SpawnError::ScopeClosed(scope));
@@ -329,9 +356,30 @@ impl ProcessSupervisor {
             .expect("scope results mutex")
             .insert(scope, report_tx.clone());
         let worker = self.worker();
-        tokio::spawn(async move {
+        let backstop = ScopeCleanupBackstop {
+            backend: self.inner.backend.clone(),
+            scope,
+            report: report_tx.clone(),
+            armed: true,
+        };
+        let cleanup = tokio::spawn(async move {
+            let mut backstop = backstop;
             let _ = finished.await;
             let result = worker.terminate_scope(scope, opts).await;
+            if !result.as_ref().is_ok_and(|r| r.all_verified()) {
+                backstop.backend.hard_kill_scope(scope);
+            }
+            // A completed worker returns its actual report, even when unverified.
+            // Only interruption/panic publishes the generic Drop-backstop error.
+            backstop.armed = false;
+            result
+        });
+        tokio::spawn(async move {
+            let result = cleanup.await.unwrap_or_else(|e| {
+                Err(TerminateError::Signal(format!(
+                    "scope cleanup worker failed: {e}"
+                )))
+            });
             report_tx.send_replace(Some(result));
         });
         let mut processes = Vec::new();
@@ -465,22 +513,28 @@ impl ProcessSupervisor {
                         .collect::<Vec<_>>()
                 };
                 for (pid, target) in targets {
-                    let sample =
-                        tokio::time::timeout(Duration::from_secs(1), inner.backend.sample(&target))
-                            .await
-                            .unwrap_or_else(|_| Err(StatsError::Backend("sampler timeout".into())))
-                            .map(|raw| {
-                                let start = inner
-                                    .spawn_times
-                                    .lock()
-                                    .expect("spawn times mutex")
-                                    .get(&pid)
-                                    .copied();
-                                let uptime = start
-                                    .map(|s| inner.clock.now().saturating_duration_since(s))
-                                    .unwrap_or_default();
-                                ProcessStats::from_raw(pid, raw, uptime)
-                            });
+                    let observed = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        std::panic::AssertUnwindSafe(inner.backend.sample(&target)).catch_unwind(),
+                    )
+                    .await;
+                    let sample = match observed {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(_)) => Err(StatsError::Backend("sampler panicked".into())),
+                        Err(_) => Err(StatsError::Backend("sampler timeout".into())),
+                    }
+                    .map(|raw| {
+                        let start = inner
+                            .spawn_times
+                            .lock()
+                            .expect("spawn times mutex")
+                            .get(&pid)
+                            .copied();
+                        let uptime = start
+                            .map(|s| inner.clock.now().saturating_duration_since(s))
+                            .unwrap_or_default();
+                        ProcessStats::from_raw(pid, raw, uptime)
+                    });
                     // Keep the same registry -> samples lock order as stats and the monitor.
                     // A sample finishing after reap must not resurrect a cache entry.
                     let registry = inner.registry.lock().expect("registry mutex");
@@ -511,13 +565,22 @@ impl ProcessSupervisor {
         if let Some(exit) = self.inner.waiters.try_get(pid) {
             return Ok(exit);
         }
-        {
+        let future = {
             let registry = self.lock_registry();
-            if registry.scope_of(pid).is_none() {
-                return Err(WaitError::UnknownProcess(pid));
+            let Some(scope) = registry.scope_of(pid).and_then(|id| registry.get(id)) else {
+                return self
+                    .inner
+                    .waiters
+                    .try_get(pid)
+                    .ok_or(WaitError::UnknownProcess(pid));
+            };
+            if let Some(exit) = scope.get(pid).and_then(|p| p.exit()) {
+                return Ok(exit);
             }
-        }
-        Ok(self.inner.waiters.wait(pid).await)
+            // Register under ownership lock before a completion can be pruned/evicted.
+            self.inner.waiters.wait(pid)
+        };
+        Ok(future.await)
     }
 
     /// Terminates a single process with a verified two-phase teardown.
@@ -535,11 +598,15 @@ impl ProcessSupervisor {
             return Ok(exit);
         }
 
-        let (scope, spawned, graceful, request_events) = {
+        let (scope, spawned, graceful, request_events, mut exit_future) = {
             let mut registry = self.lock_registry();
-            let scope = registry
-                .scope_of(pid)
-                .ok_or(TerminateError::UnknownProcess(pid))?;
+            let Some(scope) = registry.scope_of(pid) else {
+                return self
+                    .inner
+                    .waiters
+                    .try_get(pid)
+                    .ok_or(TerminateError::UnknownProcess(pid));
+            };
             let s = registry.get_mut(scope).expect("scope exists");
             let process = s.get(pid).ok_or(TerminateError::UnknownProcess(pid))?;
             if let Some(exit) = process.exit() {
@@ -550,7 +617,13 @@ impl ProcessSupervisor {
             };
             let graceful = process.spec().graceful_signal;
             let events = s.request_termination(pid)?;
-            (scope, spawned, graceful, events)
+            (
+                scope,
+                spawned,
+                graceful,
+                events,
+                self.inner.waiters.wait(pid),
+            )
         };
         self.inner.dispatcher.dispatch(&request_events).await;
 
@@ -561,7 +634,7 @@ impl ProcessSupervisor {
         // Graceful phase.
         let _ = self.inner.backend.signal(&spawned, graceful).await;
         tokio::select! {
-            exit = self.inner.waiters.wait(pid) => return Ok(exit),
+            exit = &mut exit_future => return Ok(exit),
             () = self.inner.clock.sleep(opts.grace.as_duration()) => {}
         }
 
@@ -576,7 +649,7 @@ impl ProcessSupervisor {
 
         let exit = match opts.force_timeout {
             Some(timeout) => tokio::select! {
-                exit = self.inner.waiters.wait(pid) => exit,
+                exit = &mut exit_future => exit,
                 () = self.inner.clock.sleep(timeout) => ProcessExit {
                     pid,
                     code: None,
@@ -587,7 +660,7 @@ impl ProcessSupervisor {
                     forced: true,
                 },
             },
-            None => self.inner.waiters.wait(pid).await,
+            None => exit_future.await,
         };
         Ok(exit)
     }
@@ -602,21 +675,64 @@ impl ProcessSupervisor {
         scope: ProcessScopeId,
         opts: TerminateOptions,
     ) -> Result<ScopeTerminationReport, TerminateError> {
-        let operation = self.scope_operation(scope);
+        if let Some(report) = self
+            .inner
+            .reports
+            .lock()
+            .expect("reports mutex")
+            .get(&scope)
+            .cloned()
+        {
+            return Ok(report);
+        }
+        let operation = self
+            .scope_operation(scope)
+            .ok_or(TerminateError::UnknownScope(scope))?;
         let _serial = operation.lock().await;
+        if let Some(report) = self
+            .inner
+            .reports
+            .lock()
+            .expect("reports mutex")
+            .get(&scope)
+            .cloned()
+        {
+            return Ok(report);
+        }
         let (events, live) = {
             let mut registry = self.lock_registry();
             let s = registry
                 .get_mut(scope)
                 .ok_or(TerminateError::UnknownScope(scope))?;
-            (s.begin_scope_termination(), s.live_process_ids())
+            {
+                let events = s.begin_scope_termination();
+                let processes = s
+                    .process_ids()
+                    .into_iter()
+                    .map(|pid| {
+                        let observer: crate::ports::WaitFuture =
+                            match s.get(pid).and_then(|p| p.exit()) {
+                                Some(exit) => Box::pin(std::future::ready(exit)),
+                                None => self.inner.waiters.wait(pid),
+                            };
+                        (pid, observer)
+                    })
+                    .collect::<Vec<_>>();
+                (events, processes)
+            }
         };
         self.inner.dispatcher.dispatch(&events).await;
 
         let mut set = tokio::task::JoinSet::new();
-        for pid in live {
+        for (pid, observer) in live {
             let this = self.worker();
-            set.spawn(async move { (pid, this.terminate(pid, opts).await) });
+            set.spawn(async move {
+                let result = tokio::select! { biased;
+                    exit = observer => Ok(exit),
+                    result = this.terminate(pid, opts) => result,
+                };
+                (pid, result)
+            });
         }
 
         let mut outcomes = Vec::new();
@@ -638,8 +754,56 @@ impl ProcessSupervisor {
         // Sweep any descendants that outlived their roots: a whole-group kill catches
         // grandchildren the per-root path does not track individually.
         self.inner.backend.cleanup_scope(scope).await?;
+        // A containment sweep can finish roots whose individual signal failed or timed out.
+        // Re-observe their monitor outcome; a sweep itself is never evidence of reap.
+        for (pid, outcome) in &mut outcomes {
+            if !outcome.is_verified() {
+                let waited = match opts.force_timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, self.wait(*pid)).await.ok(),
+                    None => Some(self.wait(*pid).await),
+                };
+                if let Some(Ok(exit)) = waited {
+                    *outcome = exit.outcome;
+                }
+            }
+        }
 
-        Ok(ScopeTerminationReport { scope, outcomes })
+        let report = ScopeTerminationReport { scope, outcomes };
+        if report.all_verified() {
+            // Publish before removing the live entry so repeat callers cannot see a gap.
+            self.inner
+                .reports
+                .lock()
+                .expect("reports mutex")
+                .insert(scope, report.clone());
+            self.lock_registry().remove(scope);
+            self.inner
+                .scope_operations
+                .lock()
+                .expect("scope operations mutex")
+                .remove(&scope);
+            let mut completed = self
+                .inner
+                .completed_scopes
+                .lock()
+                .expect("completed scopes mutex");
+            completed.push_back(scope);
+            while completed.len() > 256 {
+                if let Some(old) = completed.pop_front() {
+                    self.inner
+                        .reports
+                        .lock()
+                        .expect("reports mutex")
+                        .remove(&old);
+                    self.inner
+                        .scope_results
+                        .lock()
+                        .expect("scope results mutex")
+                        .remove(&old);
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Terminates all scopes and cleans up. Safe to call more than once.
@@ -647,21 +811,23 @@ impl ProcessSupervisor {
     /// # Errors
     /// Returns [`ShutdownError::Unverified`] if any scope could not be verified as cleaned up.
     pub async fn shutdown(&self) -> Result<ShutdownReport, ShutdownError> {
-        if self.inner.shutting_down.swap(true, Ordering::SeqCst) {
-            return Ok(ShutdownReport { scopes: Vec::new() });
-        }
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
+        let _serial = self.inner.shutdown_serial.lock().await;
         let scopes = self.lock_registry().scope_ids();
         let mut reports = Vec::new();
         let mut unverified = 0usize;
         for scope in scopes {
-            if let Ok(report) = self
+            match self
                 .terminate_scope(scope, TerminateOptions::default())
                 .await
             {
-                if !report.all_verified() {
-                    unverified += 1;
+                Ok(report) => {
+                    if !report.all_verified() {
+                        unverified += 1;
+                    }
+                    reports.push(report);
                 }
-                reports.push(report);
+                Err(_) => unverified += 1,
             }
         }
         if unverified > 0 {
@@ -682,7 +848,10 @@ impl ProcessSupervisor {
     fn start_monitor(&self, scope: ProcessScopeId, pid: ProcessId, spawned: Spawned) {
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            let wait_result = inner.backend.wait(&spawned).await;
+            let wait_result = std::panic::AssertUnwindSafe(inner.backend.wait(&spawned))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(WaitError::Backend("waiter panicked".into())));
             let events = {
                 let mut registry = inner.registry.lock().expect("registry mutex");
                 let Some(s) = registry.get_mut(scope) else {
@@ -733,6 +902,15 @@ impl ProcessSupervisor {
             };
             inner.samples.lock().expect("samples mutex").remove(&pid);
             inner.dispatcher.dispatch(&events).await;
+            {
+                let mut completed = inner.completed.lock().expect("completed mutex");
+                completed.push_back(pid);
+                while completed.len() > 256 {
+                    if let Some(old) = completed.pop_front() {
+                        inner.outputs.lock().expect("outputs mutex").remove(&old);
+                    }
+                }
+            }
             inner
                 .spawn_times
                 .lock()
@@ -791,5 +969,22 @@ impl ScopedProcesses {
     }
     pub fn take_output(&self, pid: ProcessId) -> Option<crate::output::ProcessOutput> {
         self.supervisor.take_output(pid)
+    }
+}
+
+struct ScopeCleanupBackstop {
+    backend: Arc<dyn ProcessBackend>,
+    scope: ProcessScopeId,
+    report: ScopeCleanupSender,
+    armed: bool,
+}
+impl Drop for ScopeCleanupBackstop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.backend.hard_kill_scope(self.scope);
+            self.report.send_replace(Some(Err(TerminateError::Signal(
+                "scope cleanup interrupted or unverified; synchronous backstop issued".into(),
+            ))));
+        }
     }
 }

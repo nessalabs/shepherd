@@ -1,6 +1,6 @@
 # Shepherd — Design & Implementation Plan
 
-> Status: **Plan / RFC** (implementation in progress). This document is the source of
+> Status: **Implemented; final hardening CI validation in progress**. This document is the source of
 > truth for the architecture. Companion documents:
 >
 > - `[DIAGRAMS.md](./DIAGRAMS.md)` — class and state diagrams.
@@ -339,7 +339,8 @@ reported as success.
    cannot await or verify, so it records `CleanupUnverified(DroppedWithoutShutdown)` and
    emits a `tracing` warning.
 4. **Kernel backstop for abrupt death** (`Drop` never runs — `SIGKILL`/`abort`): Windows
-  Job Object `KILL_ON_JOB_CLOSE`, Linux `PR_SET_PDEATHSIG`/cgroup.
+  Job Object `KILL_ON_JOB_CLOSE` after assignment. Linux cgroups do not automatically kill
+  on creator death; no such backstop is implemented.
 
 
 
@@ -498,8 +499,8 @@ Status legend: ✅ done · 🚧 partial · ⬜ planned.
    detached-child containment) is implemented ([0011](./decisions/0011-cgroup-v2-backend.md)); privileged runtime tests passed in [CI run 34674051633](https://github.com/nessalabs/shepherd/actions/runs/34674051633).
 4. ✅ **Stats sampler** — one shared cached sampler, Linux CPU/RSS/I/O, resource fixtures/tests (ADR 0013). Platform extensions follow in item 6.
 5. ✅ **Output plumbing** — bounded byte queue + tail capture + output-stress tests (ADR 0014).
-6. 🚧 **macOS + Windows backends** — implemented (ADRs 0015–0016); Windows runtime CI pending.
-7. ⬜ **Hardening** — property/`loom`/stress/race suites; finalize the guarantee table.
+6. ✅ **macOS + Windows backends** — real runtime tests passed on all OSes ([CI 34674491652](https://github.com/nessalabs/shepherd/actions/runs/34674491652)); ADRs 0015–0016.
+7. 🚧 **Hardening** — property/loom/stress/race suites, quarantine and bounded history implemented; 2,000 local resource cycles passed; final CI pending.
 
 Also ✅: `with_scope` async scope guard, including cancellation reports (ADR 0017).
 
@@ -539,3 +540,15 @@ Phase A implementation note: Linux defaults to cgroup v2 only after a real files
 and kill-interface probe; otherwise ProcessGroup. Kernel versions without cgroup.kill
 use the fallback. A cgroup does not kill its members merely because its creator dies.
 The table above remains the target until the later platform/stats phases land.
+
+
+## Implementation refinements and final review
+
+ADRs 0011–0020 supersede the older sketches where necessary. Process groups now use
+one private anchor per scope. Stats are cached per-root observations; descendant
+counts are None. Explicit scope cleanup releases resources only after its final
+sweep; failed reaps remain quarantined. Completed histories are bounded to 256
+entries per category. The scope result signature and cancellation observation path
+are specified in ADR 0017. Runtime interruption is an unverified backstop, not async
+Drop. See [OWNERSHIP.md](./OWNERSHIP.md) for the public API review and
+[VALIDATION.md](./VALIDATION.md) for §18 deliverables and evidence.

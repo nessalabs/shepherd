@@ -137,14 +137,20 @@ impl ProcessBackend for NullBackend {
                 }
             }
         };
-        loop {
+        let exit = loop {
             if let Some(exit) = *rx.borrow_and_update() {
-                return Ok(exit);
+                break exit;
             }
             if rx.changed().await.is_err() {
-                return Ok(KILLED_EXIT);
+                return Err(WaitError::Backend("null waiter closed".into()));
             }
-        }
+        };
+        self.state
+            .lock()
+            .expect("null backend mutex")
+            .procs
+            .remove(&target.os.pid);
+        Ok(exit)
     }
 
     async fn sample(&self, target: &Spawned) -> Result<RawStats, StatsError> {
@@ -174,6 +180,13 @@ impl ProcessBackend for NullBackend {
             peak_rss: Support::Unsupported,
             io: Support::Unsupported,
             force_termination: true,
+        }
+    }
+
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        let state = self.state.lock().expect("null backend mutex");
+        for proc in state.procs.values().filter(|p| p.scope == scope) {
+            NullBackend::deliver(proc, KILLED_EXIT);
         }
     }
 

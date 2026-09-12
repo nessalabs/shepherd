@@ -91,14 +91,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build privileged tests as runner
-        run: cargo test -p shepherd-fixtures --test cgroup_integration --no-run
+        run: cargo test -p shepherd-fixtures --test cgroup_integration --no-run --message-format=json > cgroup-artifacts.json
       - name: Exercise real cgroup v2 (fail closed)
         run: |
           set -euo pipefail
           test -f /sys/fs/cgroup/cgroup.controllers
           sudo mkdir /sys/fs/cgroup/shepherd-ci
           trap 'sudo rmdir /sys/fs/cgroup/shepherd-ci' EXIT
-          test_bin=$(find target/debug/deps -maxdepth 1 -name 'cgroup_integration-*' -type f -executable | head -n 1)
+          test_bin=$(python3 -c 'import json; rows=[json.loads(line) for line in open("cgroup-artifacts.json")]; print(next(r["executable"] for r in rows if r.get("target", {}).get("name") == "cgroup_integration" and r.get("executable")))')
           test -n "$test_bin"
           sudo env SHEPHERD_CGROUP_ROOT=/sys/fs/cgroup/shepherd-ci "$test_bin" --ignored --test-threads=1 --nocapture
 
@@ -127,3 +127,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p shepherd-fixtures --test output_integration -- --nocapture
+
+  properties-concurrency:
+    name: generated invariants + registry and waiter interleavings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p shepherd --test properties --test adversarial --test scoped
+      - run: cargo test -p shepherd-app --lib loom_
+      - name: Model the actual waiter registration/publication lock
+        env:
+          RUSTFLAGS: --cfg shepherd_loom
+        run: cargo test -p shepherd-infra --lib loom_
+
+  leak-inspection:
+    name: in-process FD or handle counts + owned zombie inspection (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p shepherd-fixtures --test leak_stress -- --nocapture

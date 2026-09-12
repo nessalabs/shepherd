@@ -178,6 +178,10 @@ impl ProcessBackend for WaitFailsBackend {
         }
     }
 
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.inner.hard_kill_scope(scope);
+    }
+
     fn hard_kill_all(&self) {
         self.inner.hard_kill_all();
     }

@@ -417,6 +417,16 @@ impl ProcessBackend for WindowsJobBackend {
             force_termination: true,
         }
     }
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        let state = self.state.lock().expect("job mutex");
+        for slot in state.children.values().filter(|s| s.scope == scope) {
+            slot.killed.store(true, Ordering::SeqCst);
+        }
+        if let Some(job) = state.jobs.get(&scope) {
+            let _ = unsafe { TerminateJobObject(raw(job), KILLED) };
+        }
+    }
+
     fn hard_kill_all(&self) {
         let state = self.state.lock().expect("job mutex");
         for slot in state.children.values() {

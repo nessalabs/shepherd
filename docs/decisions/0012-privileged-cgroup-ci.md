@@ -15,12 +15,15 @@ from an unprivileged or cross-compilation pass.
 Local Linux reproduction (from the repository):
 
 ```sh
-cargo test -p shepherd-fixtures --test cgroup_integration --no-run
+cargo test -p shepherd-fixtures --test cgroup_integration --no-run --message-format=json > cgroup-artifacts.json
 sudo mkdir /sys/fs/cgroup/shepherd-ci
-test_bin=$(find target/debug/deps -maxdepth 1 -name 'cgroup_integration-*' -type f -executable | head -n 1)
+test_bin=$(python3 -c 'import json; rows=[json.loads(line) for line in open("cgroup-artifacts.json")]; print(next(r["executable"] for r in rows if r.get("target", {}).get("name") == "cgroup_integration" and r.get("executable")))')
 sudo env SHEPHERD_CGROUP_ROOT=/sys/fs/cgroup/shepherd-ci "$test_bin" --ignored --test-threads=1 --nocapture
 sudo rmdir /sys/fs/cgroup/shepherd-ci
 ```
 
 On hosts which forbid delegation, this command fails. Such hosts correctly use
 ProcessGroup in ordinary operation; use a delegated host to prove cgroup behavior.
+
+The executable comes from the current Cargo compiler artifact, not a directory glob
+that could accidentally select a stale cached test binary (hardening refinement).

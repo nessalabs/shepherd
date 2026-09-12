@@ -120,3 +120,35 @@ async fn discard_has_no_pipe_backpressure() {
     .unwrap()
     .all_verified());
 }
+
+#[tokio::test]
+async fn unclaimed_postmortem_output_has_bounded_retention() {
+    let sup = SupervisorBuilder::new().build();
+    let mut first = None;
+    let mut last = None;
+    for _ in 0..270 {
+        let scope = sup.create_scope();
+        let pid = sup
+            .spawn(
+                scope,
+                ProcessSpec::new(env!("CARGO_BIN_EXE_output_flood"))
+                    .arg("binary")
+                    .output(OutputMode::Capture {
+                        buffer_bytes: 32,
+                        tail_bytes: 16,
+                    }),
+            )
+            .await
+            .unwrap();
+        first.get_or_insert(pid);
+        last = Some(pid);
+        sup.wait(pid).await.unwrap();
+        assert!(sup
+            .terminate_scope(scope, TerminateOptions::default())
+            .await
+            .unwrap()
+            .all_verified());
+    }
+    assert!(sup.take_output(first.unwrap()).is_none());
+    assert!(sup.take_output(last.unwrap()).is_some());
+}

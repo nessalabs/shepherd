@@ -27,3 +27,6 @@ they do not replace that document.
 | [0015](./0015-macos-libproc-observations.md) | macOS libproc stats and Mach time conversion |
 | [0016](./0016-windows-job-object-backend.md) | Windows Job Object containment before execution |
 | [0017](./0017-async-scopes-and-cancellation.md) | Closure result plus report, cancellation cleanup workers, independent nesting |
+| [0018](./0018-ownership-quarantine-and-bounded-history.md) | Quarantine, cleanup serialization, bounded history and isolated observers |
+| [0019](./0019-stable-process-group-anchor.md) | Private anchor pins one process group across root exits |
+| [0020](./0020-adversarial-validation-boundaries.md) | Generated invariants, targeted loom models and resource accounting |

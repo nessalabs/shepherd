@@ -47,6 +47,11 @@ struct ChildSlot {
     pidfd: Option<OwnedFd>,
 }
 
+struct Anchor {
+    _input: tokio::process::ChildStdin,
+    exit: watch::Sender<Option<Result<(), String>>>,
+}
+
 struct ScopeGroup {
     pgid: i32,
     live: usize,
@@ -58,6 +63,7 @@ struct State {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     cpu_samples: HashMap<ChildKey, (std::time::Instant, u64)>,
     scope_groups: HashMap<ProcessScopeId, ScopeGroup>,
+    anchors: HashMap<ProcessScopeId, Anchor>,
     /// Serializes spawns per scope so the first process creates exactly one process group.
     scope_locks: HashMap<ProcessScopeId, Arc<tokio::sync::Mutex<()>>>,
 }
@@ -130,15 +136,65 @@ impl UnixProcessBackend {
             .map(|g| g.pgid)
     }
 
-    /// Pgid to *join* on spawn. An empty group (live == 0) is treated as gone so a later
-    /// spawn creates a fresh group; the stale pgid is still kept for `signal_scope` until then.
     fn joinable_pgid(&self, scope: ProcessScopeId) -> Option<i32> {
+        let state = self.state.lock().expect("unix backend mutex");
+        state
+            .scope_groups
+            .get(&scope)
+            .and_then(|g| (g.live > 0 || state.anchors.contains_key(&scope)).then_some(g.pgid))
+    }
+
+    fn has_anchor(&self, scope: ProcessScopeId) -> bool {
         self.state
             .lock()
             .expect("unix backend mutex")
+            .anchors
+            .contains_key(&scope)
+    }
+
+    fn ensure_anchor(&self, scope: ProcessScopeId) -> Result<(), SpawnError> {
+        if self.containment() != Containment::ProcessGroup || self.has_anchor(scope) {
+            return Ok(());
+        }
+        // A shell blocked in its builtin read creates no extra child. Its stdin is private.
+        // Keeping this group leader alive pins the PGID across natural root exits.
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "read shepherd_scope_anchor"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|e| SpawnError::Os(e.to_string()))?;
+        let pgid = child.id().expect("new anchor pid") as i32;
+        let input = child.stdin.take().expect("anchor stdin");
+        let (exit, _) = watch::channel(None);
+        let sender = exit.clone();
+        tokio::spawn(async move {
+            sender.send_replace(Some(
+                child.wait().await.map(|_| ()).map_err(|e| e.to_string()),
+            ));
+        });
+        let mut state = self.state.lock().expect("unix backend mutex");
+        state.anchors.insert(
+            scope,
+            Anchor {
+                _input: input,
+                exit,
+            },
+        );
+        state
             .scope_groups
-            .get(&scope)
-            .and_then(|g| (g.live > 0).then_some(g.pgid))
+            .insert(scope, ScopeGroup { pgid, live: 0 });
+        Ok(())
     }
 
     fn forget_group(&self, scope: ProcessScopeId) {
@@ -263,6 +319,7 @@ impl ProcessBackend for UnixProcessBackend {
             .map(|c| c.membership(scope))
             .transpose()
             .map_err(|e| SpawnError::Os(e.to_string()))?;
+        self.ensure_anchor(scope)?;
         let existing_pgid = self.joinable_pgid(scope);
         let (mut child, new_group) = match self
             .spawn_in_group(
@@ -274,7 +331,7 @@ impl ProcessBackend for UnixProcessBackend {
             .await
         {
             Ok(child) => (child, existing_pgid.is_none()),
-            Err(_err) if existing_pgid.is_some() => {
+            Err(_err) if existing_pgid.is_some() && !self.has_anchor(scope) => {
                 // The recorded group is gone (last member exited; kernel recycled the pgid).
                 // Forget it and create a fresh group for this still-open scope.
                 self.forget_group(scope);
@@ -365,6 +422,15 @@ impl ProcessBackend for UnixProcessBackend {
     }
 
     async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+        if !self
+            .state
+            .lock()
+            .expect("unix backend mutex")
+            .children
+            .contains_key(&child_key(&target.os))
+        {
+            return Ok(());
+        }
         #[cfg(target_os = "linux")]
         {
             // Hold the lock across the syscall so the pidfd cannot be closed underneath us.
@@ -374,15 +440,20 @@ impl ProcessBackend for UnixProcessBackend {
                 .get(&child_key(&target.os))
                 .and_then(|slot| slot.pidfd.as_ref())
             {
-                return pidfd_kill(fd.as_raw_fd(), to_nix(signal));
+                return pidfd_kill(fd.as_raw_fd(), to_nix(signal)?);
             }
         }
 
+        if matches!(target.os.reuse_token, ReuseToken::Unavailable) {
+            return Err(TerminateError::Signal(
+                "no safe process identity available".into(),
+            ));
+        }
         if !identity_still_matches(&target.os) {
             return Ok(());
         }
         let pid = Pid::from_raw(i32::try_from(target.os.pid).unwrap_or(0));
-        match kill(pid, Some(to_nix(signal))) {
+        match kill(pid, Some(to_nix(signal)?)) {
             Ok(()) => Ok(()),
             Err(nix::errno::Errno::ESRCH) => Ok(()),
             Err(e) => Err(TerminateError::Signal(e.to_string())),
@@ -406,7 +477,7 @@ impl ProcessBackend for UnixProcessBackend {
         let Some(pgid) = pgid else {
             return Ok(());
         };
-        match killpg(Pid::from_raw(pgid), Some(to_nix(signal))) {
+        match killpg(Pid::from_raw(pgid), Some(to_nix(signal)?)) {
             Ok(()) => Ok(()),
             Err(nix::errno::Errno::ESRCH) => {
                 self.forget_group(scope);
@@ -461,6 +532,33 @@ impl ProcessBackend for UnixProcessBackend {
                 .await
                 .map_err(|e| TerminateError::Signal(e.to_string()))?;
         }
+        let anchor = self
+            .state
+            .lock()
+            .expect("unix backend mutex")
+            .anchors
+            .get(&scope)
+            .map(|a| a.exit.subscribe());
+        if let Some(mut receiver) = anchor {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(result) = receiver.borrow_and_update().clone() {
+                        return result.map_err(TerminateError::Signal);
+                    }
+                    receiver
+                        .changed()
+                        .await
+                        .map_err(|_| TerminateError::Signal("anchor waiter closed".into()))?;
+                }
+            })
+            .await
+            .map_err(|_| TerminateError::Signal("anchor reap timed out".into()))??;
+        }
+        self.state
+            .lock()
+            .expect("unix backend mutex")
+            .anchors
+            .remove(&scope);
         self.forget_group(scope);
         self.state
             .lock()
@@ -471,6 +569,11 @@ impl ProcessBackend for UnixProcessBackend {
     }
 
     async fn sample(&self, target: &Spawned) -> Result<RawStats, StatsError> {
+        if matches!(target.os.reuse_token, ReuseToken::Unavailable) {
+            return Err(StatsError::Backend(
+                "no safe sample identity available".into(),
+            ));
+        }
         if !identity_still_matches(&target.os) {
             return Err(StatsError::Backend(
                 "process identity no longer matches".into(),
@@ -578,6 +681,17 @@ impl ProcessBackend for UnixProcessBackend {
         }
     }
 
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        #[cfg(target_os = "linux")]
+        if let Some(cgroups) = &self.cgroups {
+            let _ = cgroups.kill(scope);
+            return;
+        }
+        if let Some(pgid) = self.existing_pgid(scope) {
+            let _ = killpg(Pid::from_raw(pgid), Some(NixSignal::SIGKILL));
+        }
+    }
+
     fn hard_kill_all(&self) {
         #[cfg(target_os = "linux")]
         if let Some(cgroups) = &self.cgroups {
@@ -640,13 +754,15 @@ fn apply_env(cmd: &mut tokio::process::Command, env: &EnvPolicy) {
     }
 }
 
-fn to_nix(signal: Signal) -> NixSignal {
-    match signal {
+fn to_nix(signal: Signal) -> Result<NixSignal, TerminateError> {
+    Ok(match signal {
         Signal::Term => NixSignal::SIGTERM,
         Signal::Kill => NixSignal::SIGKILL,
         Signal::Interrupt => NixSignal::SIGINT,
-        Signal::Custom(raw) => NixSignal::try_from(raw).unwrap_or(NixSignal::SIGTERM),
-    }
+        Signal::Custom(raw) => {
+            NixSignal::try_from(raw).map_err(|e| TerminateError::Signal(e.to_string()))?
+        }
+    })
 }
 
 fn signal_from_raw(raw: i32) -> Signal {
@@ -841,5 +957,34 @@ mod tests {
             .await
             .expect("late wait must not lose a reaped child");
         assert_eq!(exit.code, Some(0));
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[tokio::test]
+    async fn mismatched_reuse_token_cannot_signal_a_live_child() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let child = backend
+            .spawn(scope, &ProcessSpec::new("sleep").arg("30"))
+            .await
+            .unwrap();
+        let wrong = Spawned {
+            os: OsIdentity::new(child.os.pid, ReuseToken::StartTime(u64::MAX)),
+        };
+        backend.signal(&wrong, Signal::Kill).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), backend.wait(&child))
+                .await
+                .is_err()
+        );
+        backend.signal(&child, Signal::Kill).await.unwrap();
+        assert_eq!(
+            backend.wait(&child).await.unwrap().signal,
+            Some(Signal::Kill)
+        );
+        backend.cleanup_scope(scope).await.unwrap();
     }
 }
