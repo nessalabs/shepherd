@@ -4,9 +4,35 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+// Keep the original allocation intact while discarding prefixes. A sequence of
+// tiny incoming reads advances an offset instead of shifting the retained bytes.
+struct BufferedChunk {
+    stream: OutputStream,
+    bytes: Vec<u8>,
+    offset: usize,
+}
+impl BufferedChunk {
+    fn snapshot(&self) -> OutputChunk {
+        OutputChunk {
+            stream: self.stream,
+            bytes: self.bytes[self.offset..].to_vec(),
+        }
+    }
+    fn into_output(mut self) -> OutputChunk {
+        if self.offset != 0 {
+            // Compact at most once, when transferring this chunk to the consumer.
+            self.bytes.copy_within(self.offset.., 0);
+            self.bytes.truncate(self.bytes.len() - self.offset);
+        }
+        OutputChunk {
+            stream: self.stream,
+            bytes: self.bytes,
+        }
+    }
+}
 struct State {
-    queue: VecDeque<OutputChunk>,
-    tail: VecDeque<OutputChunk>,
+    queue: VecDeque<BufferedChunk>,
+    tail: VecDeque<BufferedChunk>,
     bytes: usize,
     tail_bytes: usize,
     dropped: u64,
@@ -25,7 +51,7 @@ fn index(stream: OutputStream) -> usize {
     }
 }
 fn append(
-    queue: &mut VecDeque<OutputChunk>,
+    queue: &mut VecDeque<BufferedChunk>,
     size: &mut usize,
     capacity: usize,
     stream: OutputStream,
@@ -37,20 +63,21 @@ fn append(
     let mut remove = need;
     while remove > 0 {
         let first = queue.front_mut().expect("queue byte accounting");
-        let count = remove.min(first.bytes.len());
-        first.bytes.drain(..count);
+        let count = remove.min(first.bytes.len() - first.offset);
+        first.offset += count;
         remove -= count;
         *size -= count;
         dropped += count as u64;
-        if first.bytes.is_empty() {
+        if first.offset == first.bytes.len() {
             queue.pop_front();
         }
     }
     dropped += (bytes.len() - retain) as u64;
     if retain > 0 {
-        queue.push_back(OutputChunk {
+        queue.push_back(BufferedChunk {
             stream,
             bytes: bytes[bytes.len() - retain..].to_vec(),
+            offset: 0,
         });
         *size += retain;
     }
@@ -84,8 +111,12 @@ impl OutputSink for Buffer {
         let mut state = self.state.lock().expect("output mutex");
         state.bytes = 0;
         OutputSnapshot {
-            chunks: state.queue.drain(..).collect(),
-            tail: state.tail.iter().cloned().collect(),
+            chunks: state
+                .queue
+                .drain(..)
+                .map(BufferedChunk::into_output)
+                .collect(),
+            tail: state.tail.iter().map(BufferedChunk::snapshot).collect(),
             dropped_bytes: state.dropped,
             stdout_closed: state.closed[0],
             stderr_closed: state.closed[1],
@@ -188,6 +219,52 @@ mod tests {
         assert_eq!(s.dropped_bytes, 4);
         assert_eq!(s.tail[0].bytes, [3, 4]);
     }
+    #[test]
+    fn thousands_of_tiny_evictions_advance_offset_without_moving_retained_bytes() {
+        let original: Vec<_> = (0..8192).map(|n| (n % 251) as u8).collect();
+        let mut queue = VecDeque::new();
+        let mut size = 0;
+        assert_eq!(
+            append(&mut queue, &mut size, 8192, OutputStream::Stdout, &original),
+            0
+        );
+        let allocation = queue.front().unwrap().bytes.as_ptr();
+        for count in 1..8192 {
+            assert_eq!(
+                append(&mut queue, &mut size, 8192, OutputStream::Stderr, &[255]),
+                1
+            );
+            let first = queue.front().unwrap();
+            assert_eq!(first.offset, count);
+            assert_eq!(first.bytes.as_ptr(), allocation);
+            assert_eq!(first.bytes.len(), original.len());
+            assert_eq!(size, 8192);
+        }
+        // Detect prefix compaction even if it reused the same allocation: eviction
+        // must leave the underlying original bytes completely untouched.
+        assert_eq!(queue.front().unwrap().bytes, original);
+        let tail = queue
+            .iter()
+            .map(BufferedChunk::snapshot)
+            .collect::<Vec<_>>();
+        let chunks = queue
+            .into_iter()
+            .map(BufferedChunk::into_output)
+            .collect::<Vec<_>>();
+        assert_eq!(chunks, tail);
+        assert_eq!(
+            chunks[0],
+            OutputChunk {
+                stream: OutputStream::Stdout,
+                bytes: vec![original[8191]]
+            }
+        );
+        assert!(chunks[1..]
+            .iter()
+            .all(|c| c.stream == OutputStream::Stderr && c.bytes == [255]));
+        assert_eq!(chunks.iter().map(|c| c.bytes.len()).sum::<usize>(), 8192);
+    }
+
     struct FailedReader;
     impl AsyncRead for FailedReader {
         fn poll_read(

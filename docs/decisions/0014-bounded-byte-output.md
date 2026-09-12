@@ -6,7 +6,9 @@ OutputChunk carries the stream tag and raw bytes. No UTF-8 decoding is assumed.
 
 Capture starts independent OS-pipe readers at spawn. Both streams share buffer_bytes;
 overflow removes the oldest bytes, including a partial chunk when necessary, and
-increments a saturating dropped_bytes counter. An oversized incoming chunk retains
+increments a saturating dropped_bytes counter. Partial eviction advances a chunk
+offset without shifting retained bytes; a consuming read compacts that chunk only
+once. Tail snapshots copy only the retained suffix. An oversized incoming chunk retains
 its newest bytes. A zero-capacity queue still drains and counts discarded bytes.
 The optional tail has its own byte cap and survives consuming reads.
 
