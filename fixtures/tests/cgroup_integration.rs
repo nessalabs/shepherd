@@ -77,10 +77,14 @@ async fn detached(orphan: bool, drop_owner: bool) {
                 assert!(libc::WIFSIGNALED(status));
                 break;
             }
-            assert!(
-                result >= 0,
-                "detached child must remain reapable by subreaper"
-            );
+            // Drop signals synchronously, but adoption follows the root's actual exit.
+            // ECHILD before reparenting is transient; success still requires waitpid(child).
+            if result < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ECHILD)
+                );
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
