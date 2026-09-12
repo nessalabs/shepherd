@@ -40,7 +40,6 @@ type ExitChannels = (
 struct ChildSlot {
     output: Option<shepherd_app::output::ProcessOutput>,
     sampling: Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(target_os = "linux")]
     scope: ProcessScopeId,
     sender: watch::Sender<Option<Result<RawExit, String>>>,
     // Retain a receiver so the waiter task's `send` is never lost if it fires before the
@@ -220,7 +219,6 @@ impl UnixProcessBackend {
             ChildSlot {
                 output,
                 sampling: Arc::default(),
-                #[cfg(target_os = "linux")]
                 scope,
                 sender: channels.0,
                 _keep: channels.1,
@@ -254,6 +252,18 @@ impl UnixProcessBackend {
             // that outlived the last tracked root. The next spawn uses `joinable_pgid`
             // (None when live == 0) and creates a fresh group.
         }
+    }
+
+    fn publish_wait_result(
+        &self,
+        scope: ProcessScopeId,
+        sender: &watch::Sender<Option<Result<RawExit, String>>>,
+        raw: Result<RawExit, String>,
+    ) {
+        if raw.is_ok() {
+            self.note_os_exit(scope);
+        }
+        let _ = sender.send(Some(raw));
     }
 
     async fn spawn_in_group(
@@ -415,8 +425,7 @@ impl ProcessBackend for UnixProcessBackend {
             };
             // Root reap is independent of inherited pipe lifetimes. Keep owning the
             // readers here, but let termination observers see the actual exit now.
-            this.note_os_exit(scope);
-            let _ = exit_tx.send(Some(raw));
+            this.publish_wait_result(scope, &exit_tx, raw);
             if let Some(output) = output {
                 crate::output::finish_readers(readers, output).await;
             }
@@ -499,11 +508,16 @@ impl ProcessBackend for UnixProcessBackend {
                 return Err(WaitError::Backend("waiter channel closed".into()));
             }
         };
-        self.state
-            .lock()
-            .expect("unix backend mutex")
-            .children
-            .remove(&key);
+        // A waiter error is not proof that the root exited or was reaped. Keep its
+        // identity (including pidfd) available to the synchronous kill backstop.
+        // A later successful wait can consume a recovered reap observation.
+        if exit.is_ok() {
+            self.state
+                .lock()
+                .expect("unix backend mutex")
+                .children
+                .remove(&key);
+        }
         #[cfg(target_os = "linux")]
         self.state
             .lock()
@@ -571,23 +585,31 @@ impl ProcessBackend for UnixProcessBackend {
     fn hard_kill_all(&self) {
         #[cfg(target_os = "linux")]
         if let Some(cgroups) = &self.cgroups {
-            let failed = cgroups.kill_all();
+            let _ = cgroups.kill_all();
             let state = self.state.lock().expect("unix backend mutex");
-            for scope in failed {
+            // Retained roots remain reachable even after a containment entry was
+            // removed: containment cleanup alone does not prove root reap.
+            for scope in state
+                .children
+                .values()
+                .map(|slot| slot.scope)
+                .collect::<std::collections::HashSet<_>>()
+            {
                 kill_registered_roots(&state, scope);
             }
             return;
         }
-        let groups: Vec<i32> = self
-            .state
-            .lock()
-            .expect("unix backend mutex")
-            .scope_groups
+        let state = self.state.lock().expect("unix backend mutex");
+        for group in state.scope_groups.values() {
+            let _ = killpg(Pid::from_raw(group.pgid), Some(NixSignal::SIGKILL));
+        }
+        for scope in state
+            .children
             .values()
-            .map(|g| g.pgid)
-            .collect();
-        for pgid in groups {
-            let _ = killpg(Pid::from_raw(pgid), Some(NixSignal::SIGKILL));
+            .map(|slot| slot.scope)
+            .collect::<std::collections::HashSet<_>>()
+        {
+            kill_registered_roots(&state, scope);
         }
     }
 }
@@ -797,30 +819,6 @@ fn parse_state(field: &str) -> ProcessState {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    /// The waiter task reaps as soon as the OS child exits. A late `wait()` — the
-    /// monitor not yet scheduled, or a caller that subscribed after reap — must still
-    /// observe the recorded exit instead of `WaitError` / `ReapFailed`.
-    #[tokio::test]
-    async fn late_wait_after_natural_exit_still_sees_status() {
-        let backend = UnixProcessBackend::new();
-        let scope = ProcessScopeId::new(1);
-        let spec = ProcessSpec::new("true");
-        let spawned = backend.spawn(scope, &spec).await.expect("spawn true");
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let exit = backend
-            .wait(&spawned)
-            .await
-            .expect("late wait must not lose a reaped child");
-        assert_eq!(exit.code, Some(0));
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn kill_registered_roots(state: &State, scope: ProcessScopeId) {
     for ((pid, token), slot) in state
         .children
@@ -837,6 +835,68 @@ fn kill_registered_roots(state: &State, scope: ProcessScopeId) {
         if *token != 0 && read_start_time(*pid) == Some(*token) {
             let _ = kill(Pid::from_raw(*pid as i32), Some(NixSignal::SIGKILL));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn failed_wait_retains_identity_until_verified_reap() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let root = backend
+            .spawn(scope, &ProcessSpec::new("/bin/sleep").arg("30"))
+            .await
+            .unwrap();
+        let key = child_key(&root.os);
+        let sender = backend.state.lock().unwrap().children[&key].sender.clone();
+        backend.publish_wait_result(scope, &sender, Err("injected wait failure".into()));
+        assert!(backend.wait(&root).await.is_err());
+        assert!(backend.state.lock().unwrap().children.contains_key(&key));
+        assert_eq!(backend.state.lock().unwrap().scope_groups[&scope].live, 1);
+        // The real OS waiter remains alive and replaces the injected failure only
+        // after it has actually reaped this process.
+        let mut recovered = sender.subscribe();
+        // Model a containment entry already retired independently of root reap.
+        #[cfg(target_os = "linux")]
+        backend.forget_group(scope);
+        backend.hard_kill_all();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(&*recovered.borrow_and_update(), Some(Ok(_))) {
+                    break;
+                }
+                recovered.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            backend.wait(&root).await.unwrap().signal,
+            Some(Signal::Kill)
+        );
+        assert!(!backend.state.lock().unwrap().children.contains_key(&key));
+        backend.cleanup_scope(scope).await.unwrap();
+    }
+
+    /// The waiter task reaps as soon as the OS child exits. A late `wait()` — the
+    /// monitor not yet scheduled, or a caller that subscribed after reap — must still
+    /// observe the recorded exit instead of `WaitError` / `ReapFailed`.
+    #[tokio::test]
+    async fn late_wait_after_natural_exit_still_sees_status() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let spec = ProcessSpec::new("true");
+        let spawned = backend.spawn(scope, &spec).await.expect("spawn true");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let exit = backend
+            .wait(&spawned)
+            .await
+            .expect("late wait must not lose a reaped child");
+        assert_eq!(exit.code, Some(0));
     }
 }
 
@@ -869,7 +929,26 @@ mod cgroup_backstop_tests {
             cgroups.kill(scope).unwrap_err().raw_os_error(),
             Some(libc::EBADF)
         );
+        let sender = backend.state.lock().unwrap().children[&child_key(&root.os)]
+            .sender
+            .clone();
+        sender.send_replace(Some(Err("injected wait failure".into())));
+        assert!(backend.wait(&root).await.is_err());
+        assert!(backend.state.lock().unwrap().children[&child_key(&root.os)]
+            .pidfd
+            .is_some());
+        let mut recovered = sender.subscribe();
         backend.hard_kill_all();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(&*recovered.borrow_and_update(), Some(Ok(_))) {
+                    break;
+                }
+                recovered.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("failed wait discarded the root kill identity");
         let exit = tokio::time::timeout(Duration::from_secs(5), backend.wait(&root))
             .await
             .expect("failed cgroup write abandoned its registered root")
