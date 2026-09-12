@@ -34,7 +34,13 @@ impl InMemoryWaiters {
 
 impl Waiters for InMemoryWaiters {
     fn signal_exit(&self, pid: ProcessId, exit: ProcessExit) {
-        self.sender(pid).send_replace(Some(exit));
+        self.sender(pid).send_if_modified(|current| {
+            if current.is_some_and(|previous| previous.outcome.is_verified()) {
+                return false;
+            }
+            *current = Some(exit);
+            true
+        });
     }
 
     fn try_get(&self, pid: ProcessId) -> Option<ProcessExit> {
@@ -68,6 +74,29 @@ impl Waiters for InMemoryWaiters {
 mod tests {
     use super::*;
     use shepherd_domain::TerminationOutcome;
+    #[tokio::test]
+    async fn verified_correction_survives_delayed_unverified_publication() {
+        let waiters = InMemoryWaiters::new();
+        let pid = ProcessId::new(1);
+        let mut exit = ProcessExit {
+            pid,
+            code: None,
+            signal: None,
+            outcome: shepherd_domain::TerminationOutcome::CleanupUnverified(
+                shepherd_domain::UnverifiedReason::ReapFailed,
+            ),
+            forced: false,
+        };
+        waiters.signal_exit(pid, exit);
+        let failed = exit;
+        exit.outcome = TerminationOutcome::GracefulSuccess;
+        exit.code = Some(0);
+        waiters.signal_exit(pid, exit);
+        waiters.signal_exit(pid, failed);
+        assert_eq!(waiters.try_get(pid), Some(exit));
+        assert_eq!(waiters.wait(pid).await, exit);
+    }
+
     #[tokio::test]
     async fn exit_before_first_subscriber_is_retained() {
         let waiters = InMemoryWaiters::new();
