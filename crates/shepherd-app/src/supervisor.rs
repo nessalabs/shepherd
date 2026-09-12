@@ -504,30 +504,9 @@ impl ProcessSupervisor {
                 _ => result,
             }
         };
-        // No suspension between completed cleanup, publication and history retention.
-        // Never replace a concurrently published verified external cleanup with error.
+        // terminate_scope commits verified publication and bounded history together.
+        // Publish errors here without replacing a concurrently verified external result.
         publish_scope_cleanup_result(&report_tx, result);
-        let verified = report_tx
-            .borrow()
-            .as_ref()
-            .is_some_and(|result| result.as_ref().is_ok_and(|report| report.all_verified()));
-        if verified {
-            // Existing watch receivers retain their result independently of lookup history.
-            let mut completed = self
-                .inner
-                .completed_scope_results
-                .lock()
-                .expect("completed scope results mutex");
-            completed.push_back(scope);
-            while completed.len() > 256 {
-                let old = completed.pop_front().expect("completed scope result");
-                self.inner
-                    .scope_results
-                    .lock()
-                    .expect("scope results mutex")
-                    .remove(&old);
-            }
-        }
     }
 
     /// Waits for the retained report of a with_scope block, including after cancellation.
@@ -866,14 +845,32 @@ impl ProcessSupervisor {
         outcomes.sort_by_key(|(pid, _)| *pid);
         let report = ScopeTerminationReport { scope, outcomes };
         if report.all_verified() {
-            if let Some(sender) = self
+            // Publish before removing the live entry so repeat callers cannot see a gap.
+            let sender = self
                 .inner
                 .scope_results
                 .lock()
                 .expect("scope results mutex")
                 .get(&scope)
-            {
-                sender.send_replace(Some(Ok(report.clone())));
+                .cloned();
+            if let Some(sender) = sender {
+                publish_scope_cleanup_result(&sender, Ok(report.clone()));
+                // Only scoped blocks consume scoped result history. The operation lock
+                // makes verified completion enter this queue exactly once.
+                let mut completed = self
+                    .inner
+                    .completed_scope_results
+                    .lock()
+                    .expect("completed scope results mutex");
+                completed.push_back(scope);
+                while completed.len() > 256 {
+                    let old = completed.pop_front().expect("completed scoped result");
+                    self.inner
+                        .scope_results
+                        .lock()
+                        .expect("scope results mutex")
+                        .remove(&old);
+                }
             }
             self.inner
                 .reports
@@ -1539,6 +1536,72 @@ mod sampler_shutdown_tests {
     #[async_trait]
     impl IntegrationEventPublisher for Ports {
         async fn publish(&self, _: shepherd_domain::IntegrationEvent) {}
+    }
+
+    #[tokio::test]
+    async fn recovered_scoped_cleanups_enter_bounded_history_once() {
+        let ports = Arc::new(Ports {
+            fail_cleanup: AtomicBool::new(true),
+        });
+        let sup =
+            ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports.clone());
+        let mut first_receiver = None;
+        let mut first_scope = None;
+        for index in 0..300 {
+            ports.fail_cleanup.store(true, Ordering::SeqCst);
+            let failed = sup.with_scope(Vec::new(), |_| async {}).await;
+            assert!(failed.result.is_ok());
+            assert!(failed.termination.is_err());
+            let scope = failed.scope;
+            if index == 0 {
+                first_scope = Some(scope);
+                first_receiver = Some(
+                    sup.inner
+                        .scope_results
+                        .lock()
+                        .unwrap()
+                        .get(&scope)
+                        .unwrap()
+                        .subscribe(),
+                );
+            }
+            ports.fail_cleanup.store(false, Ordering::SeqCst);
+            assert!(sup
+                .terminate_scope(scope, TerminateOptions::default())
+                .await
+                .unwrap()
+                .all_verified());
+            assert!(sup.wait_scope_cleanup(scope).await.unwrap().all_verified());
+            // Repeated successful cleanup reads the cached report, without consuming
+            // another history position or evicting unrelated retained scoped results.
+            for _ in 0..3 {
+                assert!(sup
+                    .terminate_scope(scope, TerminateOptions::default())
+                    .await
+                    .unwrap()
+                    .all_verified());
+            }
+            let completed = sup.inner.completed_scope_results.lock().unwrap();
+            assert_eq!(completed.len(), (index + 1).min(256));
+            assert_eq!(completed.iter().filter(|id| **id == scope).count(), 1);
+            assert_eq!(
+                sup.inner.scope_results.lock().unwrap().len(),
+                completed.len()
+            );
+        }
+        let first_scope = first_scope.unwrap();
+        assert!(matches!(sup.wait_scope_cleanup(first_scope).await,
+            Err(TerminateError::UnknownScope(id)) if id == first_scope));
+        // Evicting lookup history cannot invalidate an already registered observer.
+        let receiver = first_receiver.unwrap();
+        assert!(receiver
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .all_verified());
+        assert!(sup.shutdown().await.unwrap().scopes.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
