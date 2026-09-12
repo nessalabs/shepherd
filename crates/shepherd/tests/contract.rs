@@ -220,6 +220,31 @@ struct CleanupFailsBackend {
     failing: std::sync::atomic::AtomicBool,
     attempts: std::sync::atomic::AtomicUsize,
 }
+
+#[derive(Default)]
+struct RecordingPublisher(std::sync::Mutex<Vec<shepherd::IntegrationEvent>>);
+#[async_trait]
+impl shepherd::IntegrationEventPublisher for RecordingPublisher {
+    async fn publish(&self, event: shepherd::IntegrationEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+impl RecordingPublisher {
+    fn scope_count(&self, scope: ProcessScopeId) -> usize {
+        self.0.lock().unwrap().iter().filter(|event|
+            matches!(event, shepherd::IntegrationEvent::ScopeTerminated { scope: id } if *id == scope)
+        ).count()
+    }
+    async fn wait_for_scope(&self, scope: ProcessScopeId) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while self.scope_count(scope) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
 #[async_trait]
 impl ProcessBackend for CleanupFailsBackend {
     async fn spawn(
@@ -270,19 +295,27 @@ impl ProcessBackend for CleanupFailsBackend {
 #[tokio::test(start_paused = true)]
 async fn shutdown_retries_failed_containment_for_empty_and_reaped_scopes() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    for populated in [false, true] {
+    for mode in ["empty", "respect-graceful", "exit-immediately"] {
         let backend = Arc::new(CleanupFailsBackend {
             inner: NullBackend::new(),
             failing: AtomicBool::new(true),
             attempts: AtomicUsize::new(0),
         });
-        let sup = SupervisorBuilder::new().backend(backend.clone()).build();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let sup = SupervisorBuilder::new()
+            .backend(backend.clone())
+            .integration_publisher(publisher.clone())
+            .build();
         let scope = sup.create_scope();
-        if populated {
-            sup.spawn(scope, ProcessSpec::new("respect-graceful"))
-                .await
-                .unwrap();
-        }
+        let pid = if mode != "empty" {
+            let pid = sup.spawn(scope, ProcessSpec::new(mode)).await.unwrap();
+            if mode == "exit-immediately" {
+                sup.wait(pid).await.unwrap();
+            }
+            Some(pid)
+        } else {
+            None
+        };
         for expected in 1..=2 {
             assert!(matches!(
                 sup.shutdown().await,
@@ -290,11 +323,22 @@ async fn shutdown_retries_failed_containment_for_empty_and_reaped_scopes() {
             ));
             assert_eq!(backend.attempts.load(Ordering::SeqCst), expected);
             assert_eq!(sup.processes(scope), Some(Vec::new()));
+            assert_eq!(
+                publisher.scope_count(scope),
+                0,
+                "published before verified cleanup"
+            );
         }
         backend.failing.store(false, Ordering::SeqCst);
         let report = sup.shutdown().await.unwrap();
         assert_eq!(report.scopes.len(), 1);
         assert!(report.scopes[0].all_verified());
+        if mode == "respect-graceful" {
+            assert_eq!(
+                report.scopes[0].outcomes,
+                vec![(pid.unwrap(), TerminationOutcome::GracefulSuccess)]
+            );
+        }
         assert_eq!(sup.processes(scope), None);
         assert!(sup
             .terminate_scope(scope, short_opts())
@@ -303,9 +347,52 @@ async fn shutdown_retries_failed_containment_for_empty_and_reaped_scopes() {
             .all_verified());
         assert!(sup.shutdown().await.unwrap().scopes.is_empty());
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
+        publisher.wait_for_scope(scope).await;
+        assert_eq!(publisher.scope_count(scope), 1);
         assert!(matches!(sup.spawn(scope, ProcessSpec::new("unused")).await,
             Err(SpawnError::ScopeClosed(id)) if id == scope));
     }
+}
+
+#[tokio::test]
+async fn cancellation_before_workers_complete_preserves_reaped_outcomes() {
+    use std::future::Future;
+    use std::task::Poll;
+    let backend = Arc::new(NullBackend::new());
+    let publisher = Arc::new(RecordingPublisher::default());
+    let sup = SupervisorBuilder::new()
+        .backend(backend.clone())
+        .integration_publisher(publisher.clone())
+        .build();
+    let scope = sup.create_scope();
+    let pid = sup
+        .spawn(scope, ProcessSpec::new("respect-graceful"))
+        .await
+        .unwrap();
+    let mut termination = Box::pin(sup.terminate_scope(scope, short_opts()));
+    // One poll begins draining and queues workers; this current-thread runtime cannot
+    // run them before we cancel, so there is no local JoinSet outcome to preserve.
+    std::future::poll_fn(|cx| {
+        assert!(termination.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(termination);
+    backend.signal_scope(scope, Signal::Kill).await.unwrap();
+    let exit = sup.wait(pid).await.unwrap();
+    assert_eq!(exit.outcome, TerminationOutcome::ForcedRequired);
+    assert_eq!(publisher.scope_count(scope), 0);
+    let report = sup.terminate_scope(scope, short_opts()).await.unwrap();
+    assert_eq!(report.outcomes, vec![(pid, exit.outcome)]);
+    assert_eq!(
+        sup.terminate_scope(scope, short_opts())
+            .await
+            .unwrap()
+            .outcomes,
+        report.outcomes
+    );
+    publisher.wait_for_scope(scope).await;
+    assert_eq!(publisher.scope_count(scope), 1);
 }
 
 #[tokio::test]

@@ -30,11 +30,18 @@ caller that discarded its future; the retained report is the observation path.
 Lookup history retains the most recent 256 verified completed scope reports. Pending
 and failed/unverified cleanup reports are not evicted. A receiver registered before
 completion retains its result even after the lookup history expires that scope ID;
-new lookups of expired verified scopes return UnknownScope.
+new lookups of expired verified scopes return UnknownScope. A separate observer
+awaits the cleanup worker's JoinHandle and publishes TerminateError on worker panic;
+a retained sender can therefore never hide a cleanup panic as a permanently pending
+report while the runtime remains running.
 
 Spawns run in owned application workers so cancellation cannot interrupt the
 backend-spawn-to-monitor ownership handoff. Scope operations serialize cleanup
 against an admitted spawn; the guard worker waits for any such spawn to complete.
+Operation locks are allocated only for created scopes and removed after verified
+cleanup, after publishing the cached report. Queued callers recheck that report
+under the retained operation lock; completed or unknown lookups do not recreate
+per-scope locks.
 Ordinary shutdown closes admission, then waits for already admitted spawns to attach
 and enter their scope's normal graceful termination and descendant sweep. A late
 spawn must not hard-kill unrelated scopes while they are still owed grace. Last
