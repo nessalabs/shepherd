@@ -92,6 +92,8 @@ impl Drop for CleanupGuard {
     }
 }
 
+type ScopeOperation = tokio::sync::Mutex<Option<ScopeTerminationReport>>;
+
 struct Inner {
     registry: SharedRegistry,
     backend: Arc<dyn ProcessBackend>,
@@ -100,7 +102,7 @@ struct Inner {
     dispatcher: EventDispatcher,
     spawn_times: Mutex<HashMap<ProcessId, Instant>>,
     shutting_down: Arc<AtomicBool>,
-    scope_operations: Mutex<HashMap<ProcessScopeId, Arc<tokio::sync::Mutex<()>>>>,
+    scope_operations: Mutex<HashMap<ProcessScopeId, Arc<ScopeOperation>>>,
     samples: Mutex<HashMap<ProcessId, Result<ProcessStats, StatsError>>>,
     sampler_started: AtomicBool,
     sampler_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -218,7 +220,7 @@ impl ProcessSupervisor {
             .scope_operations
             .lock()
             .expect("scope operations mutex")
-            .insert(scope, Arc::new(tokio::sync::Mutex::new(())));
+            .insert(scope, Arc::new(tokio::sync::Mutex::new(None)));
         Ok(scope)
     }
 
@@ -227,7 +229,7 @@ impl ProcessSupervisor {
         self.inner.backend.capabilities()
     }
 
-    fn scope_operation(&self, scope: ProcessScopeId) -> Option<Arc<tokio::sync::Mutex<()>>> {
+    fn scope_operation(&self, scope: ProcessScopeId) -> Option<Arc<ScopeOperation>> {
         self.inner
             .scope_operations
             .lock()
@@ -268,7 +270,10 @@ impl ProcessSupervisor {
                 SpawnError::UnknownScope(scope)
             }
         })?;
-        let _serial = operation.lock().await;
+        let serial = operation.lock().await;
+        if serial.is_some() {
+            return Err(SpawnError::ScopeClosed(scope));
+        }
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return Err(SpawnError::ScopeClosed(scope));
         }
@@ -563,7 +568,19 @@ impl ProcessSupervisor {
                     .ok_or(TerminateError::UnknownScope(scope));
             }
         };
-        let _serial = operation.lock().await;
+        self.terminate_scope_operation(scope, opts, operation).await
+    }
+
+    async fn terminate_scope_operation(
+        &self,
+        scope: ProcessScopeId,
+        opts: TerminateOptions,
+        operation: Arc<ScopeOperation>,
+    ) -> Result<ScopeTerminationReport, TerminateError> {
+        let mut serial = operation.lock().await;
+        if let Some(report) = serial.as_ref() {
+            return Ok(report.clone());
+        }
         if let Some(report) = self
             .inner
             .reports
@@ -579,7 +596,31 @@ impl ProcessSupervisor {
             let s = registry
                 .get_mut(scope)
                 .ok_or(TerminateError::UnknownScope(scope))?;
-            (s.begin_scope_termination(), s.process_ids())
+            let events = s.begin_scope_termination();
+            let live = s.process_ids();
+            // A monitor may have recorded a reap while Open but not dispatched its
+            // prune yet. Capture those exits at the same lock boundary as Draining.
+            // Later reaps persist themselves; already-pruned Open history is not kept.
+            let exits: Vec<_> = live
+                .iter()
+                .filter_map(|pid| {
+                    s.get(*pid)
+                        .and_then(|process| process.exit())
+                        .map(|exit| (*pid, exit.outcome))
+                })
+                .collect();
+            if !exits.is_empty() {
+                let mut pending = self
+                    .inner
+                    .pending_outcomes
+                    .lock()
+                    .expect("pending outcomes mutex");
+                let retained = pending.entry(scope).or_default();
+                for (pid, outcome) in exits {
+                    retained.entry(pid).or_insert(outcome);
+                }
+            }
+            (events, live)
         };
         events.retain(|event| !matches!(event, shepherd_domain::DomainEvent::ScopeClosed { .. }));
         self.inner.dispatcher.dispatch(&events).await;
@@ -634,6 +675,8 @@ impl ProcessSupervisor {
         outcomes.sort_by_key(|(pid, _)| *pid);
         let report = ScopeTerminationReport { scope, outcomes };
         if report.all_verified() {
+            // In-flight callers own this state even after bounded lookup history expires.
+            *serial = Some(report.clone());
             self.inner
                 .reports
                 .lock()
@@ -686,12 +729,33 @@ impl ProcessSupervisor {
     pub async fn shutdown(&self) -> Result<ShutdownReport, ShutdownError> {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         let _serial = self.inner.shutdown_serial.lock().await;
-        let scopes = self.lock_registry().scope_ids();
+        // Pin every snapshotted operation before another terminator can retire it.
+        let scopes = {
+            let registry = self.lock_registry();
+            let operations = self
+                .inner
+                .scope_operations
+                .lock()
+                .expect("scope operations mutex");
+            registry
+                .scope_ids()
+                .into_iter()
+                .map(|scope| {
+                    (
+                        scope,
+                        operations
+                            .get(&scope)
+                            .expect("registered scope operation")
+                            .clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         let mut reports = Vec::new();
         let mut unverified = 0usize;
-        for scope in scopes {
+        for (scope, operation) in scopes {
             match self
-                .terminate_scope(scope, TerminateOptions::default())
+                .terminate_scope_operation(scope, TerminateOptions::default(), operation)
                 .await
             {
                 Ok(report) => {
@@ -1011,6 +1075,143 @@ mod scope_operation_tests {
     fn supervisor() -> ProcessSupervisor {
         let ports = Arc::new(EmptyPorts);
         ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports)
+    }
+
+    #[tokio::test]
+    async fn queued_operations_retain_results_after_lookup_history_eviction() {
+        let supervisor = supervisor();
+        let scope = supervisor.create_scope();
+        let operation = supervisor.scope_operation(scope).unwrap();
+        let held = operation.lock().await;
+        let mut cleanup = Box::pin(supervisor.terminate_scope(scope, Default::default()));
+        let mut queued = Box::pin(supervisor.terminate_scope(scope, Default::default()));
+        let mut spawn = Box::pin(supervisor.spawn(scope, ProcessSpec::new("unused")));
+        std::future::poll_fn(|cx| {
+            assert!(cleanup.as_mut().poll(cx).is_pending());
+            assert!(queued.as_mut().poll(cx).is_pending());
+            assert!(spawn.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(held);
+        assert!(cleanup.await.unwrap().all_verified());
+        for _ in 0..650 {
+            let old = supervisor.create_scope();
+            supervisor
+                .terminate_scope(old, Default::default())
+                .await
+                .unwrap();
+        }
+        assert!(!supervisor
+            .inner
+            .reports
+            .lock()
+            .unwrap()
+            .contains_key(&scope));
+        assert!(queued.await.unwrap().all_verified());
+        assert!(matches!(spawn.await, Err(SpawnError::ScopeClosed(id)) if id == scope));
+        assert!(supervisor.inner.scope_operations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_snapshot_pins_operations_before_it_reaches_each_scope() {
+        let supervisor = supervisor();
+        for _ in 0..652 {
+            supervisor.create_scope();
+        }
+        let scopes = supervisor.lock_registry().scope_ids();
+        let first = supervisor.scope_operation(scopes[0]).unwrap();
+        let held = first.lock().await;
+        let mut shutdown = Box::pin(supervisor.shutdown());
+        std::future::poll_fn(|cx| {
+            assert!(shutdown.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        for scope in &scopes[1..] {
+            supervisor
+                .terminate_scope(*scope, Default::default())
+                .await
+                .unwrap();
+        }
+        assert!(!supervisor
+            .inner
+            .reports
+            .lock()
+            .unwrap()
+            .contains_key(&scopes[1]));
+        drop(held);
+        let result = shutdown.await.unwrap();
+        assert_eq!(result.scopes.len(), 652);
+        assert!(result
+            .scopes
+            .iter()
+            .all(ScopeTerminationReport::all_verified));
+    }
+
+    #[tokio::test]
+    async fn draining_captures_reap_recorded_open_before_monitor_prune() {
+        let supervisor = supervisor();
+        let scope = supervisor.create_scope();
+        // Pause the monitor at its registry unlock, before dispatching ProcessReaped.
+        let (pid, event) = {
+            let mut registry = supervisor.lock_registry();
+            let pid = registry.next_process_id();
+            let s = registry.get_mut(scope).unwrap();
+            s.attach_spawned(
+                pid,
+                shepherd_domain::OsIdentity::new(1, shepherd_domain::ReuseToken::Unavailable),
+                ProcessSpec::new("unused"),
+            )
+            .unwrap();
+            let exit = ProcessExit {
+                pid,
+                code: Some(0),
+                signal: None,
+                outcome: TerminationOutcome::ExitedNaturally,
+                forced: false,
+            };
+            s.record_exit(pid).unwrap();
+            let events = s.record_reaped(pid, exit).unwrap();
+            assert!(s.is_open());
+            (
+                pid,
+                events
+                    .into_iter()
+                    .find(|event| {
+                        matches!(event, shepherd_domain::DomainEvent::ProcessReaped { .. })
+                    })
+                    .unwrap(),
+            )
+        };
+        assert!(supervisor.inner.pending_outcomes.lock().unwrap().is_empty());
+        let mut cleanup = Box::pin(supervisor.terminate_scope(scope, Default::default()));
+        std::future::poll_fn(|cx| {
+            assert!(cleanup.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        // The JoinSet has not run. Cancel cleanup, then resume the monitor's prune.
+        drop(cleanup);
+        RegistryPruneHandler::new(supervisor.inner.registry.clone())
+            .handle(&event)
+            .await
+            .unwrap();
+        assert!(supervisor
+            .lock_registry()
+            .get(scope)
+            .unwrap()
+            .process_ids()
+            .is_empty());
+        let retry = supervisor
+            .terminate_scope(scope, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            retry.outcomes,
+            vec![(pid, TerminationOutcome::ExitedNaturally)]
+        );
+        assert!(supervisor.inner.pending_outcomes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
