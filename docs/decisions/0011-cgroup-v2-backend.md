@@ -25,6 +25,9 @@ capabilities never silently degrade while processes are owned. This refines §17
 Keep the kill descriptor open for synchronous Drop. Explicit scope cleanup checks
 `cgroup.events` for `populated 0`, then removes the scope directory. Failure or a
 five-second timeout returns an error; a successful signal alone is insufficient.
+Empty nested cgroups are removed bottom-up before the scope directory. Traversal
+uses pinned directory descriptors and refuses symlinks; cgroup control files are
+never unlinked. Kernel directory removal still fails if a group becomes populated.
 Root children are separately waited and reaped. Descendant zombies belong to their
 OS parent/reaper; emptiness means no live descendant, not that Shepherd can wait
 for arbitrary non-child processes. Tests use a subreaper to verify their reaping.

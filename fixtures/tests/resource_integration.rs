@@ -130,3 +130,64 @@ async fn real_io_counters_increase() {
         .all_verified());
     std::fs::remove_file(path).unwrap();
 }
+
+/// Exercise units through the public cache on both Intel and Apple Silicon. A
+/// timebase error can pass the existing "CPU is nonzero" test while reporting
+/// either roughly 0.024 or 41.7 cores for this single-threaded workload on ARM.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_single_thread_cpu_is_in_core_units() {
+    let sup = SupervisorBuilder::new()
+        .stats_interval(Duration::from_millis(250))
+        .build();
+    let scope = sup.create_scope();
+    let pid = sup
+        .spawn(
+            scope,
+            ProcessSpec::new(env!("CARGO_BIN_EXE_resource_workload")).arg("cpu"),
+        )
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut previous_uptime = None;
+        let mut elapsed = Duration::ZERO;
+        let mut cpu_seconds = 0.0;
+        let mut intervals = 0;
+        loop {
+            match sup.stats(pid).await {
+                Ok(sample) => {
+                    if let Some(previous) = previous_uptime {
+                        let duration = sample.uptime.saturating_sub(previous);
+                        if !duration.is_zero() {
+                            cpu_seconds += f64::from(sample.cpu_usage) * duration.as_secs_f64();
+                            elapsed += duration;
+                            intervals += 1;
+                        }
+                    }
+                    // Skip the first observation: it only establishes the backend baseline.
+                    previous_uptime = Some(sample.uptime);
+                    if intervals >= 8 && elapsed >= Duration::from_secs(2) {
+                        return cpu_seconds / elapsed.as_secs_f64();
+                    }
+                }
+                Err(StatsError::NotReady(_)) => {}
+                Err(error) => panic!("CPU sample failed: {error}"),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(sup
+        .terminate_scope(scope, TerminateOptions::default())
+        .await
+        .unwrap()
+        .all_verified());
+    let cores = observed.expect("eight fresh CPU intervals within fifteen seconds");
+    // Average several substantial intervals and allow scheduler contention and
+    // accounting jitter; an exact instantaneous 1.0 assertion would be fragile.
+    assert!(
+        cores.is_finite() && cores > 0.05 && cores <= 2.0,
+        "single-thread burner should consume 0.05..=2 cores, observed {cores}"
+    );
+    eprintln!("macOS single-thread CPU average: {cores} cores");
+}

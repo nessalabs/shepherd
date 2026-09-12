@@ -1,10 +1,12 @@
 //! The `ProcessSupervisor` application service.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures_util::future::{AbortHandle, Abortable};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use futures_util::FutureExt;
 
 use shepherd_domain::{
@@ -75,6 +77,7 @@ impl Clone for ProcessSupervisor {
 struct CleanupGuard {
     backend: Arc<dyn ProcessBackend>,
     shutting_down: Arc<AtomicBool>,
+    owners_dropped: Arc<AtomicBool>,
 }
 
 impl Drop for CleanupGuard {
@@ -84,6 +87,7 @@ impl Drop for CleanupGuard {
                 "ProcessSupervisor dropped without shutdown; issuing unverified hard-kill"
             );
         }
+        self.owners_dropped.store(true, Ordering::SeqCst);
         self.shutting_down.store(true, Ordering::SeqCst);
         self.backend.hard_kill_all();
     }
@@ -97,6 +101,7 @@ struct Inner {
     dispatcher: EventDispatcher,
     spawn_times: Mutex<HashMap<ProcessId, Instant>>,
     shutting_down: Arc<AtomicBool>,
+    owners_dropped: Arc<AtomicBool>,
     scope_operations: Mutex<HashMap<ProcessScopeId, Arc<tokio::sync::Mutex<()>>>>,
     samples: Mutex<HashMap<ProcessId, Result<ProcessStats, StatsError>>>,
     sampler_started: AtomicBool,
@@ -141,6 +146,7 @@ impl ProcessSupervisor {
     ) -> Self {
         let registry: SharedRegistry = Arc::new(Mutex::new(ScopeRegistry::new()));
         let shutting_down = Arc::new(AtomicBool::new(false));
+        let owners_dropped = Arc::new(AtomicBool::new(false));
         let handlers: Vec<Arc<dyn EventHandler>> = vec![
             Arc::new(WaitNotifierHandler::new(waiters.clone())),
             Arc::new(RegistryPruneHandler::new(registry.clone())),
@@ -165,10 +171,12 @@ impl ProcessSupervisor {
                 completed_scopes: Mutex::new(VecDeque::new()),
                 shutdown_serial: tokio::sync::Mutex::new(()),
                 shutting_down: Arc::clone(&shutting_down),
+                owners_dropped: Arc::clone(&owners_dropped),
             }),
             cleanup: Some(Arc::new(CleanupGuard {
                 backend,
                 shutting_down,
+                owners_dropped,
             })),
         }
     }
@@ -273,7 +281,9 @@ impl ProcessSupervisor {
         }
 
         let spawned = self.inner.backend.spawn(scope, &spec).await?;
-        if self.inner.shutting_down.load(Ordering::SeqCst) {
+        // Ordinary shutdown waits on this operation lock and cleans an admitted spawn
+        // through its scope. Only last-owner Drop requires a synchronous late-spawn sweep.
+        if self.inner.owners_dropped.load(Ordering::SeqCst) {
             self.inner.backend.hard_kill_all();
             self.kill_orphan(&spawned).await;
             return Err(SpawnError::ScopeClosed(scope));
@@ -408,6 +418,7 @@ impl ProcessSupervisor {
             Some(error) => Err(error),
             None => Ok(body(ScopedProcesses {
                 scope,
+                owned: Mutex::new(processes.iter().copied().collect()),
                 processes,
                 supervisor: self.worker(),
             })
@@ -494,76 +505,73 @@ impl ProcessSupervisor {
         let weak = Arc::downgrade(&self.inner);
         let interval = self.inner.stats_interval;
         tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut pending = FuturesUnordered::new();
+            let mut active = HashMap::<ProcessId, AbortHandle>::new();
             loop {
-                let Some(inner) = weak.upgrade() else {
-                    break;
-                };
-                let targets = {
-                    let registry = inner.registry.lock().expect("registry mutex");
-                    registry
-                        .scope_ids()
-                        .into_iter()
-                        .flat_map(|id| {
-                            let scope = registry.get(id).expect("scope exists");
-                            scope
-                                .live_process_ids()
-                                .into_iter()
-                                .map(|pid| {
-                                    (
-                                        pid,
-                                        Spawned {
-                                            os: scope
-                                                .get(pid)
-                                                .expect("process exists")
-                                                .os_identity(),
-                                        },
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .collect::<Vec<_>>()
-                };
-                for (pid, target) in targets {
-                    let observed = tokio::time::timeout(
-                        Duration::from_secs(1),
-                        std::panic::AssertUnwindSafe(inner.backend.sample(&target)).catch_unwind(),
-                    )
-                    .await;
-                    let sample = match observed {
-                        Ok(Ok(result)) => result,
-                        Ok(Err(_)) => Err(StatsError::Backend("sampler panicked".into())),
-                        Err(_) => Err(StatsError::Backend("sampler timeout".into())),
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let Some(inner) = weak.upgrade() else { break; };
+                        let targets = {
+                            let registry = inner.registry.lock().expect("registry mutex");
+                            registry.scope_ids().into_iter().flat_map(|id| {
+                                let scope = registry.get(id).expect("scope exists");
+                                scope.live_process_ids().into_iter().map(|pid| {
+                                    (pid, Spawned {
+                                        os: scope.get(pid).expect("process exists").os_identity(),
+                                    })
+                                }).collect::<Vec<_>>()
+                            }).collect::<Vec<_>>()
+                        };
+                        let live: HashSet<_> = targets.iter().map(|(pid, _)| *pid).collect();
+                        for (pid, abort) in &active {
+                            if !live.contains(pid) {
+                                abort.abort();
+                            }
+                        }
+                        for (pid, target) in targets {
+                            // One observation per root, with no queue of missed intervals.
+                            if active.contains_key(&pid) { continue; }
+                            let backend = Arc::clone(&inner.backend);
+                            let (abort, registration) = AbortHandle::new_pair();
+                            active.insert(pid, abort);
+                            pending.push(async move {
+                                let observed = Abortable::new(async {
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(1),
+                                        std::panic::AssertUnwindSafe(backend.sample(&target)).catch_unwind(),
+                                    ).await {
+                                        Ok(Ok(result)) => result,
+                                        Ok(Err(_)) => Err(StatsError::Backend("sampler panicked".into())),
+                                        Err(_) => Err(StatsError::Backend("sampler timeout".into())),
+                                    }
+                                }, registration).await;
+                                (pid, observed)
+                            }.boxed());
+                        }
                     }
-                    .map(|raw| {
-                        let start = inner
-                            .spawn_times
-                            .lock()
-                            .expect("spawn times mutex")
-                            .get(&pid)
-                            .copied();
-                        let uptime = start
-                            .map(|s| inner.clock.now().saturating_duration_since(s))
-                            .unwrap_or_default();
-                        ProcessStats::from_raw(pid, raw, uptime)
-                    });
-                    // Keep the same registry -> samples lock order as stats and the monitor.
-                    // A sample finishing after reap must not resurrect a cache entry.
-                    let registry = inner.registry.lock().expect("registry mutex");
-                    let live = registry
-                        .scope_of(pid)
-                        .and_then(|id| registry.get(id))
-                        .and_then(|s| s.get(pid))
-                        .is_some_and(|p| p.state().is_live());
-                    if live {
-                        inner
-                            .samples
-                            .lock()
-                            .expect("samples mutex")
-                            .insert(pid, sample);
+                    Some((pid, observed)) = pending.next(), if !pending.is_empty() => {
+                        active.remove(&pid);
+                        let Ok(observed) = observed else { continue; };
+                        let Some(inner) = weak.upgrade() else { break; };
+                        let sample = observed.map(|raw| {
+                            let start = inner.spawn_times.lock().expect("spawn times mutex")
+                                .get(&pid).copied();
+                            let uptime = start.map(|s| inner.clock.now().saturating_duration_since(s))
+                                .unwrap_or_default();
+                            ProcessStats::from_raw(pid, raw, uptime)
+                        });
+                        // Recheck under registry -> samples lock order: a result after reap
+                        // must never resurrect a cache entry.
+                        let registry = inner.registry.lock().expect("registry mutex");
+                        let live = registry.scope_of(pid).and_then(|id| registry.get(id))
+                            .and_then(|s| s.get(pid)).is_some_and(|p| p.state().is_live());
+                        if live {
+                            inner.samples.lock().expect("samples mutex").insert(pid, sample);
+                        }
                     }
                 }
-                drop(inner);
-                tokio::time::sleep(interval).await;
             }
         });
     }
@@ -966,6 +974,7 @@ pub struct WithScopeResult<T> {
 pub struct ScopedProcesses {
     scope: ProcessScopeId,
     processes: Vec<ProcessId>,
+    owned: Mutex<HashSet<ProcessId>>,
     supervisor: ProcessSupervisor,
 }
 impl ScopedProcesses {
@@ -976,20 +985,33 @@ impl ScopedProcesses {
         &self.processes
     }
     pub async fn spawn(&self, spec: ProcessSpec) -> Result<ProcessId, SpawnError> {
-        self.supervisor.spawn(self.scope, spec).await
+        let pid = self.supervisor.spawn(self.scope, spec).await?;
+        self.owned
+            .lock()
+            .expect("scoped processes mutex")
+            .insert(pid);
+        Ok(pid)
     }
     pub async fn wait(&self, pid: ProcessId) -> Result<ProcessExit, WaitError> {
-        if self
-            .supervisor
-            .lock_registry()
-            .scope_of(pid)
-            .is_some_and(|s| s != self.scope)
+        if !self
+            .owned
+            .lock()
+            .expect("scoped processes mutex")
+            .contains(&pid)
         {
             return Err(WaitError::UnknownProcess(pid));
         }
         self.supervisor.wait(pid).await
     }
     pub fn take_output(&self, pid: ProcessId) -> Option<crate::output::ProcessOutput> {
+        if !self
+            .owned
+            .lock()
+            .expect("scoped processes mutex")
+            .contains(&pid)
+        {
+            return None;
+        }
         self.supervisor.take_output(pid)
     }
 }
