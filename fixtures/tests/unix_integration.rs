@@ -35,15 +35,18 @@ async fn graceful_termination_of_a_real_process() {
 async fn stubborn_process_is_force_killed() {
     let sup = SupervisorBuilder::new().build();
     let scope = sup.create_scope();
+    let ready = std::env::temp_dir().join(format!("shepherd-stubborn-{}", std::process::id()));
+    let _ = std::fs::remove_file(&ready);
     let pid = sup
         .spawn(
             scope,
-            ProcessSpec::new(env!("CARGO_BIN_EXE_ignore_sigterm")),
+            ProcessSpec::new(env!("CARGO_BIN_EXE_ignore_sigterm")).arg(ready.as_os_str()),
         )
         .await
         .unwrap();
-    // Let the fixture install its SIGTERM-ignoring handler before we signal it.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Readiness is emitted only after installing SIG_IGN, independent of host load.
+    let _ = read_os_pid(&ready).await;
+    std::fs::remove_file(ready).unwrap();
     let exit = sup.terminate(pid, short_opts()).await.unwrap();
     assert_eq!(exit.outcome, TerminationOutcome::ForcedRequired);
     assert!(exit.forced);

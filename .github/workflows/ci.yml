@@ -74,17 +74,30 @@ jobs:
         run: cargo test --workspace
 
   linux-containment:
-    name: Linux containment (process group; cgroup probe)
+    name: Linux unprivileged lifecycle + capability honesty
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Probe cgroup v2 availability
-        run: |
-          echo "cgroup v2 mount:"; (mount | grep cgroup2 || echo "  none")
-          echo "cgroup.controllers:"; (cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || echo "  unavailable")
-          echo "NOTE: full cgroup.kill containment tests land with the cgroup v2 backend (Phase 2);"
-          echo "this job currently validates the POSIX process-group backend on Linux."
       - name: Real-process integration tests
         run: cargo test -p shepherd-fixtures --test unix_integration -- --nocapture
+
+  privileged-cgroup:
+    name: privileged cgroup.kill + setsid + isolation + reap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build privileged tests as runner
+        run: cargo test -p shepherd-fixtures --test cgroup_integration --no-run
+      - name: Exercise real cgroup v2 (fail closed)
+        run: |
+          set -euo pipefail
+          test -f /sys/fs/cgroup/cgroup.controllers
+          sudo mkdir /sys/fs/cgroup/shepherd-ci
+          trap 'sudo rmdir /sys/fs/cgroup/shepherd-ci' EXIT
+          test_bin=$(find target/debug/deps -maxdepth 1 -name 'cgroup_integration-*' -type f -executable | head -n 1)
+          test -n "$test_bin"
+          sudo env SHEPHERD_CGROUP_ROOT=/sys/fs/cgroup/shepherd-ci "$test_bin" --ignored --test-threads=1 --nocapture

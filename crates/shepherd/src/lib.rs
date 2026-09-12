@@ -95,7 +95,12 @@ impl SupervisorBuilder {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn default_backend() -> Arc<dyn ProcessBackend> {
+    Arc::new(UnixProcessBackend::auto())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn default_backend() -> Arc<dyn ProcessBackend> {
     // Process-group Unix adapter; process-wrap / cgroups-rs are deferred (ADR 0006).
     Arc::new(UnixProcessBackend::new())

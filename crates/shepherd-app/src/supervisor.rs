@@ -94,6 +94,7 @@ struct Inner {
     dispatcher: EventDispatcher,
     spawn_times: Mutex<HashMap<ProcessId, Instant>>,
     shutting_down: Arc<AtomicBool>,
+    scope_operations: Mutex<HashMap<ProcessScopeId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl std::fmt::Debug for ProcessSupervisor {
@@ -128,6 +129,7 @@ impl ProcessSupervisor {
                 waiters,
                 dispatcher: EventDispatcher::new(handlers),
                 spawn_times: Mutex::new(HashMap::new()),
+                scope_operations: Mutex::new(HashMap::new()),
                 shutting_down: Arc::clone(&shutting_down),
             }),
             cleanup: Arc::new(CleanupGuard {
@@ -140,6 +142,21 @@ impl ProcessSupervisor {
     /// Creates a new, open scope and returns its id.
     pub fn create_scope(&self) -> ProcessScopeId {
         self.lock_registry().create_scope()
+    }
+
+    /// Runtime capabilities of the selected backend.
+    pub fn capabilities(&self) -> shepherd_domain::Capabilities {
+        self.inner.backend.capabilities()
+    }
+
+    fn scope_operation(&self, scope: ProcessScopeId) -> Arc<tokio::sync::Mutex<()>> {
+        self.inner
+            .scope_operations
+            .lock()
+            .expect("scope operations mutex")
+            .entry(scope)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// The ids of live processes in a scope, or `None` if the scope is unknown.
@@ -161,6 +178,11 @@ impl ProcessSupervisor {
         scope: ProcessScopeId,
         spec: ProcessSpec,
     ) -> Result<ProcessId, SpawnError> {
+        let operation = self.scope_operation(scope);
+        let _serial = operation.lock().await;
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return Err(SpawnError::ScopeClosed(scope));
+        }
         {
             let registry = self.lock_registry();
             let s = registry.get(scope).ok_or(SpawnError::UnknownScope(scope))?;
@@ -206,9 +228,9 @@ impl ProcessSupervisor {
             .lock()
             .expect("spawn_times mutex")
             .insert(pid, self.inner.clock.now());
-        self.inner.dispatcher.dispatch(&events).await;
-        // Wait/reap starts here, not in a ReaperHandler (ADR 0008).
+        // Start ownership monitoring before any cancellable dispatch.
         self.start_monitor(scope, pid, spawned);
+        self.inner.dispatcher.dispatch(&events).await;
         Ok(pid)
     }
 
@@ -347,6 +369,8 @@ impl ProcessSupervisor {
         scope: ProcessScopeId,
         opts: TerminateOptions,
     ) -> Result<ScopeTerminationReport, TerminateError> {
+        let operation = self.scope_operation(scope);
+        let _serial = operation.lock().await;
         let (events, live) = {
             let mut registry = self.lock_registry();
             let s = registry
@@ -370,13 +394,17 @@ impl ProcessSupervisor {
                     pid,
                     TerminationOutcome::CleanupUnverified(UnverifiedReason::ProcessDisappeared),
                 )),
-                Err(_) => {}
+                Err(error) => {
+                    return Err(TerminateError::Signal(format!(
+                        "termination worker failed: {error}"
+                    )))
+                }
             }
         }
 
         // Sweep any descendants that outlived their roots: a whole-group kill catches
         // grandchildren the per-root path does not track individually.
-        let _ = self.inner.backend.signal_scope(scope, Signal::Kill).await;
+        self.inner.backend.cleanup_scope(scope).await?;
 
         Ok(ScopeTerminationReport { scope, outcomes })
     }

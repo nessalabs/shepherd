@@ -28,7 +28,7 @@ flowchart TD
         EV[Domain Events]
     end
     subgraph infra["shepherd-infra (adapters / ACL)"]
-        LIN[UnixProcessBackend<br/>tokio::process + nix<br/>cgroup v2 later]
+        LIN[UnixProcessBackend<br/>tokio::process + nix<br/>optional cgroup v2 before exec]
         WIN[WindowsBackend<br/>Job Object + windows-sys]
         MAC[MacBackend<br/>process group + libproc]
         NUL[NullBackend&nbsp;test fake]
@@ -418,3 +418,6 @@ sequenceDiagram
     Note over IT,PUB: bounded, lossy-tolerant; cannot stall Shepherd
     Note over D: handler error -> typed HandlerError + tracing, never swallowed
 ```
+
+Cgroup cleanup: serialize scope operations → root termination/reap → cgroup.kill →
+populated=0 → remove containment directory → return report (ADR 0011).

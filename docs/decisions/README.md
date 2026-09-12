@@ -19,3 +19,6 @@ they do not replace that document.
 | [0008](./0008-monitor-owned-wait.md) | Wait/reap starts at spawn in a monitor task, not a `ReaperHandler` |
 | [0009](./0009-toolchain-and-quality-gates.md) | Edition 2021, MSRV 1.83, TypeScript fitness functions, 100% domain coverage |
 | [0010](./0010-retain-slot-until-wait.md) | Child slot stays until `wait` consumes the exit (late monitor must not `ReapFailed`) |
+
+| [0011](./0011-cgroup-v2-backend.md) | Pre-exec cgroup membership, atomic kill, verified emptiness |
+| [0012](./0012-privileged-cgroup-ci.md) | Hosted privileged cgroup tests fail closed |

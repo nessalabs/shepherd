@@ -59,6 +59,12 @@ pub trait ProcessBackend: Send + Sync {
         signal: Signal,
     ) -> Result<(), TerminateError>;
 
+    /// Sweeps remaining descendants and verifies containment is empty where supported.
+    /// Called only after the application has serialized against new spawns.
+    async fn cleanup_scope(&self, scope: ProcessScopeId) -> Result<(), TerminateError> {
+        self.signal_scope(scope, Signal::Kill).await
+    }
+
     /// Resolves when the process has exited, returning its raw exit. Reaps the child.
     async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError>;
 

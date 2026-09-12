@@ -6,7 +6,7 @@ resource observation — and leaves *policy* to the caller.
 
 > Status: early implementation. The pure domain, application orchestration, a deterministic
 > test backend, and a real Unix (process-group) backend are in place and tested. Linux
-> cgroup v2, macOS, and Windows backends, plus streaming stats and output plumbing, are on
+> cgroup v2 is implemented with privileged tests; macOS statistics and Windows backends, plus streaming stats and output plumbing, remain on
 > the roadmap (see [`docs/DESIGN.md`](docs/DESIGN.md)).
 
 ## The core invariant
@@ -68,10 +68,10 @@ cargo fmt --all --check                                  # format
 
 ## Platform guarantees (current)
 
-| Capability | Linux (process group) | macOS | Windows |
+| Capability | Linux (cgroup v2 when usable; else process group) | macOS | Windows |
 | --- | --- | --- | --- |
 | Root process tracking | yes | yes | (null backend) |
-| Descendant cleanup | best-effort (`killpg`) | best-effort | — |
+| Descendant cleanup | `cgroup.kill` with emptiness verification; fallback best-effort (`killpg`) | best-effort | — |
 | Force termination | yes | yes | — |
 | RSS / peak RSS stats | yes (`/proc`) | — | — |
 
@@ -82,3 +82,7 @@ limitations).
 ## License
 
 Apache-2.0.
+
+Linux selects containment at construction. Use `supervisor.capabilities()` to inspect
+it. Privileged test requirements and commands: [ADR 0012](docs/decisions/0012-privileged-cgroup-ci.md).
+Cgroup containment does not imply cleanup after abrupt supervisor SIGKILL.

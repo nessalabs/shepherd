@@ -34,10 +34,10 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 type ChildKey = (u32, u64);
 
 struct ChildSlot {
-    sender: watch::Sender<Option<RawExit>>,
+    sender: watch::Sender<Option<Result<RawExit, String>>>,
     // Retain a receiver so the waiter task's `send` is never lost if it fires before the
     // supervisor's monitor subscribes.
-    _keep: watch::Receiver<Option<RawExit>>,
+    _keep: watch::Receiver<Option<Result<RawExit, String>>>,
     #[cfg(target_os = "linux")]
     pidfd: Option<OwnedFd>,
 }
@@ -59,6 +59,8 @@ struct State {
 #[derive(Clone, Default)]
 pub struct UnixProcessBackend {
     state: Arc<Mutex<State>>,
+    #[cfg(target_os = "linux")]
+    cgroups: Option<Arc<super::cgroup::Cgroups>>,
 }
 
 impl std::fmt::Debug for UnixProcessBackend {
@@ -72,6 +74,35 @@ impl UnixProcessBackend {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Selects cgroup v2 if a delegated ancestor permits creation and cgroup.kill.
+    /// Otherwise returns an honest process-group backend.
+    #[cfg(target_os = "linux")]
+    pub fn auto() -> Self {
+        super::cgroup::Cgroups::detect()
+            .map(|cgroups| Self {
+                state: Arc::default(),
+                cgroups: Some(Arc::new(cgroups)),
+            })
+            .unwrap_or_else(|_| Self::new())
+    }
+
+    /// Requires a real writable cgroup v2 ancestor; never silently falls back.
+    #[cfg(target_os = "linux")]
+    pub fn with_cgroup_root(root: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        Ok(Self {
+            state: Arc::default(),
+            cgroups: Some(Arc::new(super::cgroup::Cgroups::new(root.as_ref())?)),
+        })
+    }
+
+    fn containment(&self) -> Containment {
+        #[cfg(target_os = "linux")]
+        if self.cgroups.is_some() {
+            return Containment::CgroupV2;
+        }
+        Containment::ProcessGroup
     }
 
     fn scope_lock(&self, scope: ProcessScopeId) -> Arc<tokio::sync::Mutex<()>> {
@@ -115,8 +146,8 @@ impl UnixProcessBackend {
         &self,
         scope: ProcessScopeId,
         os: OsIdentity,
-        sender: watch::Sender<Option<RawExit>>,
-        keep: watch::Receiver<Option<RawExit>>,
+        sender: watch::Sender<Option<Result<RawExit, String>>>,
+        keep: watch::Receiver<Option<Result<RawExit, String>>>,
         new_group: bool,
         #[cfg(target_os = "linux")] pidfd: Option<OwnedFd>,
     ) {
@@ -162,6 +193,7 @@ impl UnixProcessBackend {
         &self,
         spec: &ProcessSpec,
         target_pgid: i32,
+        #[cfg(target_os = "linux")] membership: Option<&std::fs::File>,
     ) -> Result<tokio::process::Child, SpawnError> {
         let mut cmd = tokio::process::Command::new(&spec.program);
         cmd.args(&spec.args)
@@ -175,10 +207,20 @@ impl UnixProcessBackend {
 
         // SAFETY: `setpgid` is async-signal-safe and the closure touches only its captured
         // `target_pgid` copy, so it is sound to run between fork and exec.
+        #[cfg(target_os = "linux")]
+        let membership_fd = membership.map(AsRawFd::as_raw_fd);
         unsafe {
             cmd.pre_exec(move || {
                 if libc::setpgid(0, target_pgid) != 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                #[cfg(target_os = "linux")]
+                if let Some(fd) = membership_fd {
+                    // Writing 0 moves the calling child before exec can fork descendants.
+                    // write is async-signal-safe; the parent retains the opened file.
+                    if libc::write(fd, b"0".as_ptr().cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });
@@ -203,18 +245,41 @@ impl ProcessBackend for UnixProcessBackend {
         let scope_lock = self.scope_lock(scope);
         let _serial = scope_lock.lock().await;
 
+        #[cfg(target_os = "linux")]
+        let membership = self
+            .cgroups
+            .as_ref()
+            .map(|c| c.membership(scope))
+            .transpose()
+            .map_err(|e| SpawnError::Os(e.to_string()))?;
         let existing_pgid = self.joinable_pgid(scope);
-        let (mut child, new_group) =
-            match self.spawn_in_group(spec, existing_pgid.unwrap_or(0)).await {
-                Ok(child) => (child, existing_pgid.is_none()),
-                Err(_err) if existing_pgid.is_some() => {
-                    // The recorded group is gone (last member exited; kernel recycled the pgid).
-                    // Forget it and create a fresh group for this still-open scope.
-                    self.forget_group(scope);
-                    (self.spawn_in_group(spec, 0).await?, true)
-                }
-                Err(err) => return Err(err),
-            };
+        let (mut child, new_group) = match self
+            .spawn_in_group(
+                spec,
+                existing_pgid.unwrap_or(0),
+                #[cfg(target_os = "linux")]
+                membership.as_ref(),
+            )
+            .await
+        {
+            Ok(child) => (child, existing_pgid.is_none()),
+            Err(_err) if existing_pgid.is_some() => {
+                // The recorded group is gone (last member exited; kernel recycled the pgid).
+                // Forget it and create a fresh group for this still-open scope.
+                self.forget_group(scope);
+                (
+                    self.spawn_in_group(
+                        spec,
+                        0,
+                        #[cfg(target_os = "linux")]
+                        membership.as_ref(),
+                    )
+                    .await?,
+                    true,
+                )
+            }
+            Err(err) => return Err(err),
+        };
 
         let pid = child
             .id()
@@ -240,16 +305,12 @@ impl ProcessBackend for UnixProcessBackend {
         tokio::spawn(async move {
             let status = child.wait().await;
             let raw = match status {
-                Ok(status) => RawExit {
+                Ok(status) => Ok(RawExit {
                     code: status.code(),
                     signal: status.signal().map(signal_from_raw),
                     core_dumped: status.core_dumped(),
-                },
-                Err(_) => RawExit {
-                    code: None,
-                    signal: None,
-                    core_dumped: false,
-                },
+                }),
+                Err(error) => Err(error.to_string()),
             };
             let _ = exit_tx.send(Some(raw));
             this.note_os_exit(scope);
@@ -288,6 +349,14 @@ impl ProcessBackend for UnixProcessBackend {
         scope: ProcessScopeId,
         signal: Signal,
     ) -> Result<(), TerminateError> {
+        #[cfg(target_os = "linux")]
+        if let Some(cgroups) = &self.cgroups {
+            if signal == Signal::Kill {
+                return cgroups
+                    .kill(scope)
+                    .map_err(|e| TerminateError::Signal(e.to_string()));
+            }
+        }
         let pgid = self.existing_pgid(scope);
         let Some(pgid) = pgid else {
             return Ok(());
@@ -317,7 +386,7 @@ impl ProcessBackend for UnixProcessBackend {
             }
         };
         let exit = loop {
-            if let Some(exit) = *rx.borrow_and_update() {
+            if let Some(exit) = rx.borrow_and_update().clone() {
                 break exit;
             }
             if rx.changed().await.is_err() {
@@ -329,7 +398,25 @@ impl ProcessBackend for UnixProcessBackend {
             .expect("unix backend mutex")
             .children
             .remove(&key);
-        Ok(exit)
+        exit.map_err(WaitError::Backend)
+    }
+
+    async fn cleanup_scope(&self, scope: ProcessScopeId) -> Result<(), TerminateError> {
+        self.signal_scope(scope, Signal::Kill).await?;
+        #[cfg(target_os = "linux")]
+        if let Some(cgroups) = &self.cgroups {
+            cgroups
+                .finish(scope)
+                .await
+                .map_err(|e| TerminateError::Signal(e.to_string()))?;
+        }
+        self.forget_group(scope);
+        self.state
+            .lock()
+            .expect("unix backend mutex")
+            .scope_locks
+            .remove(&scope);
+        Ok(())
     }
 
     async fn sample(&self, target: &Spawned) -> Result<RawStats, StatsError> {
@@ -343,7 +430,7 @@ impl ProcessBackend for UnixProcessBackend {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            descendant_containment: Containment::ProcessGroup,
+            descendant_containment: self.containment(),
             cpu: Support::Unsupported,
             rss: rss_support(),
             peak_rss: peak_support(),
@@ -353,6 +440,11 @@ impl ProcessBackend for UnixProcessBackend {
     }
 
     fn hard_kill_all(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(cgroups) = &self.cgroups {
+            cgroups.kill_all();
+            return;
+        }
         let groups: Vec<i32> = self
             .state
             .lock()
