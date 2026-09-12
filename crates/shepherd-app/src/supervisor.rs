@@ -1,9 +1,13 @@
 //! The `ProcessSupervisor` application service.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use futures_util::future::{AbortHandle, Abortable};
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::FutureExt;
 
 use shepherd_domain::{
     ProcessExit, ProcessId, ProcessScopeId, ProcessSpec, ProcessStats, Signal, TerminationOutcome,
@@ -302,70 +306,73 @@ impl ProcessSupervisor {
         let weak = Arc::downgrade(&self.inner);
         let interval = self.inner.stats_interval;
         tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut pending = FuturesUnordered::new();
+            let mut active = HashMap::<ProcessId, AbortHandle>::new();
             loop {
-                let Some(inner) = weak.upgrade() else {
-                    break;
-                };
-                let targets = {
-                    let registry = inner.registry.lock().expect("registry mutex");
-                    registry
-                        .scope_ids()
-                        .into_iter()
-                        .flat_map(|id| {
-                            let scope = registry.get(id).expect("scope exists");
-                            scope
-                                .live_process_ids()
-                                .into_iter()
-                                .map(|pid| {
-                                    (
-                                        pid,
-                                        Spawned {
-                                            os: scope
-                                                .get(pid)
-                                                .expect("process exists")
-                                                .os_identity(),
-                                        },
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .collect::<Vec<_>>()
-                };
-                for (pid, target) in targets {
-                    let sample =
-                        tokio::time::timeout(Duration::from_secs(1), inner.backend.sample(&target))
-                            .await
-                            .unwrap_or_else(|_| Err(StatsError::Backend("sampler timeout".into())))
-                            .map(|raw| {
-                                let start = inner
-                                    .spawn_times
-                                    .lock()
-                                    .expect("spawn times mutex")
-                                    .get(&pid)
-                                    .copied();
-                                let uptime = start
-                                    .map(|s| inner.clock.now().saturating_duration_since(s))
-                                    .unwrap_or_default();
-                                ProcessStats::from_raw(pid, raw, uptime)
-                            });
-                    // Keep the same registry -> samples lock order as stats and the monitor.
-                    // A sample finishing after reap must not resurrect a cache entry.
-                    let registry = inner.registry.lock().expect("registry mutex");
-                    let live = registry
-                        .scope_of(pid)
-                        .and_then(|id| registry.get(id))
-                        .and_then(|s| s.get(pid))
-                        .is_some_and(|p| p.state().is_live());
-                    if live {
-                        inner
-                            .samples
-                            .lock()
-                            .expect("samples mutex")
-                            .insert(pid, sample);
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let Some(inner) = weak.upgrade() else { break; };
+                        let targets = {
+                            let registry = inner.registry.lock().expect("registry mutex");
+                            registry.scope_ids().into_iter().flat_map(|id| {
+                                let scope = registry.get(id).expect("scope exists");
+                                scope.live_process_ids().into_iter().map(|pid| {
+                                    (pid, Spawned {
+                                        os: scope.get(pid).expect("process exists").os_identity(),
+                                    })
+                                }).collect::<Vec<_>>()
+                            }).collect::<Vec<_>>()
+                        };
+                        let live: HashSet<_> = targets.iter().map(|(pid, _)| *pid).collect();
+                        for (pid, abort) in &active {
+                            if !live.contains(pid) {
+                                abort.abort();
+                            }
+                        }
+                        for (pid, target) in targets {
+                            // One observation per root, with no queue of missed intervals.
+                            if active.contains_key(&pid) { continue; }
+                            let backend = Arc::clone(&inner.backend);
+                            let (abort, registration) = AbortHandle::new_pair();
+                            active.insert(pid, abort);
+                            pending.push(async move {
+                                let observed = Abortable::new(async {
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(1),
+                                        std::panic::AssertUnwindSafe(backend.sample(&target)).catch_unwind(),
+                                    ).await {
+                                        Ok(Ok(result)) => result,
+                                        Ok(Err(_)) => Err(StatsError::Backend("sampler panicked".into())),
+                                        Err(_) => Err(StatsError::Backend("sampler timeout".into())),
+                                    }
+                                }, registration).await;
+                                (pid, observed)
+                            }.boxed());
+                        }
+                    }
+                    Some((pid, observed)) = pending.next(), if !pending.is_empty() => {
+                        active.remove(&pid);
+                        let Ok(observed) = observed else { continue; };
+                        let Some(inner) = weak.upgrade() else { break; };
+                        let sample = observed.map(|raw| {
+                            let start = inner.spawn_times.lock().expect("spawn times mutex")
+                                .get(&pid).copied();
+                            let uptime = start.map(|s| inner.clock.now().saturating_duration_since(s))
+                                .unwrap_or_default();
+                            ProcessStats::from_raw(pid, raw, uptime)
+                        });
+                        // Recheck under registry -> samples lock order: a result after reap
+                        // must never resurrect a cache entry.
+                        let registry = inner.registry.lock().expect("registry mutex");
+                        let live = registry.scope_of(pid).and_then(|id| registry.get(id))
+                            .and_then(|s| s.get(pid)).is_some_and(|p| p.state().is_live());
+                        if live {
+                            inner.samples.lock().expect("samples mutex").insert(pid, sample);
+                        }
                     }
                 }
-                drop(inner);
-                tokio::time::sleep(interval).await;
             }
         });
     }
