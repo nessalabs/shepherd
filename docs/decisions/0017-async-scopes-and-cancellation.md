@@ -84,3 +84,9 @@ The cleanup worker publishes its result before disarming its synchronous backsto
 A separate JoinHandle observer only translates join failures; runtime shutdown after
 worker completion cannot leave the retained report pending. A cross-runtime test
 verifies completed cleanup remains observable without a join observer.
+
+Verified external scope termination publishes directly to a block's cleanup channel.
+The channel is registered before the scope becomes visible to shutdown; the active
+body and cleanup worker retain it independently of bounded report lookup history.
+A body finishing after that history expires still observes the verified report,
+and its worker preserves that result instead of repeating expired scope lookup.

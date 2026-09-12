@@ -71,6 +71,22 @@ async fn run(iterations: usize) {
             .all_verified());
         assert!(sup.wait(pid).await.unwrap().outcome.is_verified());
         assert!(sup.processes(scope).is_none());
+        // Reap and output EOF are separate observations. Include every reader in
+        // the resource accounting without delaying the root's verified exit.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = output.read();
+                assert!(snapshot.chunks.is_empty() && snapshot.tail.is_empty());
+                assert!(snapshot.errors.is_empty());
+                assert_eq!(snapshot.dropped_bytes, 0);
+                if snapshot.stdout_closed && snapshot.stderr_closed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("output readers did not finish before resource accounting");
         drop(output);
     }
     sup.shutdown().await.unwrap();

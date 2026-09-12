@@ -503,11 +503,13 @@ impl ProcessBackend for UnixProcessBackend {
                 }),
                 Err(error) => Err(error.to_string()),
             };
+            // Root reap is independent of inherited pipe lifetimes. Keep owning the
+            // readers here, but let termination observers see the actual exit now.
+            this.note_os_exit(scope);
+            let _ = exit_tx.send(Some(raw));
             if let Some(output) = output {
                 crate::output::finish_readers(readers, output).await;
             }
-            this.note_os_exit(scope);
-            let _ = exit_tx.send(Some(raw));
         });
 
         Ok(Spawned { os })

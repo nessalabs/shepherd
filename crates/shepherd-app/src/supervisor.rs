@@ -195,14 +195,17 @@ impl ProcessSupervisor {
 
     /// Creates a new, open scope and returns its id.
     pub fn create_scope(&self) -> ProcessScopeId {
-        self.create_scope_before_publish(|| {})
+        self.create_scope_before_publish(|_| {})
     }
 
     // The callback lets the concurrency regression pause at the publication boundary.
-    fn create_scope_before_publish(&self, before_publish: impl FnOnce()) -> ProcessScopeId {
+    fn create_scope_before_publish(
+        &self,
+        before_publish: impl FnOnce(ProcessScopeId),
+    ) -> ProcessScopeId {
         let mut registry = self.lock_registry();
         let scope = registry.create_scope();
-        before_publish();
+        before_publish(scope);
         // Registry -> operation map is the shared lock order. Do not expose the new
         // scope to shutdown before its serialization lock exists.
         self.inner
@@ -378,17 +381,19 @@ impl ProcessSupervisor {
         F: FnOnce(ScopedProcesses) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
-        let scope = self.create_scope();
         let (finish, finished) = tokio::sync::oneshot::channel();
         let guard = ScopeExit {
             finish: Some(finish),
         };
         let (report_tx, mut report_rx) = tokio::sync::watch::channel(None);
-        self.inner
-            .scope_results
-            .lock()
-            .expect("scope results mutex")
-            .insert(scope, report_tx.clone());
+        // Register observation before shutdown can discover this scope.
+        let scope = self.create_scope_before_publish(|scope| {
+            self.inner
+                .scope_results
+                .lock()
+                .expect("scope results mutex")
+                .insert(scope, report_tx.clone());
+        });
         let worker = self.worker();
         let backstop = ScopeCleanupBackstop {
             backend: self.inner.backend.clone(),
@@ -399,7 +404,12 @@ impl ProcessSupervisor {
         let cleanup = tokio::spawn(async move {
             let mut backstop = backstop;
             let _ = finished.await;
-            let result = worker.terminate_scope(scope, opts).await;
+            let retained = backstop.verified_report();
+            let result = match retained {
+                Some(report) => Ok(report),
+                None => worker.terminate_scope(scope, opts).await,
+            };
+            let result = backstop.verified_report().map(Ok).unwrap_or(result);
             if !result.as_ref().is_ok_and(|r| r.all_verified()) {
                 backstop.backend.hard_kill_scope(scope);
             }
@@ -408,9 +418,12 @@ impl ProcessSupervisor {
         });
         tokio::spawn(async move {
             if let Err(error) = cleanup.await {
-                report_tx.send_replace(Some(Err(TerminateError::Signal(format!(
-                    "scope cleanup worker failed: {error}"
-                )))));
+                publish_scope_cleanup_result(
+                    &report_tx,
+                    Err(TerminateError::Signal(format!(
+                        "scope cleanup worker failed: {error}"
+                    ))),
+                );
             }
         });
         let mut processes = Vec::new();
@@ -864,6 +877,15 @@ impl ProcessSupervisor {
         let report = ScopeTerminationReport { scope, outcomes };
         if report.all_verified() {
             // Publish before removing the live entry so repeat callers cannot see a gap.
+            if let Some(sender) = self
+                .inner
+                .scope_results
+                .lock()
+                .expect("scope results mutex")
+                .get(&scope)
+            {
+                sender.send_replace(Some(Ok(report.clone())));
+            }
             self.inner
                 .reports
                 .lock()
@@ -1058,6 +1080,22 @@ impl ProcessSupervisor {
     }
 }
 
+fn publish_scope_cleanup_result(
+    sender: &ScopeCleanupSender,
+    result: Result<ScopeTerminationReport, TerminateError>,
+) {
+    sender.send_if_modified(|current| {
+        if current
+            .as_ref()
+            .is_some_and(|result| result.as_ref().is_ok_and(|report| report.all_verified()))
+        {
+            return false;
+        }
+        *current = Some(result);
+        true
+    });
+}
+
 type ScopeCleanupSender =
     tokio::sync::watch::Sender<Option<Result<ScopeTerminationReport, TerminateError>>>;
 struct ScopeExit {
@@ -1138,19 +1176,30 @@ struct ScopeCleanupBackstop {
     armed: bool,
 }
 impl ScopeCleanupBackstop {
+    fn verified_report(&self) -> Option<ScopeTerminationReport> {
+        self.report
+            .borrow()
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .filter(|report| report.all_verified())
+            .cloned()
+    }
     fn complete(&mut self, result: Result<ScopeTerminationReport, TerminateError>) {
         // No suspension point may separate result publication from disarming.
-        self.report.send_replace(Some(result));
+        publish_scope_cleanup_result(&self.report, result);
         self.armed = false;
     }
 }
 impl Drop for ScopeCleanupBackstop {
     fn drop(&mut self) {
-        if self.armed {
+        if self.armed && self.verified_report().is_none() {
             self.backend.hard_kill_scope(self.scope);
-            self.report.send_replace(Some(Err(TerminateError::Signal(
-                "scope cleanup interrupted or unverified; synchronous backstop issued".into(),
-            ))));
+            publish_scope_cleanup_result(
+                &self.report,
+                Err(TerminateError::Signal(
+                    "scope cleanup interrupted or unverified; synchronous backstop issued".into(),
+                )),
+            );
         }
     }
 }
@@ -1457,6 +1506,93 @@ mod scope_operation_tests {
     }
 
     #[test]
+    fn worker_error_publication_cannot_downgrade_verified_external_cleanup() {
+        let supervisor = supervisor();
+        let scope = supervisor.create_scope();
+        let report = ScopeTerminationReport {
+            scope,
+            outcomes: Vec::new(),
+        };
+        let (sender, receiver) = tokio::sync::watch::channel(Some(Ok(report)));
+        // Both normal cleanup errors and the JoinError observer use this atomic helper.
+        publish_scope_cleanup_result(&sender, Err(TerminateError::UnknownScope(scope)));
+        publish_scope_cleanup_result(
+            &sender,
+            Err(TerminateError::Signal("worker panicked".into())),
+        );
+        assert!(receiver
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .all_verified());
+    }
+
+    #[tokio::test]
+    async fn active_block_retains_external_cleanup_after_report_eviction() {
+        let supervisor = supervisor();
+        let external = supervisor.clone();
+        let result = supervisor
+            .with_scope(Vec::new(), move |scope| async move {
+                let report = external
+                    .terminate_scope(scope.id(), Default::default())
+                    .await
+                    .unwrap();
+                assert!(report.all_verified());
+                for _ in 0..650 {
+                    let old = external.create_scope();
+                    external
+                        .terminate_scope(old, Default::default())
+                        .await
+                        .unwrap();
+                }
+                assert!(!external
+                    .inner
+                    .reports
+                    .lock()
+                    .unwrap()
+                    .contains_key(&scope.id()));
+                // Match F's global history eviction as well: both active participants
+                // must use their own channel, independently of lookup retention.
+                let receiver = external
+                    .inner
+                    .scope_results
+                    .lock()
+                    .unwrap()
+                    .remove(&scope.id())
+                    .unwrap()
+                    .subscribe();
+                (42, receiver)
+            })
+            .await;
+        let (value, receiver) = result.result.unwrap();
+        assert_eq!(value, 42);
+        assert!(result.termination.unwrap().all_verified());
+        // Wait for the worker's history update, proving it also retained success.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !supervisor
+                .inner
+                .completed_scope_results
+                .lock()
+                .unwrap()
+                .contains(&result.scope)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(receiver
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .all_verified());
+    }
+
+    #[test]
     fn completed_cleanup_is_observable_after_runtime_drop_without_join_observer() {
         let supervisor = supervisor();
         let scope = supervisor.create_scope();
@@ -1512,7 +1648,7 @@ mod scope_operation_tests {
         let (inserted, insertion) = std::sync::mpsc::sync_channel(0);
         let (release, released) = std::sync::mpsc::sync_channel(0);
         let creation = std::thread::spawn(move || {
-            creator.create_scope_before_publish(|| {
+            creator.create_scope_before_publish(|_| {
                 inserted.send(()).unwrap();
                 released.recv().unwrap();
             })
