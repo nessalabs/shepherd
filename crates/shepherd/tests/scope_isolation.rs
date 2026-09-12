@@ -35,6 +35,7 @@ struct GatedBackend {
     reaped: Notify,
     global_kills: AtomicUsize,
     fail_cleanup: AtomicBool,
+    panic_cleanup: AtomicBool,
     descendant: Mutex<Option<Spawned>>,
 }
 #[async_trait]
@@ -67,6 +68,10 @@ impl ProcessBackend for GatedBackend {
         self.inner.signal_scope(scope, signal).await
     }
     async fn cleanup_scope(&self, scope: ProcessScopeId) -> Result<(), TerminateError> {
+        assert!(
+            !self.panic_cleanup.swap(false, Ordering::SeqCst),
+            "injected cleanup panic"
+        );
         if self.fail_cleanup.swap(false, Ordering::SeqCst) {
             return Err(TerminateError::Signal("injected cleanup failure".into()));
         }
@@ -256,4 +261,58 @@ async fn verified_scope_report_history_is_bounded_without_losing_pending_or_fail
         observer.await.unwrap().all_verified(),
         "registered receiver lost its completed result"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cleanup_worker_panic_publishes_error_for_returned_and_canceled_blocks() {
+    let backend = Arc::new(GatedBackend::default());
+    let supervisor = SupervisorBuilder::new().backend(backend.clone()).build();
+    backend.panic_cleanup.store(true, Ordering::SeqCst);
+    let returned = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        supervisor.with_scope(vec![], |_| async { 42 }),
+    )
+    .await
+    .expect("cleanup panic left retained report pending forever");
+    assert_eq!(returned.result.unwrap(), 42);
+    assert!(
+        matches!(returned.termination, Err(TerminateError::Signal(message)) if message.contains("scope cleanup worker failed"))
+    );
+    assert!(
+        matches!(supervisor.wait_scope_cleanup(returned.scope).await, Err(TerminateError::Signal(message)) if message.contains("scope cleanup worker failed"))
+    );
+    assert!(supervisor
+        .terminate_scope(returned.scope, Default::default())
+        .await
+        .unwrap()
+        .all_verified());
+
+    backend.panic_cleanup.store(true, Ordering::SeqCst);
+    let owner = supervisor.clone();
+    let (started, scope_id) = tokio::sync::oneshot::channel();
+    let pending = tokio::spawn(async move {
+        owner
+            .with_scope(vec![], |scope| async move {
+                started.send(scope.id()).unwrap();
+                std::future::pending::<()>().await;
+            })
+            .await
+    });
+    let scope = scope_id.await.unwrap();
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        supervisor.wait_scope_cleanup(scope),
+    )
+    .await
+    .expect("canceled block cleanup panic left report pending forever");
+    assert!(
+        matches!(report, Err(TerminateError::Signal(message)) if message.contains("scope cleanup worker failed"))
+    );
+    assert!(supervisor
+        .terminate_scope(scope, Default::default())
+        .await
+        .unwrap()
+        .all_verified());
 }

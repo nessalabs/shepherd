@@ -193,7 +193,13 @@ impl ProcessSupervisor {
 
     /// Creates a new, open scope and returns its id.
     pub fn create_scope(&self) -> ProcessScopeId {
-        self.lock_registry().create_scope()
+        let scope = self.lock_registry().create_scope();
+        self.inner
+            .scope_operations
+            .lock()
+            .expect("scope operations mutex")
+            .insert(scope, Arc::new(tokio::sync::Mutex::new(())));
+        scope
     }
 
     /// Runtime capabilities of the selected backend.
@@ -201,14 +207,13 @@ impl ProcessSupervisor {
         self.inner.backend.capabilities()
     }
 
-    fn scope_operation(&self, scope: ProcessScopeId) -> Arc<tokio::sync::Mutex<()>> {
+    fn scope_operation(&self, scope: ProcessScopeId) -> Option<Arc<tokio::sync::Mutex<()>>> {
         self.inner
             .scope_operations
             .lock()
             .expect("scope operations mutex")
-            .entry(scope)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+            .get(&scope)
+            .cloned()
     }
 
     /// The ids of live processes in a scope, or `None` if the scope is unknown.
@@ -241,7 +246,19 @@ impl ProcessSupervisor {
         scope: ProcessScopeId,
         spec: ProcessSpec,
     ) -> Result<ProcessId, SpawnError> {
-        let operation = self.scope_operation(scope);
+        let operation = self.scope_operation(scope).ok_or_else(|| {
+            if self
+                .inner
+                .reports
+                .lock()
+                .expect("reports mutex")
+                .contains_key(&scope)
+            {
+                SpawnError::ScopeClosed(scope)
+            } else {
+                SpawnError::UnknownScope(scope)
+            }
+        })?;
         let _serial = operation.lock().await;
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return Err(SpawnError::ScopeClosed(scope));
@@ -360,24 +377,30 @@ impl ProcessSupervisor {
             .expect("scope results mutex")
             .insert(scope, report_tx.clone());
         let worker = self.worker();
-        tokio::spawn(async move {
+        let cleanup = tokio::spawn(async move {
             let _ = finished.await;
-            let result = worker.terminate_scope(scope, opts).await;
+            worker.terminate_scope(scope, opts).await
+        });
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let result = cleanup.await.unwrap_or_else(|error| {
+                Err(TerminateError::Signal(format!(
+                    "scope cleanup worker failed: {error}"
+                )))
+            });
             let verified = result.as_ref().is_ok_and(|report| report.all_verified());
             report_tx.send_replace(Some(result));
             if verified {
                 // Evict only completed, verified reports. Existing watch receivers
                 // retain their published result independently of this lookup history.
-                let mut completed = worker
-                    .inner
+                let mut completed = inner
                     .completed_scope_results
                     .lock()
                     .expect("completed scope results mutex");
                 completed.push_back(scope);
                 while completed.len() > 256 {
                     let old = completed.pop_front().expect("completed scope result");
-                    worker
-                        .inner
+                    inner
                         .scope_results
                         .lock()
                         .expect("scope results mutex")
@@ -658,7 +681,30 @@ impl ProcessSupervisor {
         scope: ProcessScopeId,
         opts: TerminateOptions,
     ) -> Result<ScopeTerminationReport, TerminateError> {
-        let operation = self.scope_operation(scope);
+        if let Some(report) = self
+            .inner
+            .reports
+            .lock()
+            .expect("reports mutex")
+            .get(&scope)
+            .cloned()
+        {
+            return Ok(report);
+        }
+        let operation = match self.scope_operation(scope) {
+            Some(operation) => operation,
+            None => {
+                // Cleanup may have published and removed its lock since the first read.
+                return self
+                    .inner
+                    .reports
+                    .lock()
+                    .expect("reports mutex")
+                    .get(&scope)
+                    .cloned()
+                    .ok_or(TerminateError::UnknownScope(scope));
+            }
+        };
         let _serial = operation.lock().await;
         if let Some(report) = self
             .inner
@@ -713,6 +759,11 @@ impl ProcessSupervisor {
                 .expect("reports mutex")
                 .insert(scope, report.clone());
             self.lock_registry().remove(scope);
+            self.inner
+                .scope_operations
+                .lock()
+                .expect("scope operations mutex")
+                .remove(&scope);
             let mut completed = self
                 .inner
                 .completed_scopes
@@ -911,5 +962,121 @@ impl ScopedProcesses {
             return None;
         }
         self.supervisor.take_output(pid)
+    }
+}
+
+#[cfg(test)]
+mod scope_operation_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::future::Future;
+    use std::task::Context;
+
+    // Empty-scope cleanup must never invoke a root process operation.
+    struct EmptyPorts;
+    #[async_trait]
+    impl ProcessBackend for EmptyPorts {
+        async fn spawn(&self, _: ProcessScopeId, _: &ProcessSpec) -> Result<Spawned, SpawnError> {
+            panic!("closed or unknown scopes must not reach backend spawn")
+        }
+        async fn signal(&self, _: &Spawned, _: Signal) -> Result<(), TerminateError> {
+            unreachable!()
+        }
+        async fn signal_scope(&self, _: ProcessScopeId, _: Signal) -> Result<(), TerminateError> {
+            Ok(())
+        }
+        async fn wait(&self, _: &Spawned) -> Result<shepherd_domain::RawExit, WaitError> {
+            unreachable!()
+        }
+        async fn sample(&self, _: &Spawned) -> Result<shepherd_domain::RawStats, StatsError> {
+            unreachable!()
+        }
+        fn capabilities(&self) -> shepherd_domain::Capabilities {
+            unreachable!()
+        }
+        fn hard_kill_all(&self) {}
+    }
+    #[async_trait]
+    impl Clock for EmptyPorts {
+        fn now(&self) -> Instant {
+            unreachable!()
+        }
+        async fn sleep(&self, _: Duration) {
+            unreachable!()
+        }
+    }
+    impl Waiters for EmptyPorts {
+        fn signal_exit(&self, _: ProcessId, _: ProcessExit) {
+            unreachable!()
+        }
+        fn try_get(&self, _: ProcessId) -> Option<ProcessExit> {
+            unreachable!()
+        }
+        fn wait(&self, _: ProcessId) -> crate::ports::WaitFuture {
+            unreachable!()
+        }
+    }
+    #[async_trait]
+    impl IntegrationEventPublisher for EmptyPorts {
+        async fn publish(&self, _: shepherd_domain::IntegrationEvent) {}
+    }
+    fn supervisor() -> ProcessSupervisor {
+        let ports = Arc::new(EmptyPorts);
+        ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports)
+    }
+
+    #[tokio::test]
+    async fn completed_scopes_and_unknown_lookups_do_not_retain_operation_locks() {
+        let supervisor = supervisor();
+        let mut last = None;
+        for _ in 0..600 {
+            let scope = supervisor.create_scope();
+            assert_eq!(supervisor.inner.scope_operations.lock().unwrap().len(), 1);
+            assert!(supervisor
+                .terminate_scope(scope, TerminateOptions::default())
+                .await
+                .unwrap()
+                .all_verified());
+            assert!(supervisor.inner.scope_operations.lock().unwrap().is_empty());
+            last = Some(scope);
+        }
+        let scope = last.unwrap();
+        assert!(supervisor
+            .terminate_scope(scope, TerminateOptions::default())
+            .await
+            .unwrap()
+            .all_verified());
+        assert!(
+            matches!(supervisor.spawn(scope, ProcessSpec::new("unused")).await, Err(SpawnError::ScopeClosed(id)) if id == scope)
+        );
+        for id in 1000..1600 {
+            let unknown = ProcessScopeId::new(id);
+            assert!(
+                matches!(supervisor.spawn(unknown, ProcessSpec::new("unused")).await, Err(SpawnError::UnknownScope(id)) if id == unknown)
+            );
+            assert!(
+                matches!(supervisor.terminate_scope(unknown, TerminateOptions::default()).await, Err(TerminateError::UnknownScope(id)) if id == unknown)
+            );
+        }
+        assert!(supervisor.inner.scope_operations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_queued_behind_cleanup_reports_scope_closed_without_recreating_lock() {
+        let supervisor = supervisor();
+        let scope = supervisor.create_scope();
+        let operation = supervisor.scope_operation(scope).unwrap();
+        let held = operation.lock().await;
+        let mut cleanup =
+            std::pin::pin!(supervisor.terminate_scope(scope, TerminateOptions::default()));
+        let mut spawn = std::pin::pin!(supervisor.spawn_owned(scope, ProcessSpec::new("unused")));
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(cleanup.as_mut().poll(&mut cx).is_pending());
+        assert!(spawn.as_mut().poll(&mut cx).is_pending());
+        drop(held);
+        assert!(cleanup.await.unwrap().all_verified());
+        assert!(supervisor.scope_operation(scope).is_none());
+        assert!(matches!(spawn.await, Err(SpawnError::ScopeClosed(id)) if id == scope));
+        assert!(supervisor.scope_operation(scope).is_none());
     }
 }
