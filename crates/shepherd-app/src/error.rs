@@ -2,6 +2,14 @@
 
 use shepherd_domain::{DomainError, ProcessId, ProcessScopeId};
 
+/// Error admitting a new process scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ScopeCreationError {
+    /// Shutdown has started, so no new scopes can be admitted.
+    #[error("supervisor is no longer accepting scopes")]
+    SupervisorClosed,
+}
+
 /// Error creating a process.
 #[derive(Debug, thiserror::Error)]
 pub enum SpawnError {

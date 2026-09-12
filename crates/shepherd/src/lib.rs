@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 pub use shepherd_app::ports::{IntegrationEventPublisher, ProcessBackend, Spawned};
 pub use shepherd_app::{
-    HandlerError, ProcessSupervisor, ScopeTerminationReport, ShutdownError, ShutdownReport,
-    SpawnError, StatsError, TerminateError, TerminateOptions, WaitError,
+    HandlerError, ProcessSupervisor, ScopeCreationError, ScopeTerminationReport, ShutdownError,
+    ShutdownReport, SpawnError, StatsError, TerminateError, TerminateOptions, WaitError,
 };
 pub use shepherd_domain::{
     Capabilities, Containment, DomainEvent, EnvPolicy, GracePeriod, IntegrationEvent, ProcessExit,
@@ -95,7 +95,12 @@ impl SupervisorBuilder {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn default_backend() -> Arc<dyn ProcessBackend> {
+    Arc::new(UnixProcessBackend::auto())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn default_backend() -> Arc<dyn ProcessBackend> {
     // Process-group Unix adapter; process-wrap / cgroups-rs are deferred (ADR 0006).
     Arc::new(UnixProcessBackend::new())

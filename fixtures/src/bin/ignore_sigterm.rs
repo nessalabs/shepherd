@@ -9,6 +9,9 @@ fn main() {
     unsafe {
         libc::signal(libc::SIGTERM, libc::SIG_IGN);
     }
+    if let Some(ready) = std::env::args_os().nth(1) {
+        std::fs::write(ready, std::process::id().to_string()).unwrap();
+    }
     loop {
         std::thread::sleep(Duration::from_millis(200));
     }

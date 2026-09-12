@@ -7,3 +7,6 @@ pub use null::NullBackend;
 mod unix;
 #[cfg(unix)]
 pub use unix::UnixProcessBackend;
+
+#[cfg(target_os = "linux")]
+mod cgroup;

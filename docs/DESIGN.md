@@ -489,7 +489,7 @@ Status legend: ✅ done · 🚧 partial · ⬜ planned.
    (domain at 100% line/function coverage, enforced by the `domain-coverage` CI job).
 3. 🚧 **Unix / Linux backend** — real process-group backend (spawn, signal, wait/reap,
    `/proc` stats) with isolation/termination/descendant tests. cgroup v2 (`cgroup.kill`,
-   detached-child containment) is ⬜ still to come.
+   detached-child containment) is implemented ([0011](./decisions/0011-cgroup-v2-backend.md)); privileged runtime validation remains required.
 4. ⬜ **Stats sampler** — shared interval-poll sampler + CPU stats + resource fixtures/tests.
 5. ⬜ **Output plumbing** — bounded byte queue + tail capture + output-stress tests.
 6. ⬜ **macOS + Windows backends** — validated via CI.
@@ -501,8 +501,7 @@ Platform backend implementation may be delegated to subagents to keep the main c
 
 ## 16. Open decisions to confirm
 
-- Availability of a **privileged/self-hosted Linux runner** for `privileged-cgroup` (else
-containerize on hosted runners).
+- No runner decision remains open: hosted sudo tests fail closed ([0012](./decisions/0012-privileged-cgroup-ci.md)).
 
 Closed in this implementation (see `docs/decisions/`):
 
@@ -530,3 +529,7 @@ CI jobs added · guarantees proven locally vs only via CI · known OS limitation
 leak inspection after integration tests · public-API cancellation-safety & ownership review.
 Any guarantee an OS cannot provide is exposed through capabilities/types/errors rather than
 faked.
+Phase A implementation note: Linux defaults to cgroup v2 only after a real filesystem
+and kill-interface probe; otherwise ProcessGroup. Kernel versions without cgroup.kill
+use the fallback. A cgroup does not kill its members merely because its creator dies.
+The table above remains the target until the later platform/stats phases land.
