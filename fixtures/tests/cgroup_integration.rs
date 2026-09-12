@@ -120,3 +120,61 @@ fn ordinary_directory_never_claims_cgroup_capability() {
         Containment::ProcessGroup
     );
 }
+
+#[tokio::test]
+#[ignore = "requires delegated cgroup v2; privileged CI runs --ignored and fails closed"]
+async fn nested_cgroups_are_removed_after_kill_and_reap() {
+    use shepherd::{ProcessBackend, ProcessScopeId, Signal};
+    let delegated = std::path::PathBuf::from(
+        std::env::var_os("SHEPHERD_CGROUP_ROOT")
+            .expect("set a writable delegated cgroup v2 ancestor"),
+    );
+    let ancestor = delegated.join(format!("nested-test-{}", std::process::id()));
+    std::fs::create_dir(&ancestor).unwrap();
+    let backend = UnixProcessBackend::with_cgroup_root(&ancestor).unwrap();
+    let root = std::fs::read_dir(&ancestor)
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_type().unwrap().is_dir())
+        .unwrap()
+        .path();
+    let scope = ProcessScopeId::new(1);
+    let child = backend
+        .spawn(
+            scope,
+            &ProcessSpec::new(env!("CARGO_BIN_EXE_sleep_forever")),
+        )
+        .await
+        .unwrap();
+    let scope_path = root.join(format!("scope-{scope}"));
+    let nested = scope_path.join("nested");
+    let leaf = nested.join("leaf");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::create_dir(&leaf).unwrap();
+    std::fs::create_dir(scope_path.join("empty-sibling")).unwrap();
+    std::fs::write(leaf.join("cgroup.procs"), child.os.pid.to_string()).unwrap();
+    assert!(std::fs::read_to_string(scope_path.join("cgroup.events"))
+        .unwrap()
+        .lines()
+        .any(|line| line == "populated 1"));
+
+    backend.cleanup_scope(scope).await.unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(5), backend.wait(&child))
+        .await
+        .expect("nested member was not reaped")
+        .unwrap();
+    assert_eq!(exit.signal, Some(Signal::Kill));
+    assert!(!scope_path.exists(), "nested cgroups leaked after cleanup");
+    // Cleanup remains idempotent after the complete tree has been removed.
+    backend.cleanup_scope(scope).await.unwrap();
+    drop(backend);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while root.exists() {
+            // The OS waiter may still be releasing its backend clone after publication.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("supervisor cgroup leaked after cleanup");
+    std::fs::remove_dir(ancestor).unwrap();
+}

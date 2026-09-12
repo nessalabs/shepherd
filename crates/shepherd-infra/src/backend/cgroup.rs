@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -11,6 +13,24 @@ use std::time::Duration;
 use shepherd_domain::ProcessScopeId;
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
+
+// Walk through pinned directory descriptors. O_NOFOLLOW rejects replacement symlinks;
+// control files are left to cgroupfs, which removes them with their directory.
+fn remove_empty_tree(path: &Path) -> io::Result<()> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    let anchored = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    for entry in fs::read_dir(anchored)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_empty_tree(&entry.path())?;
+        }
+    }
+    fs::remove_dir(path)
+}
+
 struct Group {
     path: PathBuf,
     kill: File,
@@ -61,7 +81,6 @@ impl Cgroups {
     pub fn new(ancestor: &Path) -> io::Result<Self> {
         let probe = File::open(ancestor)?;
         let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        use std::os::fd::AsRawFd;
         // SAFETY: valid open descriptor and correctly sized output buffer.
         if unsafe { libc::fstatfs(probe.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
@@ -121,7 +140,7 @@ impl Cgroups {
                 };
                 let events = fs::read_to_string(group.path.join("cgroup.events"))?;
                 if events.lines().any(|l| l == "populated 0") {
-                    fs::remove_dir(&group.path)?;
+                    remove_empty_tree(&group.path)?;
                     groups.remove(&scope);
                     return Ok(());
                 }
@@ -139,5 +158,33 @@ impl Drop for Cgroups {
         self.kill_all();
         self.groups.get_mut().expect("cgroup mutex").clear();
         let _ = fs::remove_dir(&self.root);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_removal_never_follows_a_symlink() {
+        let parent = std::env::temp_dir().join(format!(
+            "shepherd-cgroup-tree-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let scope = parent.join("scope");
+        let outside = parent.join("outside");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&scope).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let link = scope.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(remove_empty_tree(&link).is_err());
+        assert!(remove_empty_tree(&scope).is_err());
+        assert!(outside.is_dir(), "followed a symlink outside the scope");
+        fs::remove_file(link).unwrap();
+        remove_empty_tree(&scope).unwrap();
+        fs::remove_dir(outside).unwrap();
+        fs::remove_dir(parent).unwrap();
     }
 }
