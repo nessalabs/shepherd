@@ -121,6 +121,20 @@ struct Inner {
     shutdown_serial: tokio::sync::Mutex<()>,
 }
 
+// Claims and completion share this lock order; only retained captures consume history.
+fn retain_completed_output(inner: &Inner, pid: ProcessId) {
+    let mut completed = inner.completed.lock().expect("completed mutex");
+    let mut outputs = inner.outputs.lock().expect("outputs mutex");
+    if outputs.contains_key(&pid) && !completed.contains(&pid) {
+        completed.push_back(pid);
+        while completed.len() > 256 {
+            if let Some(old) = completed.pop_front() {
+                outputs.remove(&old);
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for ProcessSupervisor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProcessSupervisor")
@@ -687,11 +701,16 @@ impl ProcessSupervisor {
     ) -> Result<ProcessExit, TerminateError> {
         // Idempotency: if the process already reached a terminal state (and was possibly
         // pruned from the registry), the recorded exit lives in the waiters.
-        if let Some(exit) = self.inner.waiters.try_get(pid) {
+        if let Some(exit) = self
+            .inner
+            .waiters
+            .try_get(pid)
+            .filter(|exit| exit.outcome.is_verified())
+        {
             return Ok(exit);
         }
 
-        let (scope, spawned, graceful, request_events, mut exit_future) = {
+        let (scope, spawned, graceful, request_events, quarantined, mut exit_future) = {
             let mut registry = self.lock_registry();
             let Some(scope) = registry.scope_of(pid) else {
                 return self
@@ -703,8 +722,11 @@ impl ProcessSupervisor {
             let s = registry.get_mut(scope).expect("scope exists");
             let process = s.get(pid).ok_or(TerminateError::UnknownProcess(pid))?;
             if let Some(exit) = process.exit() {
-                return Ok(exit);
+                if exit.outcome.is_verified() {
+                    return Ok(exit);
+                }
             }
+            let quarantined = process.exit().is_some();
             let spawned = Spawned {
                 os: process.os_identity(),
             };
@@ -715,13 +737,24 @@ impl ProcessSupervisor {
                 spawned,
                 graceful,
                 events,
+                quarantined,
                 self.inner.waiters.wait(pid),
             )
         };
+        if quarantined {
+            return self
+                .retry_quarantined(scope, pid, spawned, graceful, opts)
+                .await;
+        }
         self.inner.dispatcher.dispatch(&request_events).await;
 
         if let Some(exit) = self.inner.waiters.try_get(pid) {
-            return Ok(exit);
+            if exit.outcome.is_verified() {
+                return Ok(exit);
+            }
+            return self
+                .retry_quarantined(scope, pid, spawned, graceful, opts)
+                .await;
         }
 
         // Graceful phase.
@@ -755,6 +788,122 @@ impl ProcessSupervisor {
             },
             None => exit_future.await,
         };
+        Ok(exit)
+    }
+
+    // A failed monitor has no future verified waiter notification to await. Retry
+    // through the retained backend identity, with at most two fresh wait attempts.
+    async fn retry_quarantined(
+        &self,
+        scope: ProcessScopeId,
+        pid: ProcessId,
+        spawned: Spawned,
+        graceful: Signal,
+        opts: TerminateOptions,
+    ) -> Result<ProcessExit, TerminateError> {
+        let _ = self.inner.backend.signal(&spawned, graceful).await;
+        let observe = || {
+            std::panic::AssertUnwindSafe(self.inner.backend.wait(&spawned))
+                .catch_unwind()
+                .map(|result| {
+                    result
+                        .unwrap_or_else(|_| Err(WaitError::Backend("retry waiter panicked".into())))
+                })
+                .boxed()
+        };
+        let mut observation = observe();
+        let grace = self.inner.clock.sleep(opts.grace.as_duration());
+        tokio::pin!(grace);
+        let observed = tokio::select! {
+            result = &mut observation => Some(result),
+            () = &mut grace => None,
+        };
+        if let Some(Ok(raw)) = observed {
+            return self.record_recovered_exit(scope, pid, raw).await;
+        }
+        if observed.is_some() {
+            // An immediate wait error is not completion and must not skip force.
+            grace.await;
+        }
+        let _ = self.inner.backend.signal(&spawned, Signal::Kill).await;
+        if observed.is_some() {
+            observation = observe();
+        }
+        let result = match opts.force_timeout {
+            Some(timeout) => tokio::select! {
+                result = observation => Some(result),
+                () = self.inner.clock.sleep(timeout) => None,
+            },
+            None => Some(observation.await),
+        };
+        match result {
+            Some(Ok(raw)) => self.record_recovered_exit(scope, pid, raw).await,
+            other => Ok(ProcessExit {
+                pid,
+                code: None,
+                signal: None,
+                forced: true,
+                outcome: TerminationOutcome::CleanupUnverified(match other {
+                    Some(Err(_)) => UnverifiedReason::ReapFailed,
+                    None => UnverifiedReason::WaitTimedOut {
+                        waited: opts.force_timeout.expect("bounded wait"),
+                    },
+                    Some(Ok(_)) => unreachable!(),
+                }),
+            }),
+        }
+    }
+
+    async fn record_recovered_exit(
+        &self,
+        scope: ProcessScopeId,
+        pid: ProcessId,
+        raw: shepherd_domain::RawExit,
+    ) -> Result<ProcessExit, TerminateError> {
+        let killed = raw.signal == Some(Signal::Kill);
+        let mut exit = ProcessExit {
+            pid,
+            code: raw.code,
+            signal: raw.signal,
+            forced: killed,
+            outcome: if killed {
+                TerminationOutcome::ForcedRequired
+            } else {
+                TerminationOutcome::GracefulSuccess
+            },
+        };
+        let events = {
+            let mut registry = self.lock_registry();
+            let mut events = Vec::new();
+            if let Some(s) = registry.get_mut(scope) {
+                if let Some(previous) = s
+                    .get(pid)
+                    .and_then(|process| process.exit())
+                    .filter(|exit| exit.outcome.is_verified())
+                {
+                    exit = previous;
+                } else if s.get(pid).is_some() {
+                    events = s.record_reaped(pid, exit)?;
+                    if !s.is_open() {
+                        self.inner
+                            .pending_outcomes
+                            .lock()
+                            .expect("pending outcomes mutex")
+                            .entry(scope)
+                            .or_default()
+                            .insert(pid, exit.outcome);
+                    }
+                }
+            }
+            retain_completed_output(&self.inner, pid);
+            // Publish the correction before cancellation can interrupt dispatch/prune.
+            // The Waiters contract prevents a delayed old failure from downgrading it.
+            self.inner.waiters.signal_exit(pid, exit);
+            events
+                .retain(|event| !matches!(event, shepherd_domain::DomainEvent::ScopeClosed { .. }));
+            events
+        };
+        self.inner.dispatcher.dispatch(&events).await;
         Ok(exit)
     }
 
@@ -865,9 +1014,17 @@ impl ProcessSupervisor {
         for (pid, observer) in live {
             let this = self.worker();
             set.spawn(async move {
+                let termination = this.terminate(pid, opts);
+                tokio::pin!(termination);
                 let result = tokio::select! { biased;
-                    exit = observer => Ok(exit),
-                    result = this.terminate(pid, opts) => result,
+                    exit = observer => {
+                        if exit.outcome.is_verified() {
+                            Ok(exit)
+                        } else {
+                            termination.await
+                        }
+                    },
+                    result = &mut termination => result,
                 };
                 (pid, result)
             });
@@ -1174,17 +1331,7 @@ impl ProcessSupervisor {
             // A failed reap may leave a live producer behind this observer. Only
             // verified completions are eligible for bounded post-mortem eviction.
             if verified_reap {
-                let mut completed = inner.completed.lock().expect("completed mutex");
-                let mut outputs = inner.outputs.lock().expect("outputs mutex");
-                // Discarded or already claimed output consumes no observer history.
-                if outputs.contains_key(&pid) {
-                    completed.push_back(pid);
-                    while completed.len() > 256 {
-                        if let Some(old) = completed.pop_front() {
-                            outputs.remove(&old);
-                        }
-                    }
-                }
+                retain_completed_output(&inner, pid);
             }
             inner.dispatcher.dispatch(&events).await;
             inner
@@ -1510,6 +1657,110 @@ mod scoped_history_tests {
     impl IntegrationEventPublisher for HistoryPorts {
         async fn publish(&self, _: shepherd_domain::IntegrationEvent) {}
     }
+    #[derive(Default)]
+    struct RecoveringBackend {
+        panic_attempts: u32,
+        waits: AtomicU32,
+        signals: Mutex<Vec<Signal>>,
+        released: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl ProcessBackend for RecoveringBackend {
+        async fn spawn(&self, _: ProcessScopeId, _: &ProcessSpec) -> Result<Spawned, SpawnError> {
+            Ok(Spawned {
+                os: shepherd_domain::OsIdentity::new(
+                    42,
+                    shepherd_domain::ReuseToken::StartTime(42),
+                ),
+            })
+        }
+        async fn signal(&self, _: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+            self.signals.lock().unwrap().push(signal);
+            self.released.notify_one();
+            Ok(())
+        }
+        async fn signal_scope(&self, _: ProcessScopeId, _: Signal) -> Result<(), TerminateError> {
+            Ok(())
+        }
+        async fn wait(&self, _: &Spawned) -> Result<shepherd_domain::RawExit, WaitError> {
+            if self.waits.fetch_add(1, Ordering::SeqCst) < self.panic_attempts {
+                panic!("injected backend wait panic");
+            }
+            self.released.notified().await;
+            Ok(shepherd_domain::RawExit {
+                code: None,
+                signal: Some(Signal::Term),
+                core_dumped: false,
+            })
+        }
+        async fn sample(&self, _: &Spawned) -> Result<shepherd_domain::RawStats, StatsError> {
+            Err(StatsError::Backend("unused".into()))
+        }
+        fn capabilities(&self) -> shepherd_domain::Capabilities {
+            unreachable!()
+        }
+        fn hard_kill_all(&self) {}
+        fn hard_kill_scope(&self, _: ProcessScopeId) {}
+    }
+
+    async fn run_scope_retry(panic_attempts: u32) {
+        let backend = Arc::new(RecoveringBackend {
+            panic_attempts,
+            ..Default::default()
+        });
+        let ports = Arc::new(HistoryPorts::default());
+        let supervisor =
+            ProcessSupervisor::new(backend.clone(), ports.clone(), ports.clone(), ports);
+        let scope = supervisor.create_scope();
+        let pid = supervisor
+            .spawn(scope, ProcessSpec::new("recovering"))
+            .await
+            .unwrap();
+        let initial = supervisor.wait(pid).await.unwrap();
+        assert_eq!(
+            initial.outcome,
+            TerminationOutcome::CleanupUnverified(UnverifiedReason::ReapFailed)
+        );
+        let report = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervisor.terminate_scope(
+                scope,
+                TerminateOptions {
+                    grace: shepherd_domain::GracePeriod::new(Duration::from_millis(1)),
+                    force_timeout: Some(Duration::from_millis(100)),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.all_verified(), panic_attempts < 3);
+        assert!(backend.waits.load(Ordering::SeqCst) >= 2);
+        let signals = backend.signals.lock().unwrap().clone();
+        assert_eq!(signals.first(), Some(&Signal::Term));
+        if panic_attempts > 1 {
+            assert!(
+                signals.contains(&Signal::Kill),
+                "panic skipped forced attempt"
+            );
+        }
+        assert_eq!(
+            supervisor.wait(pid).await.unwrap().outcome.is_verified(),
+            panic_attempts < 3
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_retry_does_not_short_circuit_on_cached_failed_reap() {
+        run_scope_retry(1).await;
+    }
+
+    #[tokio::test]
+    async fn scope_retry_catches_panics_in_both_fresh_wait_attempts() {
+        run_scope_retry(2).await;
+        run_scope_retry(3).await;
+    }
+
     struct EmptyOutput;
     impl crate::output::OutputSink for EmptyOutput {
         fn push(&self, _: crate::output::OutputStream, _: &[u8]) {}

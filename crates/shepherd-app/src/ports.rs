@@ -102,6 +102,8 @@ pub trait Clock: Send + Sync {
 /// Lets `wait(pid)` callers block until a process reaches its reaped terminal state.
 pub trait Waiters: Send + Sync {
     /// Records the terminal exit for `pid` and wakes any waiters.
+    /// Accept verified corrections to unverified observations atomically; once verified,
+    /// retain that result if an older unverified notification arrives out of order.
     fn signal_exit(&self, pid: ProcessId, exit: ProcessExit);
     /// Returns the recorded exit if the process has already been reaped.
     fn try_get(&self, pid: ProcessId) -> Option<ProcessExit>;

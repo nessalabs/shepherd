@@ -48,11 +48,14 @@ impl Waiters for InMemoryWaiters {
             .entry(pid)
             .or_insert_with(|| watch::channel(None).0)
             .clone();
-        if sender.borrow().is_some() {
+        let previous = *sender.borrow();
+        if previous.is_some_and(|exit| exit.outcome.is_verified()) {
             return;
         }
         sender.send_replace(Some(exit));
-        slots.completed.push_back(pid);
+        if previous.is_none() {
+            slots.completed.push_back(pid);
+        }
         while slots.completed.len() > 256 {
             if let Some(old) = slots.completed.pop_front() {
                 slots.senders.remove(&old);
@@ -92,6 +95,30 @@ mod tests {
     use super::*;
     use shepherd_domain::TerminationOutcome;
     #[tokio::test]
+    async fn verified_correction_survives_delayed_unverified_publication() {
+        let waiters = InMemoryWaiters::new();
+        let pid = ProcessId::new(1);
+        let mut exit = ProcessExit {
+            pid,
+            code: None,
+            signal: None,
+            outcome: shepherd_domain::TerminationOutcome::CleanupUnverified(
+                shepherd_domain::UnverifiedReason::ReapFailed,
+            ),
+            forced: false,
+        };
+        waiters.signal_exit(pid, exit);
+        let failed = exit;
+        exit.outcome = TerminationOutcome::GracefulSuccess;
+        exit.code = Some(0);
+        waiters.signal_exit(pid, exit);
+        waiters.signal_exit(pid, failed);
+        assert_eq!(waiters.try_get(pid), Some(exit));
+        assert_eq!(waiters.wait(pid).await, exit);
+        assert_eq!(waiters.slots.lock().unwrap().completed.iter().filter(|id| **id == pid).count(), 1);
+    }
+
+    #[tokio::test]
     async fn exit_before_first_subscriber_is_retained() {
         let waiters = InMemoryWaiters::new();
         let pid = ProcessId::new(1);
@@ -105,6 +132,7 @@ mod tests {
         waiters.signal_exit(pid, exit);
         assert_eq!(waiters.try_get(pid), Some(exit));
         assert_eq!(waiters.wait(pid).await, exit);
+        assert_eq!(waiters.slots.lock().unwrap().completed.iter().filter(|id| **id == pid).count(), 1);
     }
 }
 

@@ -132,9 +132,14 @@ async fn shutdown_is_idempotent() {
     sup.shutdown().await.unwrap();
 }
 
-/// Backend whose `wait` always fails, to prove we never manufacture a verified exit.
+/// Backend whose monitor fails, with explicit controls for a later retry.
+#[derive(Default)]
 struct WaitFailsBackend {
     inner: NullBackend,
+    recover: std::sync::atomic::AtomicBool,
+    hang: std::sync::atomic::AtomicBool,
+    recover_on_kill: std::sync::atomic::AtomicBool,
+    signals: std::sync::Mutex<Vec<Signal>>,
 }
 
 #[async_trait]
@@ -148,6 +153,15 @@ impl ProcessBackend for WaitFailsBackend {
     }
 
     async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+        self.signals.lock().unwrap().push(signal);
+        if signal == Signal::Kill
+            && self
+                .recover_on_kill
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.recover
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         self.inner.signal(target, signal).await
     }
 
@@ -159,7 +173,14 @@ impl ProcessBackend for WaitFailsBackend {
         self.inner.signal_scope(scope, signal).await
     }
 
-    async fn wait(&self, _target: &Spawned) -> Result<RawExit, WaitError> {
+    async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
+        use std::sync::atomic::Ordering;
+        if self.hang.load(Ordering::SeqCst) {
+            return std::future::pending().await;
+        }
+        if self.recover.load(Ordering::SeqCst) {
+            return self.inner.wait(target).await;
+        }
         Err(WaitError::Backend("lost child handle".into()))
     }
 
@@ -192,6 +213,7 @@ async fn wait_failure_is_cleanup_unverified() {
     let sup = SupervisorBuilder::new()
         .backend(Arc::new(WaitFailsBackend {
             inner: NullBackend::new(),
+            ..Default::default()
         }))
         .build();
     let scope = sup.create_scope();
@@ -415,4 +437,88 @@ async fn completed_scope_reports_are_bounded() {
     }
     assert!(matches!(sup.terminate_scope(oldest, short_opts()).await,
         Err(TerminateError::UnknownScope(id)) if id == oldest));
+}
+
+#[tokio::test(start_paused = true)]
+async fn quarantined_root_retries_signals_and_accepts_only_fresh_verified_reap() {
+    use std::sync::atomic::Ordering;
+    for program in ["respect-graceful", "ignore-graceful"] {
+        let backend = Arc::new(WaitFailsBackend::default());
+        let sup = SupervisorBuilder::new().backend(backend.clone()).build();
+        let scope = sup.create_scope();
+        let pid = sup.spawn(scope, ProcessSpec::new(program)).await.unwrap();
+        assert!(!sup.wait(pid).await.unwrap().outcome.is_verified());
+        backend.recover.store(true, Ordering::SeqCst);
+        let recovered = sup.terminate(pid, short_opts()).await.unwrap();
+        assert!(recovered.outcome.is_verified());
+        assert_eq!(sup.wait(pid).await.unwrap(), recovered);
+        assert_eq!(sup.terminate(pid, short_opts()).await.unwrap(), recovered);
+        assert_eq!(
+            *backend.signals.lock().unwrap(),
+            if program == "respect-graceful" {
+                vec![Signal::Term]
+            } else {
+                vec![Signal::Term, Signal::Kill]
+            }
+        );
+        assert!(sup.processes(scope).unwrap().is_empty());
+        assert!(sup
+            .terminate_scope(scope, short_opts())
+            .await
+            .unwrap()
+            .all_verified());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn quarantined_retry_still_forces_when_wait_errors_or_times_out() {
+    use std::sync::atomic::Ordering;
+    for hangs in [false, true] {
+        let backend = Arc::new(WaitFailsBackend::default());
+        let sup = SupervisorBuilder::new().backend(backend.clone()).build();
+        let scope = sup.create_scope();
+        let pid = sup
+            .spawn(scope, ProcessSpec::new("ignore-graceful"))
+            .await
+            .unwrap();
+        assert!(!sup.wait(pid).await.unwrap().outcome.is_verified());
+        backend.hang.store(hangs, Ordering::SeqCst);
+        let retry = sup.terminate(pid, short_opts()).await.unwrap();
+        assert!(!retry.outcome.is_verified());
+        assert_eq!(
+            *backend.signals.lock().unwrap(),
+            vec![Signal::Term, Signal::Kill]
+        );
+        assert!(!sup.wait(pid).await.unwrap().outcome.is_verified());
+        backend.hang.store(false, Ordering::SeqCst);
+        backend.recover.store(true, Ordering::SeqCst);
+        let recovered = sup.terminate(pid, short_opts()).await.unwrap();
+        assert_eq!(recovered.outcome, TerminationOutcome::ForcedRequired);
+        assert!(sup.shutdown().await.is_ok());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn fresh_retry_wait_error_still_forces_then_records_recovered_scope_outcome() {
+    use std::sync::atomic::Ordering;
+    let backend = Arc::new(WaitFailsBackend::default());
+    let sup = SupervisorBuilder::new().backend(backend.clone()).build();
+    let scope = sup.create_scope();
+    let pid = sup
+        .spawn(scope, ProcessSpec::new("ignore-graceful"))
+        .await
+        .unwrap();
+    assert!(!sup.wait(pid).await.unwrap().outcome.is_verified());
+    backend.recover_on_kill.store(true, Ordering::SeqCst);
+    let report = sup.terminate_scope(scope, short_opts()).await.unwrap();
+    assert_eq!(
+        report.outcomes,
+        vec![(pid, TerminationOutcome::ForcedRequired)]
+    );
+    assert_eq!(
+        *backend.signals.lock().unwrap(),
+        vec![Signal::Term, Signal::Kill]
+    );
+    assert!(sup.wait(pid).await.unwrap().outcome.is_verified());
+    assert!(sup.shutdown().await.is_ok());
 }
