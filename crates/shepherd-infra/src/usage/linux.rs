@@ -45,8 +45,9 @@ pub(super) fn sample(identity: ObservedProcessIdentity) -> Result<ProcessUsage, 
         .ok_or_else(|| unavailable("boot time unavailable"))?
         .parse::<u64>()
         .map_err(unavailable)?;
-    // SAFETY: read-only clock tick frequency query.
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
+        .map_err(unavailable)?
+        .ok_or_else(|| unavailable("clock frequency unavailable"))?;
     if hz <= 0 {
         return Err(unavailable("invalid clock frequency"));
     }

@@ -4,6 +4,8 @@ fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "both".into());
     if mode == "inherit-pipes" {
         #[cfg(unix)]
+        // SAFETY: SIG_IGN is a valid signal disposition, not a Rust callback;
+        // the single-threaded fixture changes only its own SIGTERM behavior.
         unsafe {
             libc::signal(libc::SIGTERM, libc::SIG_IGN);
         }

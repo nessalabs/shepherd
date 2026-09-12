@@ -18,6 +18,8 @@ FD/handle, owned-zombie, containment, or domain-coverage assertions.
 | Hardware and toolchains | Existing latest-image suites plus Linux ARM64, Intel macOS, Windows ARM64, Ubuntu 22.04 and Windows 2022; optimized workspace tests and Rust 1.83 execution. Each compatibility job prints its actual host/compiler. |
 | libc | Full workspace tests execute native Linux musl binaries in addition to GNU/Linux tests. |
 | Long stress | Six named OS/architecture images × two runtimes, configurable bounded iteration count and seed; 512 property cases; per-job timeouts; logs and regression artifacts retained even on failure. |
+| Combined application soak | Two to four scopes run changing helpers and output floods while readers slow down or drop, observations are cancelled, partial launches fail, scope bodies are cancelled, and spawn races shutdown. Both Tokio runtimes must finish with verified cleanup, bounded post-warm-up RSS, no descriptor/handle growth, and no owned zombies. |
+| Unsafe boundaries | Safe wrappers replace raw calls where practical; platform Clippy requires safety comments, and CI checks the [unsafe register](UNSAFE_CODE.md) against source. |
 | CI definitions | Pinned actionlint checks workflow syntax/expressions on every PR. |
 
 The bounded mixed stress test runs under ordinary workspace CI. The long workflow
@@ -70,3 +72,16 @@ backend instances on macOS, releasing the gate before reacquiring backend state.
 This gate coordinates Shepherd's own spawn paths; unrelated application fork/spawn
 implementations do not participate in it. The mixed fanout stress is the native
 regression, run on both macOS architectures with an independent watchdog.
+
+## Combined soak limits
+
+`application_soak` runs six warm-up rounds and six measured rounds in ordinary CI.
+The manual workflow defaults to 200 measured rounds on each OS/runtime combination.
+It samples the supervisor process's resident memory after each round, allowing at
+most 64 MiB above the warm baseline. This catches sustained large growth; it does
+not prove that every allocation is freed or detect every small leak. Native handles
+and descriptors retain the stricter final zero-growth assertion.
+
+The seed varies scope counts, polling delays, and shutdown timing. It records the
+workload choices, not an exact replay of thread or OS scheduling. Longer runs use
+the external watchdog and retain progress and stall diagnostics.

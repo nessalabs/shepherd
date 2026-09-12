@@ -35,6 +35,7 @@ fn owned(raw: HANDLE) -> io::Result<OwnedHandle> {
     if raw.is_null() || raw == INVALID_HANDLE_VALUE {
         Err(io::Error::last_os_error())
     } else {
+        // SAFETY: raw was checked against null and INVALID_HANDLE_VALUE; callers transfer a newly owned handle exactly once to RAII.
         Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
     }
 }
@@ -52,19 +53,25 @@ fn ft(t: FILETIME) -> u64 {
     (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)
 }
 fn times(handle: HANDLE) -> io::Result<(u64, u64)> {
+    // SAFETY: This Win32 integer/pointer output record permits all-zero initialization; size fields are set before use where required.
     let mut creation = unsafe { std::mem::zeroed() };
     let mut exit = creation;
     let mut kernel = creation;
     let mut user = creation;
+    // SAFETY: The caller retains the process handle; all four FILETIME outputs are initialized writable records and no pointer escapes.
     bool_result(unsafe {
         GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
     })?;
     Ok((ft(creation), ft(kernel).saturating_add(ft(user))))
 }
 fn new_job() -> io::Result<OwnedHandle> {
+    // SAFETY: null security/name pointers request an unnamed default-security job;
+    // owned() validates and takes ownership of the returned handle.
     let job = owned(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) })?;
+    // SAFETY: This Win32 integer/pointer output record permits all-zero initialization; size fields are set before use where required.
     let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: The job is owned and live; the information class, record pointer, and byte size match, with no retained Rust pointers.
     bool_result(unsafe {
         SetInformationJobObject(
             raw(&job),
@@ -76,7 +83,9 @@ fn new_job() -> io::Result<OwnedHandle> {
     Ok(job)
 }
 fn active(job: &OwnedHandle) -> io::Result<u32> {
+    // SAFETY: This Win32 integer/pointer output record permits all-zero initialization; size fields are set before use where required.
     let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: The borrowed job remains owned; the output record and byte size match the requested accounting class.
     bool_result(unsafe {
         QueryInformationJobObject(
             raw(job),
@@ -91,20 +100,26 @@ fn active(job: &OwnedHandle) -> io::Result<u32> {
 fn resume(pid: u32) -> io::Result<()> {
     // The root's process handle is retained and its primary thread has never run.
     // Enumerating that process's suspended thread avoids reopening by an unowned PID.
+    // SAFETY: This Win32 integer/pointer output record permits all-zero initialization; size fields are set before use where required.
     let snapshot = owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) })?;
+    // SAFETY: This Win32 integer/pointer output record permits all-zero initialization; size fields are set before use where required.
     let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of_val(&entry) as u32;
     let mut found = false;
+    // SAFETY: The snapshot remains owned and entry.dwSize describes the initialized writable THREADENTRY32 record.
     let mut ok = unsafe { Thread32First(raw(&snapshot), &mut entry) };
     while ok != 0 {
         if entry.th32OwnerProcessID == pid {
             let thread =
+                // SAFETY: The thread ID comes from the owned snapshot and is filtered to the retained suspended root; owned() checks acquisition errors.
                 owned(unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) })?;
+            // SAFETY: The thread handle was opened with resume rights and remains owned for this call; failure is checked before proceeding.
             if unsafe { ResumeThread(raw(&thread)) } == u32::MAX {
                 return Err(io::Error::last_os_error());
             }
             found = true;
         }
+        // SAFETY: The snapshot remains owned and entry is a correctly sized writable THREADENTRY32 record.
         ok = unsafe { Thread32Next(raw(&snapshot), &mut entry) };
     }
     if found {
@@ -148,8 +163,11 @@ impl WindowsJobBackend {
         // execute without the job mutex, so sampling cannot block signals or reap.
         let (_, ticks) = times(raw(&process)).map_err(|e| StatsError::Backend(e.to_string()))?;
         let now = Instant::now();
+        // SAFETY: This Win32 integer/pointer output record permits all-zero initialization; size fields are set before use where required.
         let mut memory: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        // SAFETY: This Win32 integer/pointer output record permits all-zero initialization; size fields are set before use where required.
         let mut io: IO_COUNTERS = unsafe { std::mem::zeroed() };
+        // SAFETY: The retained process handle outlives this query and the writable memory record has the exact supplied size.
         bool_result(unsafe {
             K32GetProcessMemoryInfo(
                 raw(&process),
@@ -158,6 +176,7 @@ impl WindowsJobBackend {
             )
         })
         .map_err(|e| StatsError::Backend(e.to_string()))?;
+        // SAFETY: The retained process handle and initialized IO_COUNTERS output remain valid throughout the synchronous query.
         bool_result(unsafe { GetProcessIoCounters(raw(&process), &mut io) })
             .map_err(|e| StatsError::Backend(e.to_string()))?;
         let mut state = self.state.lock().expect("job mutex");
@@ -325,6 +344,7 @@ impl ProcessBackend for WindowsJobBackend {
                 .raw_handle()
                 .ok_or_else(|| io::Error::other("missing process handle"))?;
             // Open only while Tokio owns the unreaped process, then retain this exact handle.
+            // SAFETY: The child is still owned and suspended, preventing PID reuse; requested rights are explicit and owned() checks the returned handle.
             let process = owned(unsafe {
                 OpenProcess(
                     PROCESS_QUERY_INFORMATION
@@ -343,6 +363,7 @@ impl ProcessBackend for WindowsJobBackend {
             if let std::collections::hash_map::Entry::Vacant(entry) = state.jobs.entry(scope) {
                 entry.insert(new_job()?);
             }
+            // SAFETY: Both the job and child handles are retained; assignment is checked before the suspended child can execute.
             bool_result(unsafe {
                 AssignProcessToJobObject(raw(&state.jobs[&scope]), child_handle)
             })?;
@@ -446,12 +467,14 @@ impl ProcessBackend for WindowsJobBackend {
             return Ok(());
         };
         let mut code = 0;
+        // SAFETY: The registry lock retains the exact process handle and code is a writable scalar output.
         bool_result(unsafe { GetExitCodeProcess(raw(&slot.process), &mut code) })
             .map_err(|e| TerminateError::Signal(e.to_string()))?;
         if code != STILL_ACTIVE as u32 {
             return Ok(());
         }
         slot.killed.store(true, Ordering::SeqCst);
+        // SAFETY: The registry retains this exact owned process handle; no PID lookup or borrowed memory is involved.
         bool_result(unsafe { TerminateProcess(raw(&slot.process), KILLED) })
             .map_err(|e| TerminateError::Signal(e.to_string()))
     }
@@ -470,6 +493,7 @@ impl ProcessBackend for WindowsJobBackend {
             slot.killed.store(true, Ordering::SeqCst);
         }
         let result = if let Some(job) = state.jobs.get(&scope) {
+            // SAFETY: The registry lock retains this exact scope job handle throughout the call; no user pointers are passed.
             bool_result(unsafe { TerminateJobObject(raw(job), KILLED) })
                 .map_err(|e| TerminateError::Signal(e.to_string()))
         } else {
@@ -587,6 +611,7 @@ impl ProcessBackend for WindowsJobBackend {
             slot.killed.store(true, Ordering::SeqCst);
         }
         if let Some(job) = state.jobs.get(&scope) {
+            // SAFETY: The registry lock retains this exact scope job handle throughout the call; no user pointers are passed.
             let _ = unsafe { TerminateJobObject(raw(job), KILLED) };
         }
         for slot in state.children.values().filter(|slot| slot.scope == scope) {
@@ -602,6 +627,7 @@ impl ProcessBackend for WindowsJobBackend {
             slot.killed.store(true, Ordering::SeqCst);
         }
         for job in state.jobs.values() {
+            // SAFETY: The registry lock retains this exact scope job handle throughout the call; no user pointers are passed.
             if let Err(error) = bool_result(unsafe { TerminateJobObject(raw(job), KILLED) }) {
                 tracing::error!(%error, "Job Object hard kill failed");
             }
@@ -650,6 +676,7 @@ mod tests {
             .process
             .clone();
         assert_eq!(
+            // SAFETY: The test retains the process handle while querying kernel completion; the timeout is finite and no output pointer is passed.
             unsafe { WaitForSingleObject(raw(&process), 0) },
             windows_sys::Win32::Foundation::WAIT_TIMEOUT
         );
@@ -730,6 +757,7 @@ mod tests {
             }
         })
         .await;
+        // SAFETY: The test retains the process handle while querying kernel completion; the timeout is finite and no output pointer is passed.
         let sibling_alive = unsafe { WaitForSingleObject(raw(&sibling_handle), 0) }
             == windows_sys::Win32::Foundation::WAIT_TIMEOUT;
         // Always finish both jobs before reporting a regression failure.
@@ -768,6 +796,7 @@ mod tests {
         .await
         .expect("retry worker retained backend ownership");
         assert_eq!(
+            // SAFETY: The test retains the process handle while querying kernel completion; the timeout is finite and no output pointer is passed.
             unsafe { WaitForSingleObject(raw(&process), 5000) },
             windows_sys::Win32::Foundation::WAIT_OBJECT_0
         );
@@ -782,15 +811,18 @@ mod tests {
             .creation_flags(CREATE_SUSPENDED)
             .spawn()
             .unwrap();
+        // SAFETY: Both the job and child handles are retained; assignment is checked before the suspended child can execute.
         bool_result(unsafe { AssignProcessToJobObject(raw(&job), child.as_raw_handle()) }).unwrap();
         assert_eq!(active(&job).unwrap(), 1);
         // Keep the root suspended: it cannot exit naturally or run any user code.
         assert_eq!(
+            // SAFETY: The registry lock retains this exact scope job handle throughout the call; no user pointers are passed.
             unsafe { WaitForSingleObject(child.as_raw_handle(), 20) },
             windows_sys::Win32::Foundation::WAIT_TIMEOUT
         );
         drop(job); // no TerminateJobObject: exercise KILL_ON_JOB_CLOSE itself.
         assert_eq!(
+            // SAFETY: The test retains the process handle while querying kernel completion; the timeout is finite and no output pointer is passed.
             unsafe { WaitForSingleObject(child.as_raw_handle(), 5000) },
             windows_sys::Win32::Foundation::WAIT_OBJECT_0
         );

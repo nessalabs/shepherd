@@ -125,8 +125,14 @@ pub(super) fn group(pgid: i32) -> Result<UsageSnapshot, ObservationError> {
         .collect();
     let mut result = collect(members, UsageSelection::ProcessGroup);
     for entry in &mut result.entries {
-        // SAFETY: getpgid is a read-only query. Exit/group changes invalidate this sample.
-        if unsafe { libc::getpgid(entry.identity.os_pid as i32) } != pgid {
+        // Exit/group changes invalidate this sample.
+        if nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(
+            entry.identity.os_pid as i32,
+        )))
+        .map(|p| p.as_raw())
+        .ok()
+            != Some(pgid)
+        {
             entry.measurement = Err(UsageFailure::IdentityChanged);
         }
     }
@@ -184,23 +190,20 @@ mod native_tests {
             start_time_unix_seconds: None,
         };
         let first = sample(identity).unwrap();
-        // SAFETY: initialized rusage output record for the calling process.
-        let mut before: libc::rusage = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut before) },
-            0
-        );
+        use nix::sys::{
+            resource::{getrusage, Usage, UsageWho},
+            time::TimeValLike,
+        };
+        let before = getrusage(UsageWho::RUSAGE_SELF).unwrap();
         let deadline = Instant::now() + Duration::from_millis(250);
         let mut x = 1u64;
         while Instant::now() < deadline {
             x = std::hint::black_box(x.wrapping_mul(1664525).wrapping_add(1013904223));
         }
-        let mut after: libc::rusage = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut after) }, 0);
+        let after = getrusage(UsageWho::RUSAGE_SELF).unwrap();
         let last = sample(identity).unwrap();
-        let seconds = |r: libc::rusage| {
-            (r.ru_utime.tv_sec + r.ru_stime.tv_sec) as f64
-                + (r.ru_utime.tv_usec + r.ru_stime.tv_usec) as f64 / 1e6
+        let seconds = |r: Usage| {
+            (r.user_time().num_microseconds() + r.system_time().num_microseconds()) as f64 / 1e6
         };
         let expected = seconds(after) - seconds(before);
         let actual = (last.cpu_time - first.cpu_time).as_secs_f64();

@@ -60,6 +60,9 @@ The domain's purity, the layering, and the ubiquitous language are enforced by t
 - [`docs/GLOSSARY.md`](docs/GLOSSARY.md) — the ubiquitous language (enforced in CI).
 - [`docs/decisions/`](docs/decisions/) — implementation ADRs (ports, Drop kill, groups, signaling, wait failure, deferred crates, publishers, monitors, toolchain).
 
+The native safety boundaries, safe-wrapper replacements, and required justifications
+are documented in [Unsafe code in Shepherd](docs/UNSAFE_CODE.md).
+
 ## Development
 
 ```sh

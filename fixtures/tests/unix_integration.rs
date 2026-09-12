@@ -120,7 +120,7 @@ async fn scope_termination_cleans_up_descendants() {
 
 fn process_alive(os_pid: u32) -> bool {
     // kill(pid, 0) is a liveness probe; ESRCH means the pid is gone.
-    unsafe { libc::kill(os_pid as i32, 0) == 0 }
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(os_pid as i32), None).is_ok()
 }
 
 fn spawn_sleep_writing_pid(pid_file: &std::path::Path) -> ProcessSpec {

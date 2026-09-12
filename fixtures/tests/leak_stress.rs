@@ -3,45 +3,14 @@
 use shepherd::{GracePeriod, OutputMode, ProcessSpec, SupervisorBuilder, TerminateOptions};
 use shepherd_test_support::{RuntimeFlavor, StressConfig, StressMode, TestEnvironment};
 use std::time::Duration;
+#[path = "support/resources.rs"]
+mod resources;
 #[cfg(windows)]
 #[path = "support/windows_handles.rs"]
 mod windows_handles;
 #[cfg(unix)]
-fn handles() -> usize {
-    #[cfg(target_os = "linux")]
-    let path = "/proc/self/fd";
-    #[cfg(not(target_os = "linux"))]
-    let path = "/dev/fd";
-    std::fs::read_dir(path).unwrap().count()
-}
-#[cfg(windows)]
-fn handles() -> usize {
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
-    let mut count = 0;
-    assert_ne!(
-        unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) },
-        0
-    );
-    count as usize
-}
-#[cfg(unix)]
-fn assert_no_owned_zombies() {
-    let output = std::process::Command::new("ps")
-        .args(["-axo", "ppid=,stat=,comm="])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let own = std::process::id().to_string();
-    for line in String::from_utf8(output.stdout).unwrap().lines() {
-        let mut fields = line.split_whitespace();
-        if fields.next() == Some(own.as_str()) {
-            assert!(
-                !fields.next().unwrap_or("").starts_with('Z'),
-                "owned zombie: {line}"
-            );
-        }
-    }
-}
+use resources::assert_no_owned_zombies;
+use resources::handles;
 fn options() -> TerminateOptions {
     TerminateOptions {
         grace: GracePeriod::new(Duration::ZERO),

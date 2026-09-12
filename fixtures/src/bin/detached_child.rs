@@ -1,18 +1,22 @@
-//! Fork a detached descendant; optionally let the tracked root exit first.
+//! Start a detached descendant; optionally let the tracked root exit first.
+#![forbid(unsafe_code)]
 #[cfg(unix)]
+#[allow(clippy::zombie_processes)] // Orphan mode intentionally transfers the live child to the OS/subreaper.
 fn main() {
-    let args: Vec<_> = std::env::args().collect();
-    // SAFETY: fixture is single-threaded, no runtime or inherited locks exist at fork.
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0);
-    if pid == 0 {
-        assert!(unsafe { libc::setsid() } >= 0);
+    let args: Vec<_> = std::env::args_os().collect();
+    if args.get(2).is_some_and(|a| a == "child") {
+        nix::unistd::setsid().unwrap();
         std::fs::write(&args[1], std::process::id().to_string()).unwrap();
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
+    } else {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(&args[1])
+            .arg("child")
+            .spawn()
+            .unwrap();
+        if args.get(2).is_some_and(|a| a == "orphan") {
+            return;
         }
-    }
-    if args.get(2).is_some_and(|a| a == "orphan") {
+        child.wait().unwrap();
         return;
     }
     loop {

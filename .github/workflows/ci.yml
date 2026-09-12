@@ -32,6 +32,22 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  native-safety-lint:
+    name: Native safety lint (${{ matrix.os }})
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
   ddd-architecture:
     timeout-minutes: 20
     name: DDD architecture fitness
@@ -129,6 +145,8 @@ jobs:
       - run: cargo test -p shepherd-fixtures --test resource_integration -- --nocapture
       - name: Aggregate usage, external roots, and scope isolation
         run: cargo test --locked -p shepherd-fixtures --test usage_integration --test observation_integration -- --nocapture
+      - name: Concurrent application soak and resource bounds
+        run: cargo test --locked -p shepherd-fixtures --test application_soak -- --nocapture
       - name: Accounting conversion and failure regressions
         run: "cargo test --locked -p shepherd-infra usage:: -- --nocapture"
 
@@ -236,6 +254,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Verify external watchdog
         run: python3 -m unittest discover -s tools -p test_run_stress.py
+      - name: Verify unsafe register and scanner
+        run: |
+          python3 -m unittest discover -s tools -p test_check_unsafe.py
+          python3 tools/check_unsafe.py
       - name: Install pinned actionlint
         env:
           GH_TOKEN: ${{ github.token }}
