@@ -12,9 +12,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  SHEPHERD_PROBE_ABSENT: parent-only-sentinel
 
 jobs:
   lint:
+    timeout-minutes: 20
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
@@ -31,6 +33,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   ddd-architecture:
+    timeout-minutes: 20
     name: DDD architecture fitness
     runs-on: ubuntu-latest
     steps:
@@ -44,6 +47,7 @@ jobs:
         run: node --experimental-strip-types check.ts
 
   domain-coverage:
+    timeout-minutes: 20
     name: domain coverage (100% lines)
     runs-on: ubuntu-latest
     steps:
@@ -58,6 +62,7 @@ jobs:
         run: cargo llvm-cov -p shepherd-domain --fail-under-lines 100
 
   test:
+    timeout-minutes: 20
     name: contract + real platform backends + docs (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -74,6 +79,7 @@ jobs:
         run: cargo test --workspace
 
   linux-containment:
+    timeout-minutes: 20
     name: Linux unprivileged lifecycle + capability honesty
     runs-on: ubuntu-latest
     steps:
@@ -84,6 +90,7 @@ jobs:
         run: cargo test -p shepherd-fixtures --test unix_integration -- --nocapture
 
   privileged-cgroup:
+    timeout-minutes: 20
     name: privileged cgroup.kill + setsid + isolation + reap
     runs-on: ubuntu-latest
     steps:
@@ -108,6 +115,7 @@ jobs:
           sudo env SHEPHERD_CGROUP_ROOT=/sys/fs/cgroup/shepherd-ci "$backstop_bin" cgroup_backstop_tests --ignored --test-threads=1 --nocapture
 
   resource:
+    timeout-minutes: 20
     name: cached stats + real resource observations (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -121,6 +129,7 @@ jobs:
       - run: cargo test -p shepherd-fixtures --test resource_integration -- --nocapture
 
   output-stress:
+    timeout-minutes: 20
     name: binary output + bounded overflow + flood termination (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -134,6 +143,7 @@ jobs:
       - run: cargo test -p shepherd-fixtures --test output_integration -- --nocapture
 
   properties-concurrency:
+    timeout-minutes: 20
     name: generated invariants + registry and waiter interleavings
     runs-on: ubuntu-latest
     steps:
@@ -148,6 +158,7 @@ jobs:
         run: cargo test -p shepherd-infra --lib loom_
 
   leak-inspection:
+    timeout-minutes: 20
     name: in-process FD or handle counts + owned zombie inspection (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -159,3 +170,73 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p shepherd-fixtures --test leak_stress -- --nocapture
+
+  machine-compatibility:
+    name: Compatibility (${{ matrix.os }}, Rust ${{ matrix.rust }}, ${{ matrix.profile || 'debug' }})
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            rust: 1.83.0
+            profile: --release
+          - os: ubuntu-24.04-arm
+            rust: stable
+            profile: ''
+          - os: macos-15-intel
+            rust: stable
+            profile: --release
+          - os: windows-2022
+            rust: 1.83.0
+            profile: --release
+          - os: windows-11-arm
+            rust: stable
+            profile: ''
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Record actual compiler and machine
+        shell: bash
+        run: |
+          rustc -vV
+          uname -a
+      - name: Full workspace on alternate machines and optimized builds
+        run: cargo test --workspace --locked ${{ matrix.profile }}
+
+  linux-musl:
+    name: Real Linux musl lifecycle and observations
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Execute musl binaries (not just cross-compile)
+        run: cargo test --workspace --locked --target x86_64-unknown-linux-musl
+
+  workflow-validation:
+    name: Validate workflow syntax and expressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify external watchdog
+        run: python3 -m unittest discover -s tools -p test_run_stress.py
+      - name: Install pinned actionlint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          gh release download v1.7.12 --repo rhysd/actionlint --pattern actionlint_1.7.12_linux_amd64.tar.gz --dir "$RUNNER_TEMP/actionlint"
+          tar -xzf "$RUNNER_TEMP/actionlint/actionlint_1.7.12_linux_amd64.tar.gz" -C "$RUNNER_TEMP/actionlint"
+      - run: '"$RUNNER_TEMP/actionlint/actionlint" -shellcheck= -pyflakes='

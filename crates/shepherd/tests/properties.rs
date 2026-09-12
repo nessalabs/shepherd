@@ -5,7 +5,9 @@ use shepherd_domain::*;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig::with_cases(std::env::var("PROPTEST_CASES")
+        .map(|v| v.parse().expect("PROPTEST_CASES must be a positive integer"))
+        .unwrap_or(64)))]
     #[test]
     fn domain_invariants_one_through_nine(trace in prop::collection::vec((any::<bool>(), 0u8..5), 0..100)) {
         let mut scopes = [ProcessScope::new(ProcessScopeId::new(1)), ProcessScope::new(ProcessScopeId::new(2))];
