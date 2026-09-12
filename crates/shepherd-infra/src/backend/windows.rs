@@ -267,10 +267,12 @@ impl ProcessBackend for WindowsJobBackend {
                     core_dumped: false,
                 })
                 .map_err(|e| e.to_string());
+            // A descendant's inherited pipes cannot delay the root's verified exit.
+            // This same waiter task retains the readers through bounded finishing.
+            tx.send_replace(Some(exit));
             if let Some(output) = output {
                 crate::output::finish_readers(readers, output).await;
             }
-            tx.send_replace(Some(exit));
         });
         Ok(spawned)
     }
