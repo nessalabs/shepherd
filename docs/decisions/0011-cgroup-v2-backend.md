@@ -38,6 +38,11 @@ verified completion removes it and retains only the bounded final report.
 ScopeClosed delivery is deferred until that verified commit, including for empty
 scopes. The corresponding ScopeTerminated publication is scheduled once, remains
 best effort, and holds only event handlers, never supervisor/backend ownership.
+All integration publication uses one lazy worker and a 64-event queue. Enqueue
+never waits; overflow is dropped, and each publication has a one-second timeout.
+This bounds retained events and prevents a stalled publisher from retaining one
+deferred task per completed scope. Dropping the last sender lets the worker drain
+the bounded queue and release the publisher; it never holds a sender itself.
 Root children are separately waited and reaped. Descendant zombies belong to their
 OS parent/reaper; emptiness means no live descendant, not that Shepherd can wait
 for arbitrary non-child processes. Tests use a subreaper to verify their reaping.
