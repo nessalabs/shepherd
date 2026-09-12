@@ -165,3 +165,5 @@ has no CPU rate. Missing measurements are explicit errors, never fabricated zero
 native accounting on Linux cgroups and Windows Jobs. Unsupported backends fail
 explicitly. These are read-only, on-demand APIs; see the
 [aggregate statistics guide](docs/AGGREGATE_STATISTICS.md) for field meanings and limits.
+
+[Heap lifetime verification](docs/HEAP_VERIFICATION.md) explains allocation checks and their limits.

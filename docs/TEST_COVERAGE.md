@@ -85,3 +85,6 @@ and descriptors retain the stricter final zero-growth assertion.
 The seed varies scope counts, polling delays, and shutdown timing. It records the
 workload choices, not an exact replay of thread or OS scheduling. Longer runs use
 the external watchdog and retain progress and stall diagnostics.
+
+See [heap lifetime verification](HEAP_VERIFICATION.md) for LeakSanitizer controls,
+live-allocation bounds in a long-lived supervisor, and direct ownership-release tests.

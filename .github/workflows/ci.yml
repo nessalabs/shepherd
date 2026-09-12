@@ -258,6 +258,7 @@ jobs:
         run: |
           python3 -m unittest discover -s tools -p test_check_unsafe.py
           python3 tools/check_unsafe.py
+          python3 -m unittest discover -s tools -p test_check_leak_detector.py
       - name: Install pinned actionlint
         env:
           GH_TOKEN: ${{ github.token }}
@@ -287,3 +288,56 @@ jobs:
         run: |
           clang -Wall -Wextra -Werror -O2 docs/research/macos-rusage-probe.c -o /tmp/shepherd-rusage-probe
           /tmp/shepherd-rusage-probe
+
+  heap-retention:
+    name: Live heap and ownership (${{ matrix.os }})
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: Swatinem/rust-cache@v2
+      - name: One supervisor across 1536 lifecycles per runtime
+        run: cargo test --locked -p shepherd-fixtures --release --test heap_retention -- --ignored --nocapture
+      - name: Retain heap failure profiles
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: heap-${{ matrix.os }}
+          path: '**/dhat-heap.json'
+          if-no-files-found: ignore
+
+  leak-sanitizer:
+    name: LeakSanitizer real lifecycle and detector control
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: -Zsanitizer=leak
+      LSAN_OPTIONS: exitcode=23
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-01
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: leak-sanitizer
+      - name: Prove the detector rejects a tiny leak
+        run: |
+          rustc -Zsanitizer=leak --target x86_64-unknown-linux-gnu -g tools/leak_sentinel.rs -o /tmp/shepherd-leak-sentinel
+          python3 tools/check_leak_detector.py /tmp/shepherd-leak-sentinel
+      - name: Instrumented lifecycle, cancellation, output and observation
+        run: |
+          set -o pipefail
+          cargo test --locked --target x86_64-unknown-linux-gnu -p shepherd-fixtures --test application_soak --test usage_integration --test observation_integration -- --nocapture 2>&1 | tee leak-sanitizer.log
+      - name: Retain detector output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leak-sanitizer
+          path: leak-sanitizer.log
+          if-no-files-found: ignore
