@@ -6,6 +6,7 @@ members = [
     "crates/shepherd-infra",
     "crates/shepherd",
     "fixtures",
+    "crates/shepherd-test-support",
 ]
 
 [workspace.package]

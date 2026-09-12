@@ -494,6 +494,7 @@ dependencies = [
  "shepherd-app",
  "shepherd-domain",
  "shepherd-infra",
+ "shepherd-test-support",
  "tokio",
 ]
 
@@ -524,6 +525,7 @@ dependencies = [
  "libc",
  "ntapi",
  "shepherd",
+ "shepherd-test-support",
  "tokio",
  "windows-sys 0.59.0",
 ]
@@ -540,12 +542,17 @@ dependencies = [
  "nix",
  "shepherd-app",
  "shepherd-domain",
+ "shepherd-test-support",
  "sysinfo",
  "thiserror",
  "tokio",
  "tracing",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "shepherd-test-support"
+version = "0.1.0"
 
 [[package]]
 name = "shlex"

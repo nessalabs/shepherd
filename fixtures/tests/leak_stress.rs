@@ -1,6 +1,7 @@
 //! One-process resource accounting: warm runtime, repeated lifecycles, then compare.
 #![cfg(any(unix, windows))]
 use shepherd::{GracePeriod, OutputMode, ProcessSpec, SupervisorBuilder, TerminateOptions};
+use shepherd_test_support::{RuntimeFlavor, StressConfig, StressMode, TestEnvironment};
 use std::time::Duration;
 #[cfg(windows)]
 #[path = "support/windows_handles.rs"]
@@ -266,19 +267,15 @@ async fn run(iterations: usize, seed: u64) {
     #[cfg(unix)]
     assert_no_owned_zombies();
 }
-fn exercise(iterations: usize) {
-    let seed = std::env::var("SHEPHERD_STRESS_SEED")
-        .unwrap_or_else(|_| "42".into())
-        .parse()
-        .unwrap();
-    let runtime = std::env::var("SHEPHERD_STRESS_RUNTIME").unwrap_or_else(|_| "both".into());
-    assert!(["current", "multi", "both"].contains(&runtime.as_str()));
-    for flavor in ["current", "multi"] {
-        if runtime != "both" && runtime != flavor {
-            continue;
-        }
-        eprintln!("stress runtime={flavor}, iterations={iterations}, seed={seed}");
-        let mut builder = if flavor == "current" {
+fn exercise(config: StressConfig) {
+    let StressConfig {
+        seed,
+        runtimes,
+        iterations,
+    } = config;
+    for flavor in runtimes {
+        eprintln!("stress runtime={flavor:?}, iterations={iterations}, seed={seed}");
+        let mut builder = if *flavor == RuntimeFlavor::Current {
             tokio::runtime::Builder::new_current_thread()
         } else {
             let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -296,18 +293,10 @@ fn exercise(iterations: usize) {
 }
 #[test]
 fn bounded_lifecycle_has_no_fd_handle_or_zombie_growth() {
-    exercise(36);
+    exercise(TestEnvironment::from_env().stress(StressMode::Smoke));
 }
 #[test]
 #[ignore = "long mixed lifecycle stress; workflow_dispatch runs explicitly"]
 fn long_create_kill_capture_and_reap_loops() {
-    let iterations: usize = std::env::var("SHEPHERD_STRESS_ITERATIONS")
-        .unwrap_or_else(|_| "2000".into())
-        .parse()
-        .unwrap();
-    assert!(
-        (6..=100_000).contains(&iterations),
-        "iterations must be 6..=100000"
-    );
-    exercise(iterations);
+    exercise(TestEnvironment::from_env().stress(StressMode::Long));
 }

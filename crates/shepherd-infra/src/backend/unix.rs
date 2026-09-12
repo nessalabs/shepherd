@@ -998,8 +998,7 @@ mod cgroup_backstop_tests {
     use std::time::Duration;
 
     async fn failed_kill_file_preserves_root_backstop(all: bool) {
-        let delegated = std::env::var_os("SHEPHERD_CGROUP_ROOT")
-            .expect("set a writable delegated cgroup v2 ancestor");
+        let delegated = shepherd_test_support::TestEnvironment::from_env().cgroup_root();
         let backend = UnixProcessBackend::with_cgroup_root(delegated).unwrap();
         let scope = ProcessScopeId::new(1);
         let other = ProcessScopeId::new(2);

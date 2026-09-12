@@ -35,14 +35,20 @@ async fn launch_preserves_unicode_empty_arguments_and_recovers_from_bad_cwd() {
     }
     for clear in [false, true] {
         let values = vec![
-            ("SHEPHERD_PROBE_VALUE".into(), "value with spaces 🐑".into()),
-            ("SHEPHERD_PROBE_CWD".into(), dir.0.as_os_str().to_owned()),
+            (
+                shepherd_test_support::probe::VALUE.into(),
+                "value with spaces 🐑".into(),
+            ),
+            (
+                shepherd_test_support::probe::CWD.into(),
+                dir.0.as_os_str().to_owned(),
+            ),
         ];
         let env = if clear {
             EnvPolicy::Clear(values)
         } else {
             let mut overrides: Vec<_> = values.into_iter().map(|(k, v)| (k, Some(v))).collect();
-            overrides.push(("SHEPHERD_PROBE_ABSENT".into(), None));
+            overrides.push((shepherd_test_support::probe::ABSENT.into(), None));
             EnvPolicy::Overrides(overrides)
         };
         let pid = sup
