@@ -12,7 +12,8 @@ The optional tail has its own byte cap and survives consuming reads.
 
 ProcessSupervisor::take_output transfers the observer once. Unclaimed observers
 are retained for only the most recent 256 verified completed processes, bounding aggregate
-post-mortem retention. Live outputs, unverified reap outputs, and transferred observer lifetimes are unaffected. ProcessOutput clones
+post-mortem retention. Eviction precedes event publication so a stalled external
+publisher cannot defer that bound. Live outputs, unverified reap outputs, and transferred observer lifetimes are unaffected. ProcessOutput clones
 share queue consumption. read() returns queued chunks, the current tail, cumulative
 drops, per-stream closure flags and reader errors without awaiting new bytes. The
 observer retains only output state, never the child or supervisor ownership guard.
