@@ -197,14 +197,17 @@ impl ProcessSupervisor {
 
     /// Creates a new, open scope and returns its id.
     pub fn create_scope(&self) -> ProcessScopeId {
-        self.create_scope_before_publish(|| {})
+        self.create_scope_before_publish(|_| {})
     }
 
     // The callback lets the concurrency regression pause at the publication boundary.
-    fn create_scope_before_publish(&self, before_publish: impl FnOnce()) -> ProcessScopeId {
+    fn create_scope_before_publish(
+        &self,
+        before_publish: impl FnOnce(ProcessScopeId),
+    ) -> ProcessScopeId {
         let mut registry = self.lock_registry();
         let scope = registry.create_scope();
-        before_publish();
+        before_publish(scope);
         // Registry -> operation map is the shared lock order. Do not expose the new
         // scope to shutdown before its serialization lock exists.
         self.inner
@@ -378,17 +381,19 @@ impl ProcessSupervisor {
         F: FnOnce(ScopedProcesses) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
-        let scope = self.create_scope();
         let (finish, finished) = tokio::sync::oneshot::channel();
         let guard = ScopeExit {
             finish: Some(finish),
         };
         let (report_tx, mut report_rx) = tokio::sync::watch::channel(None);
-        self.inner
-            .scope_results
-            .lock()
-            .expect("scope results mutex")
-            .insert(scope, report_tx.clone());
+        // Register observation before shutdown can discover this scope.
+        let scope = self.create_scope_before_publish(|scope| {
+            self.inner
+                .scope_results
+                .lock()
+                .expect("scope results mutex")
+                .insert(scope, report_tx.clone());
+        });
         let worker = self.worker();
         let worker_report = report_tx.clone();
         let cleanup = tokio::spawn(async move {
@@ -401,9 +406,17 @@ impl ProcessSupervisor {
             // A normal worker publishes before returning. This observer only handles
             // failures, so runtime shutdown cannot lose an already completed result.
             if let Err(error) = cleanup.await {
-                report_tx.send_replace(Some(Err(TerminateError::Signal(format!(
-                    "scope cleanup worker failed: {error}"
-                )))));
+                report_tx.send_if_modified(|current| {
+                    if current.as_ref().is_some_and(|result| {
+                        result.as_ref().is_ok_and(|report| report.all_verified())
+                    }) {
+                        return false;
+                    }
+                    *current = Some(Err(TerminateError::Signal(format!(
+                        "scope cleanup worker failed: {error}"
+                    ))));
+                    true
+                });
             }
         });
         let mut processes = Vec::new();
@@ -451,10 +464,36 @@ impl ProcessSupervisor {
         opts: TerminateOptions,
         report_tx: ScopeCleanupSender,
     ) {
-        let result = self.terminate_scope(scope, opts).await;
-        let verified = result.as_ref().is_ok_and(|report| report.all_verified());
+        let published = report_tx.borrow().clone();
+        let result = if let Some(Ok(report)) =
+            published.filter(|result| result.as_ref().is_ok_and(|report| report.all_verified()))
+        {
+            Ok(report)
+        } else {
+            let result = self.terminate_scope(scope, opts).await;
+            // External cleanup can complete while this worker waits, then its general
+            // report can expire. Our channel retains that verified result independently.
+            match report_tx.borrow().clone() {
+                Some(Ok(report)) if report.all_verified() => Ok(report),
+                _ => result,
+            }
+        };
         // No suspension between completed cleanup, publication and history retention.
-        report_tx.send_replace(Some(result));
+        // Never replace a concurrently published verified external cleanup with error.
+        report_tx.send_if_modified(|current| {
+            if current
+                .as_ref()
+                .is_some_and(|result| result.as_ref().is_ok_and(|report| report.all_verified()))
+            {
+                return false;
+            }
+            *current = Some(result);
+            true
+        });
+        let verified = report_tx
+            .borrow()
+            .as_ref()
+            .is_some_and(|result| result.as_ref().is_ok_and(|report| report.all_verified()));
         if verified {
             // Existing watch receivers retain their result independently of lookup history.
             let mut completed = self
@@ -810,6 +849,15 @@ impl ProcessSupervisor {
         outcomes.sort_by_key(|(pid, _)| *pid);
         let report = ScopeTerminationReport { scope, outcomes };
         if report.all_verified() {
+            if let Some(sender) = self
+                .inner
+                .scope_results
+                .lock()
+                .expect("scope results mutex")
+                .get(&scope)
+            {
+                sender.send_replace(Some(Ok(report.clone())));
+            }
             self.inner
                 .reports
                 .lock()
@@ -1122,6 +1170,69 @@ mod scope_operation_tests {
         ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports)
     }
 
+    #[tokio::test]
+    async fn active_block_retains_external_cleanup_after_report_eviction() {
+        let supervisor = supervisor();
+        let external = supervisor.clone();
+        let result = supervisor
+            .with_scope(Vec::new(), move |scope| async move {
+                let report = external
+                    .terminate_scope(scope.id(), Default::default())
+                    .await
+                    .unwrap();
+                assert!(report.all_verified());
+                for _ in 0..650 {
+                    let old = external.create_scope();
+                    external
+                        .terminate_scope(old, Default::default())
+                        .await
+                        .unwrap();
+                }
+                assert!(!external
+                    .inner
+                    .reports
+                    .lock()
+                    .unwrap()
+                    .contains_key(&scope.id()));
+                // Match F's global history eviction as well: both active participants
+                // must use their own channel, independently of lookup retention.
+                let receiver = external
+                    .inner
+                    .scope_results
+                    .lock()
+                    .unwrap()
+                    .remove(&scope.id())
+                    .unwrap()
+                    .subscribe();
+                (42, receiver)
+            })
+            .await;
+        let (value, receiver) = result.result.unwrap();
+        assert_eq!(value, 42);
+        assert!(result.termination.unwrap().all_verified());
+        // Wait for the worker's history update, proving it also retained success.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !supervisor
+                .inner
+                .completed_scope_results
+                .lock()
+                .unwrap()
+                .contains(&result.scope)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(receiver
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .all_verified());
+    }
+
     #[test]
     fn completed_cleanup_is_published_without_join_observer_before_runtime_drop() {
         let supervisor = supervisor();
@@ -1173,7 +1284,7 @@ mod scope_operation_tests {
         let (inserted, insertion) = std::sync::mpsc::sync_channel(0);
         let (release, released) = std::sync::mpsc::sync_channel(0);
         let creation = std::thread::spawn(move || {
-            creator.create_scope_before_publish(|| {
+            creator.create_scope_before_publish(|_| {
                 inserted.send(()).unwrap();
                 released.recv().unwrap();
             })

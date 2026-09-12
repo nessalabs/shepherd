@@ -73,3 +73,9 @@ The in-memory terminate-cancellation test uses Tokio's paused clock: cancellatio
 occurs at 5 ms, before 20 ms grace expiry, then the unchanged liveness assertion
 observes another 50 ms. Wall-clock scheduler delays must not let force escalation
 occur before the cancellation being tested. Real-process tests retain real time.
+
+Verified external scope termination publishes directly to a block's cleanup channel.
+The channel is registered before the scope becomes visible to shutdown; the active
+body and cleanup worker retain it independently of bounded report lookup history.
+A body finishing after that history expires still observes the verified report,
+and its worker preserves that result instead of repeating expired scope lookup.
