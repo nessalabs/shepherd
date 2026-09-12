@@ -117,7 +117,8 @@ impl Process {
 
     /// Records that the process was reaped, storing its terminal exit.
     ///
-    /// Returns `true` if this call transitioned to reaped. Idempotent once reaped.
+    /// Returns `true` on initial reap or a verified correction of unverified evidence.
+    /// Verified terminal evidence is never downgraded.
     pub(crate) fn mark_reaped(&mut self, exit: ProcessExit) -> bool {
         match self.state {
             ProcessLifecycle::ExitedUnreaped
@@ -125,6 +126,15 @@ impl Process {
             | ProcessLifecycle::GracefulRequested
             | ProcessLifecycle::Forcing => {
                 self.state = ProcessLifecycle::Reaped;
+                self.exit = Some(exit);
+                true
+            }
+            ProcessLifecycle::Reaped
+                if self
+                    .exit
+                    .is_some_and(|previous| !previous.outcome.is_verified())
+                    && exit.outcome.is_verified() =>
+            {
                 self.exit = Some(exit);
                 true
             }
@@ -214,6 +224,21 @@ mod tests {
         let mut p = process();
         assert!(p.mark_reaped(exit()));
         assert_eq!(p.state(), ProcessLifecycle::Reaped);
+    }
+
+    #[test]
+    fn verified_reap_can_correct_quarantine_but_never_downgrade() {
+        let mut p = process();
+        let mut failed = exit();
+        failed.outcome = TerminationOutcome::CleanupUnverified(crate::UnverifiedReason::ReapFailed);
+        assert!(p.mark_reaped(failed));
+        assert!(!p.mark_reaped(failed));
+        assert_eq!(p.exit(), Some(failed));
+        assert!(p.mark_reaped(exit()));
+        assert_eq!(p.exit(), Some(exit()));
+        assert!(!p.mark_reaped(failed));
+        assert!(!p.mark_reaped(exit()));
+        assert_eq!(p.exit(), Some(exit()));
     }
 
     #[test]

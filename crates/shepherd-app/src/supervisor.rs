@@ -376,11 +376,16 @@ impl ProcessSupervisor {
     ) -> Result<ProcessExit, TerminateError> {
         // Idempotency: if the process already reached a terminal state (and was possibly
         // pruned from the registry), the recorded exit lives in the waiters.
-        if let Some(exit) = self.inner.waiters.try_get(pid) {
+        if let Some(exit) = self
+            .inner
+            .waiters
+            .try_get(pid)
+            .filter(|exit| exit.outcome.is_verified())
+        {
             return Ok(exit);
         }
 
-        let (scope, spawned, graceful, request_events) = {
+        let (scope, spawned, graceful, request_events, quarantined) = {
             let mut registry = self.lock_registry();
             let scope = registry
                 .scope_of(pid)
@@ -388,19 +393,32 @@ impl ProcessSupervisor {
             let s = registry.get_mut(scope).expect("scope exists");
             let process = s.get(pid).ok_or(TerminateError::UnknownProcess(pid))?;
             if let Some(exit) = process.exit() {
-                return Ok(exit);
+                if exit.outcome.is_verified() {
+                    return Ok(exit);
+                }
             }
+            let quarantined = process.exit().is_some();
             let spawned = Spawned {
                 os: process.os_identity(),
             };
             let graceful = process.spec().graceful_signal;
             let events = s.request_termination(pid)?;
-            (scope, spawned, graceful, events)
+            (scope, spawned, graceful, events, quarantined)
         };
+        if quarantined {
+            return self
+                .retry_quarantined(scope, pid, spawned, graceful, opts)
+                .await;
+        }
         self.inner.dispatcher.dispatch(&request_events).await;
 
         if let Some(exit) = self.inner.waiters.try_get(pid) {
-            return Ok(exit);
+            if exit.outcome.is_verified() {
+                return Ok(exit);
+            }
+            return self
+                .retry_quarantined(scope, pid, spawned, graceful, opts)
+                .await;
         }
 
         // Graceful phase.
@@ -434,6 +452,112 @@ impl ProcessSupervisor {
             },
             None => self.inner.waiters.wait(pid).await,
         };
+        Ok(exit)
+    }
+
+    // A failed monitor has no future verified waiter notification to await. Retry
+    // through the retained backend identity, with at most two fresh wait attempts.
+    async fn retry_quarantined(
+        &self,
+        scope: ProcessScopeId,
+        pid: ProcessId,
+        spawned: Spawned,
+        graceful: Signal,
+        opts: TerminateOptions,
+    ) -> Result<ProcessExit, TerminateError> {
+        let _ = self.inner.backend.signal(&spawned, graceful).await;
+        let mut observation = self.inner.backend.wait(&spawned);
+        let grace = self.inner.clock.sleep(opts.grace.as_duration());
+        tokio::pin!(grace);
+        let observed = tokio::select! {
+            result = &mut observation => Some(result),
+            () = &mut grace => None,
+        };
+        if let Some(Ok(raw)) = observed {
+            return self.record_recovered_exit(scope, pid, raw).await;
+        }
+        if observed.is_some() {
+            // An immediate wait error is not completion and must not skip force.
+            grace.await;
+        }
+        let _ = self.inner.backend.signal(&spawned, Signal::Kill).await;
+        if observed.is_some() {
+            observation = self.inner.backend.wait(&spawned);
+        }
+        let result = match opts.force_timeout {
+            Some(timeout) => tokio::select! {
+                result = observation => Some(result),
+                () = self.inner.clock.sleep(timeout) => None,
+            },
+            None => Some(observation.await),
+        };
+        match result {
+            Some(Ok(raw)) => self.record_recovered_exit(scope, pid, raw).await,
+            other => Ok(ProcessExit {
+                pid,
+                code: None,
+                signal: None,
+                forced: true,
+                outcome: TerminationOutcome::CleanupUnverified(match other {
+                    Some(Err(_)) => UnverifiedReason::ReapFailed,
+                    None => UnverifiedReason::WaitTimedOut {
+                        waited: opts.force_timeout.expect("bounded wait"),
+                    },
+                    Some(Ok(_)) => unreachable!(),
+                }),
+            }),
+        }
+    }
+
+    async fn record_recovered_exit(
+        &self,
+        scope: ProcessScopeId,
+        pid: ProcessId,
+        raw: shepherd_domain::RawExit,
+    ) -> Result<ProcessExit, TerminateError> {
+        let killed = raw.signal == Some(Signal::Kill);
+        let mut exit = ProcessExit {
+            pid,
+            code: raw.code,
+            signal: raw.signal,
+            forced: killed,
+            outcome: if killed {
+                TerminationOutcome::ForcedRequired
+            } else {
+                TerminationOutcome::GracefulSuccess
+            },
+        };
+        let events = {
+            let mut registry = self.lock_registry();
+            let mut events = Vec::new();
+            if let Some(s) = registry.get_mut(scope) {
+                if let Some(previous) = s
+                    .get(pid)
+                    .and_then(|process| process.exit())
+                    .filter(|exit| exit.outcome.is_verified())
+                {
+                    exit = previous;
+                } else if s.get(pid).is_some() {
+                    events = s.record_reaped(pid, exit)?;
+                    if !s.is_open() {
+                        self.inner
+                            .pending_outcomes
+                            .lock()
+                            .expect("pending outcomes mutex")
+                            .entry(scope)
+                            .or_default()
+                            .insert(pid, exit.outcome);
+                    }
+                }
+            }
+            // Publish the correction before cancellation can interrupt dispatch/prune.
+            // The Waiters contract prevents a delayed old failure from downgrading it.
+            self.inner.waiters.signal_exit(pid, exit);
+            events
+                .retain(|event| !matches!(event, shepherd_domain::DomainEvent::ScopeClosed { .. }));
+            events
+        };
+        self.inner.dispatcher.dispatch(&events).await;
         Ok(exit)
     }
 
