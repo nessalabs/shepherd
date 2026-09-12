@@ -1,0 +1,22 @@
+[package]
+name = "shepherd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reusable, production-quality process supervision library."
+
+[dependencies]
+shepherd-domain = { workspace = true }
+shepherd-app = { workspace = true }
+shepherd-infra = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
+async-trait = "0.1"
+shepherd-domain = { workspace = true }
+
+[lints]
+workspace = true

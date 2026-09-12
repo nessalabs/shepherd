@@ -17,7 +17,7 @@ class/state diagrams.
 | Value Object | Immutable, compared by value; carries no identity. |
 | Domain Event | An immutable fact that happened in the domain; emitted at most once logically. |
 | Repository | Collection-style access to aggregates. |
-| Port | A trait the domain owns; implemented by an infrastructure adapter. |
+| Port | A driven trait owned by the application layer (`shepherd-app`); implemented by an infrastructure adapter. Kept out of the pure domain crate so it stays zero-async and zero-dependency. |
 | Adapter / ACL | Infrastructure implementation of a port; translates OS concepts to domain terms. |
 | Application Service | Orchestrates the domain and drives ports; owns async. |
 
@@ -104,6 +104,21 @@ maps to Job Object soft-close / terminate semantics.
 containment strength, and support for CPU / RSS / peak RSS / I/O stats and force
 termination. Guarantees are values, never prose.
 
+### Containment
+**Value Object (enum).** The mechanism enforcing whole-tree cleanup, and thus how strong
+containment is: cgroup v2, Job Object, POSIX process group, or none.
+
+### Support
+**Value Object (enum).** Whether a particular statistic is supported by a backend.
+
+### RawStats
+**Value Object.** A raw resource sample produced by a backend, before the supervisor adds
+identity and uptime to form a `ProcessStats`.
+
+### RawExit
+**Value Object.** Raw exit information reported by a backend after a process is reaped
+(code, terminating signal, core-dump flag).
+
 ### ScopeTerminationReport
 **Value Object.** The aggregated per-process `TerminationOutcome`s produced by
 `terminate_scope`.
@@ -112,6 +127,10 @@ termination. Guarantees are values, never prose.
 **Value Object.** The aggregated result of `shutdown` across all scopes.
 
 ## Domain events
+
+### DomainEvent
+**Domain Event (enum).** The umbrella type of in-process facts returned by aggregate
+transitions and dispatched to same-context handlers.
 
 ### ProcessSpawned
 **Domain Event.** A process was successfully spawned into a scope.
@@ -138,12 +157,9 @@ message bus.
 
 ### EventHandler
 **Port.** Interface for a focused handler that reacts to specific domain events using only
-injected ports (dependency inversion). Concrete handlers: `ReaperHandler`,
-`WaitNotifierHandler`, `RegistryPruneHandler`, `IntegrationTranslator`.
-
-### ReaperHandler
-**Handler.** On `ProcessExited`, reaps the process via `ProcessBackend` and yields
-`ProcessReaped`.
+injected ports (dependency inversion). Concrete handlers: `WaitNotifierHandler`,
+`RegistryPruneHandler`, `IntegrationTranslator`. Wait/reap is owned by the per-spawn
+monitor task, not a handler (see `docs/decisions/0008-monitor-owned-wait.md`).
 
 ### WaitNotifierHandler
 **Handler.** On `ProcessReaped`, wakes pending `wait(pid)` callers via `Waiters`.
@@ -167,7 +183,7 @@ invariants; delivery is bounded and lossy-tolerant.
 **Port (outbound).** Interface for publishing `IntegrationEvent`s to the consuming
 application. A slow/absent publisher never affects Shepherd's internal state.
 
-## Ports (domain-owned traits)
+## Ports (application-owned driven traits)
 
 ### ProcessBackend
 **Port.** The platform abstraction: spawn, sample, terminate, terminate_scope, reap, and
@@ -217,3 +233,10 @@ Domain error for an unknown `ProcessId`.
 
 ### UnknownScope
 Domain error for an unknown `ProcessScopeId`.
+
+### DomainError
+The umbrella pure-domain error enum (scope closed, unknown process/scope, invalid
+transition). Contains no I/O errors.
+
+### InvalidTransition
+A domain error indicating an illegal lifecycle transition was attempted.

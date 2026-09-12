@@ -18,17 +18,17 @@ flowchart TD
     subgraph app["shepherd-app (application)"]
         SUP[ProcessSupervisor<br/>application service]
         SAMP[StatsSampler]
-        REAP[Reaper]
+        MON[per-spawn monitor<br/>wait + reap]
+        PORT[Ports: ProcessBackend / Clock / Waiters / OutputSink / EventHandler / IntegrationEventPublisher]
     end
     subgraph domain["shepherd-domain (PURE)"]
         AGG[ProcessScope&nbsp;«Aggregate Root»]
         ENT[Process&nbsp;«Entity»]
         VO[Value Objects]
         EV[Domain Events]
-        PORT[Ports: ProcessBackend / Clock / OutputSink]
     end
     subgraph infra["shepherd-infra (adapters / ACL)"]
-        LIN[LinuxBackend<br/>cgroups-rs + process-wrap + nix]
+        LIN[UnixProcessBackend<br/>tokio::process + nix<br/>cgroup v2 later]
         WIN[WindowsBackend<br/>Job Object + windows-sys]
         MAC[MacBackend<br/>process group + libproc]
         NUL[NullBackend&nbsp;test fake]
@@ -40,7 +40,7 @@ flowchart TD
     SUP --> AGG
     SUP --> PORT
     SAMP --> PORT
-    REAP --> PORT
+    MON --> PORT
     AGG --> ENT
     AGG --> VO
     AGG --> EV
@@ -53,8 +53,9 @@ flowchart TD
     F --> infra
 ```
 
-> The domain never depends on `app`, `infra`, or any OS crate. Adapters *implement* domain
-> ports; wiring happens only in the facade.
+> The domain never depends on `app`, `infra`, or any OS crate (and has no async). The driven
+> **ports live in `shepherd-app`**; adapters in `shepherd-infra` *implement* them; wiring
+> happens only in the facade.
 
 ---
 
@@ -67,7 +68,6 @@ classDiagram
         -ScopeRegistry registry
         -ProcessBackend backend
         -StatsSampler sampler
-        -Reaper reaper
         +spawn(scope_id, spec) ProcessId
         +stats(pid) ProcessStats
         +processes(scope_id) Vec~ProcessId~
@@ -207,8 +207,9 @@ classDiagram
 Notes:
 - `ProcessScope` is the **consistency boundary**; `Process` is only reachable *through* it
   (composition `*--`). External code holds `ProcessId`, never a `Process`/`Child`.
-- `ProcessBackend`, `Clock`, `OutputSink` are **ports** owned by the domain; the concrete
-  backends (`LinuxBackend`, …) implement them in `shepherd-infra`.
+- `ProcessBackend`, `Clock`, `OutputSink` are **application-owned driven ports** (in
+  `shepherd-app`, not the domain); the concrete backends (`LinuxBackend`, …) implement them in
+  `shepherd-infra`.
 
 ---
 
@@ -286,22 +287,21 @@ sequenceDiagram
     participant S as ProcessSupervisor (app)
     participant A as ProcessScope (aggregate)
     participant B as ProcessBackend (infra)
-    participant R as Reaper
+    participant M as monitor (since spawn)
 
     C->>S: terminate_scope(scope_id, opts)
-    S->>A: request_termination(now)
-    A-->>S: [Command::Graceful(pids), schedule force @ grace]
-    S->>B: terminate_scope(scope, graceful_signal)
+    S->>A: begin_scope_termination + request_termination
+    A-->>S: [TerminationRequested ...]
+    S->>B: signal each live pid (graceful)
     Note over S: await grace period (Clock)
-    S->>B: sample/liveness check
     alt survivors remain
-        S->>B: terminate_scope(scope, SIGKILL / cgroup.kill / TerminateJobObject)
+        S->>B: signal SIGKILL / signal_scope
     end
-    S->>R: await exits
-    R->>B: reap(os) for each
-    B-->>R: RawExit
-    R->>A: record_reaped(pid)
-    A-->>R: [ProcessReaped ...]
+    S->>M: await waiters (monitor already waiting)
+    M->>B: wait(spawned) already in flight
+    B-->>M: RawExit
+    M->>A: record_exit + record_reaped
+    A-->>M: [ProcessExited, ProcessReaped]
     A->>A: close() when all reaped
     S-->>C: ScopeTerminationReport { per-process TerminationOutcome }
 ```
@@ -347,11 +347,6 @@ classDiagram
         <<Port>>
         +handle(event) Result~HandlerError~
     }
-    class ReaperHandler {
-        <<Handler>>
-        -ProcessBackend backend
-        +handle(event) Result
-    }
     class WaitNotifierHandler {
         <<Handler>>
         -Waiters waiters
@@ -378,11 +373,9 @@ classDiagram
     }
 
     EventDispatcher o-- "*" EventHandler
-    ReaperHandler ..|> EventHandler
     WaitNotifierHandler ..|> EventHandler
     RegistryPruneHandler ..|> EventHandler
     IntegrationTranslator ..|> EventHandler
-    ReaperHandler ..> ProcessBackend : depends on port
     WaitNotifierHandler ..> Waiters : depends on port
     RegistryPruneHandler ..> ScopeRegistry : depends on port
     IntegrationTranslator ..> IntegrationEventPublisher : depends on port
@@ -407,20 +400,17 @@ sequenceDiagram
     participant APP as ProcessSupervisor (app)
     participant AGG as ProcessScope (aggregate)
     participant D as EventDispatcher (mediator)
-    participant H1 as ReaperHandler
     participant H2 as WaitNotifierHandler
     participant H3 as RegistryPruneHandler
     participant IT as IntegrationTranslator
     participant PUB as IntegrationEventPublisher
 
-    APP->>AGG: record_exit(pid, raw)
-    AGG-->>APP: [ProcessExited]
+    Note over APP: monitor task already waiting since spawn (ADR 0008)
+    APP->>APP: backend.wait(spawned)
+    APP->>AGG: record_exit + record_reaped
+    AGG-->>APP: [ProcessExited, ProcessReaped]
     Note over APP: transition committed under lock, then lock released
-    APP->>D: dispatch([ProcessExited])
-    D->>H1: handle(ProcessExited)
-    H1->>H1: backend.reap(os) -> [ProcessReaped]
-    H1-->>D: Ok
-    APP->>D: dispatch([ProcessReaped])
+    APP->>D: dispatch([ProcessExited, ProcessReaped])
     D->>H2: handle(ProcessReaped) -> wake wait(pid)
     D->>H3: handle(ProcessReaped) -> prune + release resource
     D->>IT: handle(ProcessReaped)

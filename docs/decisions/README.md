@@ -1,0 +1,21 @@
+# Architecture Decision Records
+
+Lightweight records of implementation choices that are not obvious from the code
+alone. Each file is numbered and named for the decision, not the ticket.
+
+These ADRs cover **this implementation** (the Unix process-group MVP and the
+application/domain wiring). They refine or defer sketches in `docs/DESIGN.md`;
+they do not replace that document.
+
+| ID | Decision |
+| --- | --- |
+| [0001](./0001-application-owned-ports.md) | Driven ports live in `shepherd-app`, not the pure domain |
+| [0002](./0002-drop-hard-kill.md) | Last supervisor handle Drop issues a synchronous hard-kill |
+| [0003](./0003-serialized-scope-process-groups.md) | One process group per scope, created under a per-scope spawn lock |
+| [0004](./0004-reuse-safe-signaling.md) | Signal via pidfd (Linux) / start-time check, never a bare recycled PID |
+| [0005](./0005-unverified-on-wait-failure.md) | A failed `ProcessBackend::wait` is `CleanupUnverified(ReapFailed)` |
+| [0006](./0006-direct-tokio-process-nix.md) | Unix adapter is `tokio::process` + `nix`; `process-wrap` / `cgroups-rs` deferred |
+| [0007](./0007-noop-default-publisher.md) | Default integration publisher is a no-op; broadcast is opt-in |
+| [0008](./0008-monitor-owned-wait.md) | Wait/reap starts at spawn in a monitor task, not a `ReaperHandler` |
+| [0009](./0009-toolchain-and-quality-gates.md) | Edition 2021, MSRV 1.83, TypeScript fitness functions, 100% domain coverage |
+| [0010](./0010-retain-slot-until-wait.md) | Child slot stays until `wait` consumes the exit (late monitor must not `ReapFailed`) |
