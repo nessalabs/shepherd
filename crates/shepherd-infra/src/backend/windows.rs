@@ -444,12 +444,16 @@ mod tests {
             .unwrap();
         bool_result(unsafe { AssignProcessToJobObject(raw(&job), child.as_raw_handle()) }).unwrap();
         assert_eq!(active(&job).unwrap(), 1);
-        resume(child.id()).unwrap();
+        // Keep the root suspended: it cannot exit naturally or run any user code.
+        assert_eq!(
+            unsafe { WaitForSingleObject(child.as_raw_handle(), 20) },
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT
+        );
         drop(job); // no TerminateJobObject: exercise KILL_ON_JOB_CLOSE itself.
         assert_eq!(
             unsafe { WaitForSingleObject(child.as_raw_handle(), 5000) },
             windows_sys::Win32::Foundation::WAIT_OBJECT_0
         );
-        assert!(!child.wait().unwrap().success());
+        let _ = child.wait().unwrap(); // Job close does not promise a nonzero exit code.
     }
 }
