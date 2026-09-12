@@ -18,7 +18,9 @@ use crate::dispatch::{
     EventDispatcher, IntegrationTranslator, RegistryPruneHandler, SharedRegistry,
     WaitNotifierHandler,
 };
-use crate::error::{ShutdownError, SpawnError, StatsError, TerminateError, WaitError};
+use crate::error::{
+    ScopeCreationError, ShutdownError, SpawnError, StatsError, TerminateError, WaitError,
+};
 use crate::ports::{
     Clock, EventHandler, IntegrationEventPublisher, ProcessBackend, Spawned, TerminateOptions,
     Waiters,
@@ -173,15 +175,43 @@ impl ProcessSupervisor {
     }
 
     /// Creates a new, open scope and returns its id.
+    ///
+    /// # Panics
+    /// Panics if shutdown has started. Use [`Self::try_create_scope`] when scope
+    /// creation can race with shutdown or when rejection must be handled.
     pub fn create_scope(&self) -> ProcessScopeId {
-        self.create_scope_before_publish(|| {})
+        self.create_scope_before_publish(|_| {})
+    }
+
+    /// Creates a scope only while this supervisor accepts new work.
+    ///
+    /// # Errors
+    /// Returns [`ScopeCreationError::SupervisorClosed`] once shutdown starts,
+    /// without allocating an id, registry entry, or operation lock.
+    pub fn try_create_scope(&self) -> Result<ProcessScopeId, ScopeCreationError> {
+        self.try_create_scope_before_publish(|_| {})
     }
 
     // The callback lets the concurrency regression pause at the publication boundary.
-    fn create_scope_before_publish(&self, before_publish: impl FnOnce()) -> ProcessScopeId {
+    fn create_scope_before_publish(
+        &self,
+        before_publish: impl FnOnce(ProcessScopeId),
+    ) -> ProcessScopeId {
+        // The fallible helper has released its registry guard before this can panic.
+        self.try_create_scope_before_publish(before_publish)
+            .expect("cannot create a scope after supervisor shutdown starts")
+    }
+
+    fn try_create_scope_before_publish(
+        &self,
+        before_publish: impl FnOnce(ProcessScopeId),
+    ) -> Result<ProcessScopeId, ScopeCreationError> {
         let mut registry = self.lock_registry();
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return Err(ScopeCreationError::SupervisorClosed);
+        }
         let scope = registry.create_scope();
-        before_publish();
+        before_publish(scope);
         // Registry -> operation map is the shared lock order. Do not expose the new
         // scope to shutdown before its serialization lock exists.
         self.inner
@@ -189,7 +219,7 @@ impl ProcessSupervisor {
             .lock()
             .expect("scope operations mutex")
             .insert(scope, Arc::new(tokio::sync::Mutex::new(())));
-        scope
+        Ok(scope)
     }
 
     /// Runtime capabilities of the selected backend.
@@ -983,6 +1013,43 @@ mod scope_operation_tests {
         ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports)
     }
 
+    #[tokio::test]
+    async fn rejected_creation_does_not_allocate_or_poison_shutdown_state() {
+        let supervisor = supervisor();
+        let admitted = supervisor.try_create_scope().unwrap();
+        assert!(supervisor.scope_operation(admitted).is_some());
+        supervisor.shutdown().await.unwrap();
+        // Probe the ID sequence before/after rejection. Only these two probes may
+        // consume IDs; rejected public calls must not advance the sequence.
+        let before = supervisor.lock_registry().next_scope_id();
+        let report_count = supervisor.inner.reports.lock().unwrap().len();
+        for _ in 0..1000 {
+            assert_eq!(
+                supervisor.try_create_scope(),
+                Err(ScopeCreationError::SupervisorClosed)
+            );
+        }
+        assert_eq!(
+            supervisor.try_create_scope_before_publish(|_| panic!("rejection invoked publication")),
+            Err(ScopeCreationError::SupervisorClosed)
+        );
+        let misuse =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| supervisor.create_scope()));
+        assert!(misuse.is_err());
+        let after = supervisor.lock_registry().next_scope_id();
+        assert_eq!(after.get(), before.get() + 1);
+        assert!(supervisor.lock_registry().scope_ids().is_empty());
+        assert!(supervisor.inner.scope_operations.lock().unwrap().is_empty());
+        assert!(supervisor.inner.pending_outcomes.lock().unwrap().is_empty());
+        assert_eq!(supervisor.inner.reports.lock().unwrap().len(), report_count);
+        assert_eq!(
+            supervisor.inner.completed_scopes.lock().unwrap().len(),
+            report_count
+        );
+        // Catching the infallible wrapper's panic must not poison the registry.
+        assert!(supervisor.shutdown().await.unwrap().scopes.is_empty());
+    }
+
     #[test]
     fn shutdown_cannot_observe_scope_before_its_operation_lock_is_published() {
         let supervisor = supervisor();
@@ -990,7 +1057,7 @@ mod scope_operation_tests {
         let (inserted, insertion) = std::sync::mpsc::sync_channel(0);
         let (release, released) = std::sync::mpsc::sync_channel(0);
         let creation = std::thread::spawn(move || {
-            creator.create_scope_before_publish(|| {
+            creator.create_scope_before_publish(|_| {
                 inserted.send(()).unwrap();
                 released.recv().unwrap();
             })
