@@ -79,3 +79,9 @@ A failed root wait retains its backend identity and pidfd for the kill backstop.
 Only a successful reap observation retires that slot; an empty cgroup proves containment,
 not root reap. Unresolved wait failures remain quarantined until backend disposal or a
 successful subsequent wait, without creating additional slots for repeated failures.
+
+A root wait failure quarantines its process-group identity. Further admission is rejected,
+and group signals never use that unverified PGID; hard cleanup still attempts retained
+root identities. The quarantine remains even if a later root wait recovers, because root
+reap does not establish that the old group ID is safe. Cgroup kill remains independently
+available. On targets without a safe retained root identity, this fails closed.
