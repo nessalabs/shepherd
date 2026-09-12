@@ -257,3 +257,8 @@ Application value carrying the closure result or initial spawn error alongside a
 
 ### ScopedProcesses
 Application access handle for a fresh block scope; escaping it does not extend scope lifetime.
+
+- **ObservedProcessIdentity**: an OS PID and optional second-resolution start time, for observation only.
+- **ObservedProcess**: one visible process and its reported parent and display name.
+- **ProcessSnapshot**: a best-effort, non-atomic inventory of visible processes.
+- **ProcessTree**: a selected root and observed descendants in parent-before-child order.

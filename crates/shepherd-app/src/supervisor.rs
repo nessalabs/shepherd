@@ -286,6 +286,16 @@ impl ProcessSupervisor {
             .map(|s| s.live_process_ids())
     }
 
+    /// Returns the OS PID of a retained managed process, for read-only observation.
+    /// Shepherd's ProcessId is a logical ID and must not be passed as an OS PID.
+    /// This lookup is not proof the process is still alive; it may exit immediately.
+    #[must_use]
+    pub fn os_pid(&self, pid: ProcessId) -> Option<u32> {
+        let registry = self.lock_registry();
+        let scope = registry.scope_of(pid)?;
+        Some(registry.get(scope)?.get(pid)?.os_identity().pid)
+    }
+
     /// Spawns a process into `scope`.
     ///
     /// # Errors

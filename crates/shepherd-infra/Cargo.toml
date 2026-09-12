@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Shepherd infrastructure adapters implementing the application ports."
 
 [dependencies]
+sysinfo = { version = "0.33.1", default-features = false, features = ["system"] }
 shepherd-domain = { workspace = true }
 shepherd-app = { workspace = true }
 thiserror = { workspace = true }

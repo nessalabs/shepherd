@@ -20,3 +20,6 @@ mod output;
 
 #[cfg(windows)]
 pub use backend::WindowsJobBackend;
+
+pub mod observation;
+pub use observation::SystemProcessObserver;

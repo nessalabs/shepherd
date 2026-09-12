@@ -35,3 +35,6 @@ pub use process::Process;
 pub use scope::ProcessScope;
 pub use spec::{EnvPolicy, GracePeriod, OutputMode, ProcessSpec, Signal};
 pub use stats::{ProcessState, ProcessStats, RawStats};
+
+mod observation;
+pub use observation::{ObservedProcess, ObservedProcessIdentity, ProcessSnapshot, ProcessTree};
