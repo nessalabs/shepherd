@@ -74,3 +74,8 @@ The in-memory terminate-cancellation test uses Tokio's paused clock: cancellatio
 occurs at 5 ms, before 20 ms grace expiry, then the unchanged liveness assertion
 observes another 50 ms. Wall-clock scheduler delays must not let force escalation
 occur before the cancellation being tested. Real-process tests retain real time.
+
+The cleanup worker publishes its result before disarming its synchronous backstop.
+A separate JoinHandle observer only translates join failures; runtime shutdown after
+worker completion cannot leave the retained report pending. A cross-runtime test
+verifies completed cleanup remains observable without a join observer.

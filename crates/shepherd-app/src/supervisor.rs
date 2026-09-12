@@ -392,18 +392,15 @@ impl ProcessSupervisor {
             if !result.as_ref().is_ok_and(|r| r.all_verified()) {
                 backstop.backend.hard_kill_scope(scope);
             }
-            // A completed worker returns its actual report, even when unverified.
-            // Only interruption/panic publishes the generic Drop-backstop error.
-            backstop.armed = false;
-            result
+            // Publish within this task: the runtime may stop before its observer runs.
+            backstop.complete(result);
         });
         tokio::spawn(async move {
-            let result = cleanup.await.unwrap_or_else(|e| {
-                Err(TerminateError::Signal(format!(
-                    "scope cleanup worker failed: {e}"
-                )))
-            });
-            report_tx.send_replace(Some(result));
+            if let Err(error) = cleanup.await {
+                report_tx.send_replace(Some(Err(TerminateError::Signal(format!(
+                    "scope cleanup worker failed: {error}"
+                )))));
+            }
         });
         let mut processes = Vec::new();
         let mut spawn_error = None;
@@ -1111,6 +1108,13 @@ struct ScopeCleanupBackstop {
     report: ScopeCleanupSender,
     armed: bool,
 }
+impl ScopeCleanupBackstop {
+    fn complete(&mut self, result: Result<ScopeTerminationReport, TerminateError>) {
+        // No suspension point may separate result publication from disarming.
+        self.report.send_replace(Some(result));
+        self.armed = false;
+    }
+}
 impl Drop for ScopeCleanupBackstop {
     fn drop(&mut self) {
         if self.armed {
@@ -1421,6 +1425,55 @@ mod scope_operation_tests {
     fn supervisor() -> ProcessSupervisor {
         let ports = Arc::new(EmptyPorts);
         ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports)
+    }
+
+    #[test]
+    fn completed_cleanup_is_observable_after_runtime_drop_without_join_observer() {
+        let supervisor = supervisor();
+        let scope = supervisor.create_scope();
+        let (sender, _) = tokio::sync::watch::channel(None);
+        supervisor
+            .inner
+            .scope_results
+            .lock()
+            .unwrap()
+            .insert(scope, sender.clone());
+        let worker = supervisor.worker();
+        let mut backstop = ScopeCleanupBackstop {
+            backend: supervisor.inner.backend.clone(),
+            scope,
+            report: sender,
+            armed: true,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Run the worker completion operation without ever scheduling a join observer.
+        runtime.block_on(async move {
+            tokio::spawn(async move {
+                let result = worker.terminate_scope(scope, Default::default()).await;
+                backstop.complete(result);
+            })
+            .await
+            .unwrap();
+        });
+        drop(runtime);
+        let next = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = next.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                supervisor.wait_scope_cleanup(scope),
+            )
+            .await
+            .expect("worker completed without publishing its result")
+            .unwrap()
+        });
+        assert_eq!(report.scope, scope);
+        assert!(report.all_verified());
     }
 
     #[tokio::test]
