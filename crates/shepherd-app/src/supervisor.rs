@@ -1520,6 +1520,20 @@ mod scope_operation_tests {
             &sender,
             Err(TerminateError::Signal("worker panicked".into())),
         );
+        let mut completed = ScopeCleanupBackstop {
+            backend: supervisor.inner.backend.clone(),
+            scope,
+            report: sender.clone(),
+            armed: true,
+        };
+        completed.complete(Err(TerminateError::UnknownScope(scope)));
+        drop(completed);
+        drop(ScopeCleanupBackstop {
+            backend: supervisor.inner.backend.clone(),
+            scope,
+            report: sender.clone(),
+            armed: true,
+        });
         assert!(receiver
             .borrow()
             .as_ref()
@@ -1540,6 +1554,14 @@ mod scope_operation_tests {
                     .await
                     .unwrap();
                 assert!(report.all_verified());
+                let receiver = external
+                    .inner
+                    .scope_results
+                    .lock()
+                    .unwrap()
+                    .get(&scope.id())
+                    .unwrap()
+                    .subscribe();
                 for _ in 0..650 {
                     let old = external.create_scope();
                     external
@@ -1553,31 +1575,21 @@ mod scope_operation_tests {
                     .lock()
                     .unwrap()
                     .contains_key(&scope.id()));
-                // Match F's global history eviction as well: both active participants
-                // must use their own channel, independently of lookup retention.
-                let receiver = external
+                assert!(!external
                     .inner
                     .scope_results
                     .lock()
                     .unwrap()
-                    .remove(&scope.id())
-                    .unwrap()
-                    .subscribe();
+                    .contains_key(&scope.id()));
                 (42, receiver)
             })
             .await;
         let (value, receiver) = result.result.unwrap();
         assert_eq!(value, 42);
         assert!(result.termination.unwrap().all_verified());
-        // Wait for the worker's history update, proving it also retained success.
+        // The worker owns Inner until it finishes; no lookup entry remains to help it.
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !supervisor
-                .inner
-                .completed_scope_results
-                .lock()
-                .unwrap()
-                .contains(&result.scope)
-            {
+            while Arc::strong_count(&supervisor.inner) != 1 {
                 tokio::task::yield_now().await;
             }
         })
