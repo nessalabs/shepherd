@@ -1,6 +1,6 @@
 //! The `ProcessSupervisor` application service.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -73,6 +73,7 @@ impl Clone for ProcessSupervisor {
 struct CleanupGuard {
     backend: Arc<dyn ProcessBackend>,
     shutting_down: Arc<AtomicBool>,
+    owners_dropped: Arc<AtomicBool>,
 }
 
 impl Drop for CleanupGuard {
@@ -82,6 +83,7 @@ impl Drop for CleanupGuard {
                 "ProcessSupervisor dropped without shutdown; issuing unverified hard-kill"
             );
         }
+        self.owners_dropped.store(true, Ordering::SeqCst);
         self.shutting_down.store(true, Ordering::SeqCst);
         self.backend.hard_kill_all();
     }
@@ -95,6 +97,7 @@ struct Inner {
     dispatcher: EventDispatcher,
     spawn_times: Mutex<HashMap<ProcessId, Instant>>,
     shutting_down: Arc<AtomicBool>,
+    owners_dropped: Arc<AtomicBool>,
     scope_operations: Mutex<HashMap<ProcessScopeId, Arc<tokio::sync::Mutex<()>>>>,
     samples: Mutex<HashMap<ProcessId, Result<ProcessStats, StatsError>>>,
     sampler_started: AtomicBool,
@@ -135,6 +138,7 @@ impl ProcessSupervisor {
     ) -> Self {
         let registry: SharedRegistry = Arc::new(Mutex::new(ScopeRegistry::new()));
         let shutting_down = Arc::new(AtomicBool::new(false));
+        let owners_dropped = Arc::new(AtomicBool::new(false));
         let handlers: Vec<Arc<dyn EventHandler>> = vec![
             Arc::new(WaitNotifierHandler::new(waiters.clone())),
             Arc::new(RegistryPruneHandler::new(registry.clone())),
@@ -155,10 +159,12 @@ impl ProcessSupervisor {
                 scope_results: Mutex::new(HashMap::new()),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
                 shutting_down: Arc::clone(&shutting_down),
+                owners_dropped: Arc::clone(&owners_dropped),
             }),
             cleanup: Some(Arc::new(CleanupGuard {
                 backend,
                 shutting_down,
+                owners_dropped,
             })),
         }
     }
@@ -235,7 +241,9 @@ impl ProcessSupervisor {
         }
 
         let spawned = self.inner.backend.spawn(scope, &spec).await?;
-        if self.inner.shutting_down.load(Ordering::SeqCst) {
+        // Ordinary shutdown waits on this operation lock and cleans an admitted spawn
+        // through its scope. Only last-owner Drop requires a synchronous late-spawn sweep.
+        if self.inner.owners_dropped.load(Ordering::SeqCst) {
             self.inner.backend.hard_kill_all();
             self.kill_orphan(&spawned).await;
             return Err(SpawnError::ScopeClosed(scope));
@@ -349,6 +357,7 @@ impl ProcessSupervisor {
             Some(error) => Err(error),
             None => Ok(body(ScopedProcesses {
                 scope,
+                owned: Mutex::new(processes.iter().copied().collect()),
                 processes,
                 supervisor: self.worker(),
             })
@@ -766,6 +775,7 @@ pub struct WithScopeResult<T> {
 pub struct ScopedProcesses {
     scope: ProcessScopeId,
     processes: Vec<ProcessId>,
+    owned: Mutex<HashSet<ProcessId>>,
     supervisor: ProcessSupervisor,
 }
 impl ScopedProcesses {
@@ -776,20 +786,33 @@ impl ScopedProcesses {
         &self.processes
     }
     pub async fn spawn(&self, spec: ProcessSpec) -> Result<ProcessId, SpawnError> {
-        self.supervisor.spawn(self.scope, spec).await
+        let pid = self.supervisor.spawn(self.scope, spec).await?;
+        self.owned
+            .lock()
+            .expect("scoped processes mutex")
+            .insert(pid);
+        Ok(pid)
     }
     pub async fn wait(&self, pid: ProcessId) -> Result<ProcessExit, WaitError> {
-        if self
-            .supervisor
-            .lock_registry()
-            .scope_of(pid)
-            .is_some_and(|s| s != self.scope)
+        if !self
+            .owned
+            .lock()
+            .expect("scoped processes mutex")
+            .contains(&pid)
         {
             return Err(WaitError::UnknownProcess(pid));
         }
         self.supervisor.wait(pid).await
     }
     pub fn take_output(&self, pid: ProcessId) -> Option<crate::output::ProcessOutput> {
+        if !self
+            .owned
+            .lock()
+            .expect("scoped processes mutex")
+            .contains(&pid)
+        {
+            return None;
+        }
         self.supervisor.take_output(pid)
     }
 }

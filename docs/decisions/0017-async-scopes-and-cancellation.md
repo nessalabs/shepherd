@@ -31,14 +31,23 @@ caller that discarded its future; the retained report is the observation path.
 Spawns run in owned application workers so cancellation cannot interrupt the
 backend-spawn-to-monitor ownership handoff. Scope operations serialize cleanup
 against an admitted spawn; the guard worker waits for any such spawn to complete.
-Last supervisor Drop sets shutdown intent and hard-kills synchronously. Internal
+Ordinary shutdown closes admission, then waits for already admitted spawns to attach
+and enter their scope's normal graceful termination and descendant sweep. A late
+spawn must not hard-kill unrelated scopes while they are still owed grace. Last
+supervisor Drop has a separate ownership flag: it hard-kills synchronously, and a
+spawn completing after that Drop repeats the sweep and reaps its root. Internal
 workers never retain its CleanupGuard. This is distinct from dropping terminate(),
 which merely stops driving that invocation and does not issue a Drop kill.
 
 Nested blocks create independent sibling scopes. Inner completion does not end the
 outer scope. Canceling a future awaiting a nested block drops both guards, and each
 scope cleans independently. Escaping a ScopedProcesses value does not extend the
-scope lifetime; subsequent spawn is rejected after block cleanup.
+scope lifetime; subsequent spawn is rejected after block cleanup. Scoped wait and
+output access accept only process IDs returned in that block's initial process list
+or by its scoped spawn method. The handle retains these IDs through process reap,
+so completed local output remains accessible and completed sibling IDs cannot
+bypass the scope boundary after registry pruning. The initial process list remains
+a snapshot; dynamic spawns are tracked separately for observation access.
 
 Verified cancellation requires a running runtime and cooperative backend ports.
 Abrupt runtime/process shutdown cannot await or return verified cleanup; OS limits
