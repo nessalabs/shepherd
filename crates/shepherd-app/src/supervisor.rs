@@ -882,6 +882,7 @@ impl ProcessSupervisor {
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|_| Err(WaitError::Backend("waiter panicked".into())));
+            let verified_reap = wait_result.is_ok();
             let events = {
                 let mut registry = inner.registry.lock().expect("registry mutex");
                 let Some(s) = registry.get_mut(scope) else {
@@ -932,7 +933,7 @@ impl ProcessSupervisor {
             };
             inner.samples.lock().expect("samples mutex").remove(&pid);
             inner.dispatcher.dispatch(&events).await;
-            {
+            if verified_reap {
                 let mut completed = inner.completed.lock().expect("completed mutex");
                 completed.push_back(pid);
                 while completed.len() > 256 {

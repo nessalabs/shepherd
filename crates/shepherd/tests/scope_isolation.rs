@@ -1,5 +1,5 @@
 //! Deterministic regressions for shutdown admission and scoped observation boundaries.
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -34,6 +34,7 @@ struct GatedBackend {
     release: Notify,
     reaped: Notify,
     global_kills: AtomicUsize,
+    fail_cleanup: AtomicBool,
     descendant: Mutex<Option<Spawned>>,
 }
 #[async_trait]
@@ -64,6 +65,12 @@ impl ProcessBackend for GatedBackend {
         signal: Signal,
     ) -> Result<(), TerminateError> {
         self.inner.signal_scope(scope, signal).await
+    }
+    async fn cleanup_scope(&self, scope: ProcessScopeId) -> Result<(), TerminateError> {
+        if self.fail_cleanup.swap(false, Ordering::SeqCst) {
+            return Err(TerminateError::Signal("injected cleanup failure".into()));
+        }
+        self.inner.cleanup_scope(scope).await
     }
     async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
         let exit = self.inner.wait(target).await;
@@ -185,4 +192,71 @@ async fn scoped_observers_reject_live_and_completed_siblings_but_keep_dynamic_ou
     assert!(supervisor.take_output(live).is_some());
     assert!(supervisor.take_output(completed).is_some());
     supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn verified_scope_report_history_is_bounded_without_losing_pending_or_failed_cleanup() {
+    let backend = Arc::new(GatedBackend::default());
+    let supervisor = SupervisorBuilder::new().backend(backend.clone()).build();
+    backend.fail_cleanup.store(true, Ordering::SeqCst);
+    let failed = supervisor.with_scope(vec![], |_| async {}).await;
+    assert!(failed.termination.is_err());
+
+    let owner = supervisor.clone();
+    let (started, scope_id) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let pending = tokio::spawn(async move {
+        owner
+            .with_scope(vec![], |scope| async move {
+                started.send(scope.id()).unwrap();
+                released.await.unwrap();
+            })
+            .await
+    });
+    let pending_scope = scope_id.await.unwrap();
+    let mut observer = Box::pin(supervisor.wait_scope_cleanup(pending_scope));
+    // Register before completion and keep this observer unpolled until after eviction.
+    tokio::select! { biased;
+        result = &mut observer => panic!("pending cleanup resolved early: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    let mut first = None;
+    for _ in 0..650 {
+        let report = supervisor.with_scope(vec![], |_| async {}).await;
+        assert!(report.termination.unwrap().all_verified());
+        first.get_or_insert(report.scope);
+    }
+    assert!(matches!(
+        supervisor.wait_scope_cleanup(first.unwrap()).await,
+        Err(TerminateError::UnknownScope(_))
+    ));
+    assert!(matches!(
+        supervisor.wait_scope_cleanup(failed.scope).await,
+        Err(TerminateError::Signal(message)) if message == "injected cleanup failure"
+    ));
+    // A new lookup must still find the pending report after hundreds of completions.
+    let mut pending_lookup = Box::pin(supervisor.wait_scope_cleanup(pending_scope));
+    tokio::select! { biased;
+        result = &mut pending_lookup => panic!("pending cleanup was lost: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    drop(pending_lookup);
+    release.send(()).unwrap();
+    assert!(pending.await.unwrap().termination.unwrap().all_verified());
+    for _ in 0..257 {
+        assert!(supervisor
+            .with_scope(vec![], |_| async {})
+            .await
+            .termination
+            .unwrap()
+            .all_verified());
+    }
+    assert!(matches!(
+        supervisor.wait_scope_cleanup(pending_scope).await,
+        Err(TerminateError::UnknownScope(_))
+    ));
+    assert!(
+        observer.await.unwrap().all_verified(),
+        "registered receiver lost its completed result"
+    );
 }
