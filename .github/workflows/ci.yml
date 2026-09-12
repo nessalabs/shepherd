@@ -58,7 +58,7 @@ jobs:
         run: cargo llvm-cov -p shepherd-domain --fail-under-lines 100
 
   test:
-    name: test (${{ matrix.os }})
+    name: contract + real platform backends + docs (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -106,3 +106,56 @@ jobs:
           backstop_bin=$(python3 -c 'import json; rows=[json.loads(line) for line in open("cgroup-backstop-artifacts.json")]; print(next(r["executable"] for r in rows if r.get("target", {}).get("name") == "shepherd_infra" and r.get("executable")))')
           test -n "$backstop_bin"
           sudo env SHEPHERD_CGROUP_ROOT=/sys/fs/cgroup/shepherd-ci "$backstop_bin" cgroup_backstop_tests --ignored --test-threads=1 --nocapture
+
+  resource:
+    name: cached stats + real resource observations (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p shepherd-fixtures --test resource_integration -- --nocapture
+
+  output-stress:
+    name: binary output + bounded overflow + flood termination (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p shepherd-fixtures --test output_integration -- --nocapture
+
+  properties-concurrency:
+    name: generated invariants + registry and waiter interleavings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p shepherd --test properties --test adversarial --test scoped
+      - run: cargo test -p shepherd-app --lib loom_
+      - name: Model the actual waiter registration/publication lock
+        env:
+          RUSTFLAGS: --cfg shepherd_loom
+        run: cargo test -p shepherd-infra --lib loom_
+
+  leak-inspection:
+    name: in-process FD or handle counts + owned zombie inspection (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p shepherd-fixtures --test leak_stress -- --nocapture

@@ -111,6 +111,13 @@ impl ProcessScope {
         if !self.state.accepts_processes() {
             return Err(DomainError::ScopeClosed(self.id));
         }
+        if self.processes.contains_key(&pid) {
+            return Err(crate::InvalidTransition {
+                from: "owned",
+                event: "attach duplicate process",
+            }
+            .into());
+        }
         self.processes.insert(pid, Process::running(pid, os, spec));
         Ok(DomainEvent::ProcessSpawned {
             scope: self.id,
@@ -204,7 +211,13 @@ impl ProcessScope {
         let mut events = Vec::new();
         if process.mark_reaped(exit) {
             events.push(DomainEvent::ProcessReaped { scope, pid, exit });
-            if matches!(self.state, ScopeState::Draining) && !self.has_live_processes() {
+            if matches!(self.state, ScopeState::Draining)
+                && !self.has_live_processes()
+                && self
+                    .processes
+                    .values()
+                    .all(|p| p.exit().is_some_and(|e| e.outcome.is_verified()))
+            {
                 self.state = ScopeState::Closed;
                 events.push(DomainEvent::ScopeClosed { scope });
             }
@@ -215,11 +228,9 @@ impl ProcessScope {
     /// Removes a reaped process from bookkeeping (invariant #9). Callers prune only after
     /// the terminal outcome has been observed/delivered.
     pub fn prune(&mut self, pid: ProcessId) {
-        if self
-            .processes
-            .get(&pid)
-            .is_some_and(|p| p.state().is_terminal())
-        {
+        if self.processes.get(&pid).is_some_and(|p| {
+            p.state().is_terminal() && p.exit().is_some_and(|e| e.outcome.is_verified())
+        }) {
             self.processes.remove(&pid);
         }
     }
@@ -475,5 +486,52 @@ mod tests {
                 .unwrap_err(),
             DomainError::ScopeClosed(scope.id())
         );
+    }
+}
+
+#[cfg(test)]
+mod adversarial_tests {
+    use super::*;
+    use crate::{ReuseToken, TerminationOutcome, UnverifiedReason};
+    #[test]
+    fn duplicate_attachment_cannot_replace_a_live_process() {
+        let mut scope = ProcessScope::new(ProcessScopeId::new(1));
+        let pid = ProcessId::new(1);
+        let os = OsIdentity::new(1, ReuseToken::StartTime(1));
+        scope
+            .attach_spawned(pid, os, ProcessSpec::new("original"))
+            .unwrap();
+        assert!(scope
+            .attach_spawned(pid, os, ProcessSpec::new("replacement"))
+            .is_err());
+        assert_eq!(scope.get(pid).unwrap().spec().program, "original");
+    }
+    #[test]
+    fn unverified_exit_is_quarantined_not_pruned_or_closed() {
+        let mut scope = ProcessScope::new(ProcessScopeId::new(1));
+        let pid = ProcessId::new(1);
+        scope
+            .attach_spawned(
+                pid,
+                OsIdentity::new(1, ReuseToken::Unavailable),
+                ProcessSpec::new("owned"),
+            )
+            .unwrap();
+        scope.begin_scope_termination();
+        scope
+            .record_reaped(
+                pid,
+                ProcessExit {
+                    pid,
+                    code: None,
+                    signal: None,
+                    forced: false,
+                    outcome: TerminationOutcome::CleanupUnverified(UnverifiedReason::ReapFailed),
+                },
+            )
+            .unwrap();
+        scope.prune(pid);
+        assert!(scope.contains(pid));
+        assert!(!scope.is_closed());
     }
 }

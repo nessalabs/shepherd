@@ -10,3 +10,10 @@ pub use unix::UnixProcessBackend;
 
 #[cfg(target_os = "linux")]
 mod cgroup;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::WindowsJobBackend;
+#[cfg(any(unix, windows))]
+mod sampling;

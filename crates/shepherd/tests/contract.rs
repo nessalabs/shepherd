@@ -199,6 +199,10 @@ impl ProcessBackend for WaitFailsBackend {
         }
     }
 
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.inner.hard_kill_scope(scope);
+    }
+
     fn hard_kill_all(&self) {
         self.inner.hard_kill_all();
     }
@@ -301,6 +305,9 @@ impl ProcessBackend for CleanupFailsBackend {
     }
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
+    }
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.inner.hard_kill_scope(scope);
     }
     fn hard_kill_all(&self) {
         self.inner.hard_kill_all();

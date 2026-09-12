@@ -71,6 +71,11 @@ pub trait ProcessBackend: Send + Sync {
     /// Samples current resource usage.
     async fn sample(&self, target: &Spawned) -> Result<RawStats, StatsError>;
 
+    /// Returns a cloneable output observer when capture was requested.
+    fn output(&self, _target: &Spawned) -> Option<crate::output::ProcessOutput> {
+        None
+    }
+
     /// The runtime-detected guarantees of this backend.
     fn capabilities(&self) -> Capabilities;
 
@@ -80,6 +85,9 @@ pub trait ProcessBackend: Send + Sync {
     /// `shutdown` was not awaited. Must not block or `.await`. Idempotent: a second call, or
     /// a call after an explicit shutdown, is a no-op.
     fn hard_kill_all(&self);
+
+    /// Synchronous scope-only backstop for interrupted cleanup workers.
+    fn hard_kill_scope(&self, scope: ProcessScopeId);
 }
 
 /// Time source, so grace periods and uptime are deterministic in tests.

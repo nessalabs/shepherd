@@ -28,7 +28,7 @@ pub enum SpawnError {
 }
 
 /// Error terminating a process or scope.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum TerminateError {
     /// The referenced process is unknown.
     #[error("unknown process {0}")]
@@ -45,8 +45,11 @@ pub enum TerminateError {
 }
 
 /// Error collecting statistics.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum StatsError {
+    /// The sampler has not completed its first observation.
+    #[error("no sample available yet for process {0}")]
+    NotReady(ProcessId),
     /// The referenced process is unknown or no longer live.
     #[error("unknown or exited process {0}")]
     UnknownProcess(ProcessId),

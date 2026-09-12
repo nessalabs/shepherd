@@ -1,0 +1,56 @@
+# 0013 — Shared interval sampler and cached per-root observations
+
+Accepted. One lazily started coordinator polls concurrent ProcessBackend sampling
+futures. Each live root has at most one in-flight observation, with no per-root
+task or thread and no backlog of missed intervals. A shared interval ticker skips
+missed ticks, discovers new roots independently of pending observations, and
+starts eligible roots at most once per tick. Completed observations publish
+independently, so a stalled root cannot delay healthy roots or new arrivals.
+Reaped roots have their pending observations cancelled on the next tick. The
+coordinator retains only a Weak reference between scheduling/publication steps;
+it never owns a CleanupGuard. Construction outside a runtime remains valid.
+Successful shutdown aborts and joins the coordinator, cancelling pending sample
+futures and its timer immediately even while the supervisor is retained. Failed
+cleanup leaves sampling active until a later successful shutdown. The join handle
+remains in supervisor state until joining finishes, so cancelling shutdown during
+that join cannot let a retry report success before sampler destruction completes.
+`SupervisorBuilder::stats_interval` defaults to one second and clamps zero to 1 ms.
+
+`stats(pid)` reads the cache only. `NotReady` distinguishes the initial interval
+from unknown/exited processes. Sampling failures are cached StatsError values and
+never relinquish process ownership. Each sample call has a one-second timeout;
+a slow sampler cannot block cleanup or other observations. Panics are isolated
+as sampling errors. Backends must yield during asynchronous work: neither timeouts
+nor concurrency can preempt a synchronously blocking poll. Uptime is the sample-time uptime, making
+staleness observable. No fresh-read API is added yet.
+
+CPU is a fraction of one core, not a percentage of the machine: 1.0 is one core.
+Linux uses deltas of /proc stat user+system ticks and monotonic elapsed time;
+the first observation establishes a baseline. RSS/peak/virtual memory use status,
+I/O uses read_bytes/write_bytes in /proc io. These are per-root observations even
+under cgroups; descendant_count is None. Missing OS data produces an error.
+Unsupported platforms continue to report Unsupported rather than invented usage.
+
+The registry is checked again before publishing a completed sample. Reaping drops
+cache entries and CPU baselines. Hundreds of roots share a task, not OS threads.
+
+The cache contract test runs on every CI platform, including Windows with this
+phase's NullBackend fallback. It verifies caching and post-exit invalidation,
+without claiming real Windows resource measurements. Real CPU/RSS observations
+are tested on Unix and real I/O counters on Linux in this phase.
+
+Native Unix and Windows observations run on Tokio's blocking pool, outside the coordinator.
+Each backend admits at most sixteen native reads, and each owned root permits
+only one queued or running read. Both admission permits move into the blocking
+closure: an async timeout cancels waiting, not the OS syscall, and cannot cause
+repeated submissions for a still-running root. Queued cancellation releases its
+root permit. Saturating all native slots delays observations but never blocks
+async runtime progress; native calls cannot be forcibly preempted. Identity and
+accounting checks remain on both sides of the observation, and no backend state
+lock spans filesystem reads.
+
+Successful supervisor shutdown joins the async coordinator, not outstanding native
+reads. Up to sixteen such calls per backend may outlive that shutdown or a sample
+timeout; their closures retain backend state (and exact Windows process handles)
+until returning. They are not detached per-root OS threads, but bounded work on
+Tokio's blocking pool; the host runtime's blocking-task shutdown rules still apply.
