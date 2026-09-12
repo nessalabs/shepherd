@@ -13,7 +13,7 @@ its newest bytes. A zero-capacity queue still drains and counts discarded bytes.
 The optional tail has its own byte cap and survives consuming reads.
 
 ProcessSupervisor::take_output transfers the observer once. Unclaimed observers
-are retained for only the most recent 256 verified completed processes, bounding aggregate
+are retained for only the most recent 256 unclaimed captures from verified completed processes, bounding aggregate
 post-mortem retention. Eviction precedes event publication so a stalled external
 publisher cannot defer that bound. Live outputs, unverified reap outputs, and transferred observer lifetimes are unaffected. ProcessOutput clones
 share queue consumption. read() returns queued chunks, the current tail, cumulative
@@ -34,3 +34,7 @@ is observable separately from the verified process termination outcome.
 Tests cover exact binary bytes, both stream tags, partial/oversized/zero-capacity
 queue overflow, capped tails, failing readers, non-consuming callers, output floods,
 discard and termination during flood.
+
+Discarded output and captures claimed before or after completion consume no history
+slots. Claim and completion serialize the output map and FIFO together so observer
+transfer cannot leave stale IDs that prematurely evict unrelated captures.
