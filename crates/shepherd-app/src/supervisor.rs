@@ -162,7 +162,10 @@ impl ProcessSupervisor {
         let registry: SharedRegistry = Arc::new(Mutex::new(ScopeRegistry::new()));
         let shutting_down = Arc::new(AtomicBool::new(false));
         let handlers: Vec<Arc<dyn EventHandler>> = vec![
-            Arc::new(WaitNotifierHandler::new(waiters.clone())),
+            Arc::new(WaitNotifierHandler::with_registry(
+                waiters.clone(),
+                registry.clone(),
+            )),
             Arc::new(RegistryPruneHandler::new(registry.clone())),
             Arc::new(IntegrationTranslator::new(publisher)),
         ];
