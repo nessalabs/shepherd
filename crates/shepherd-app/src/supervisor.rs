@@ -109,6 +109,7 @@ struct Inner {
     scope_results: Mutex<HashMap<ProcessScopeId, ScopeCleanupSender>>,
     completed_scope_results: Mutex<VecDeque<ProcessScopeId>>,
     completed: Mutex<VecDeque<ProcessId>>,
+    sampler_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stats_interval: Duration,
     reports: Mutex<HashMap<ProcessScopeId, ScopeTerminationReport>>,
     pending_outcomes: Mutex<HashMap<ProcessScopeId, HashMap<ProcessId, TerminationOutcome>>>,
@@ -169,6 +170,7 @@ impl ProcessSupervisor {
                 scope_results: Mutex::new(HashMap::new()),
                 completed_scope_results: Mutex::new(VecDeque::new()),
                 completed: Mutex::new(VecDeque::new()),
+                sampler_task: Mutex::new(None),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
                 reports: Mutex::new(HashMap::new()),
                 pending_outcomes: Mutex::new(HashMap::new()),
@@ -535,7 +537,7 @@ impl ProcessSupervisor {
         }
         let weak = Arc::downgrade(&self.inner);
         let interval = self.inner.stats_interval;
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut pending = FuturesUnordered::new();
@@ -605,6 +607,7 @@ impl ProcessSupervisor {
                 }
             }
         });
+        *self.inner.sampler_task.lock().expect("sampler task mutex") = Some(task);
     }
 
     /// Waits for a process to reach its reaped terminal state.
@@ -872,6 +875,19 @@ impl ProcessSupervisor {
         }
         if unverified > 0 {
             return Err(ShutdownError::Unverified(unverified));
+        }
+        // No future spawn can be admitted, and admitted spawns registered their sampler
+        // before releasing the scope operation lock. Stop and join the coordinator now,
+        // even if its interval is long and the user retains the supervisor indefinitely.
+        let sampler = self
+            .inner
+            .sampler_task
+            .lock()
+            .expect("sampler task mutex")
+            .take();
+        if let Some(sampler) = sampler {
+            sampler.abort();
+            let _ = sampler.await;
         }
         Ok(ShutdownReport { scopes: reports })
     }
@@ -1254,5 +1270,114 @@ mod scope_operation_tests {
         assert!(supervisor.scope_operation(scope).is_none());
         assert!(matches!(spawn.await, Err(SpawnError::ScopeClosed(id)) if id == scope));
         assert!(supervisor.scope_operation(scope).is_none());
+    }
+}
+
+#[cfg(test)]
+mod sampler_shutdown_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    struct Ports {
+        fail_cleanup: AtomicBool,
+    }
+    #[async_trait]
+    impl ProcessBackend for Ports {
+        async fn spawn(&self, _: ProcessScopeId, _: &ProcessSpec) -> Result<Spawned, SpawnError> {
+            unreachable!()
+        }
+        async fn signal(&self, _: &Spawned, _: Signal) -> Result<(), TerminateError> {
+            unreachable!()
+        }
+        async fn signal_scope(&self, _: ProcessScopeId, _: Signal) -> Result<(), TerminateError> {
+            if self.fail_cleanup.load(Ordering::SeqCst) {
+                Err(TerminateError::Signal("injected cleanup failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn wait(&self, _: &Spawned) -> Result<shepherd_domain::RawExit, WaitError> {
+            unreachable!()
+        }
+        async fn sample(&self, _: &Spawned) -> Result<shepherd_domain::RawStats, StatsError> {
+            unreachable!()
+        }
+        fn capabilities(&self) -> shepherd_domain::Capabilities {
+            unreachable!()
+        }
+        fn hard_kill_all(&self) {}
+    }
+    #[async_trait]
+    impl Clock for Ports {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+        async fn sleep(&self, duration: Duration) {
+            tokio::time::sleep(duration).await;
+        }
+    }
+    impl Waiters for Ports {
+        fn signal_exit(&self, _: ProcessId, _: ProcessExit) {
+            unreachable!()
+        }
+        fn try_get(&self, _: ProcessId) -> Option<ProcessExit> {
+            unreachable!()
+        }
+        fn wait(&self, _: ProcessId) -> crate::ports::WaitFuture {
+            unreachable!()
+        }
+    }
+    #[async_trait]
+    impl IntegrationEventPublisher for Ports {
+        async fn publish(&self, _: shepherd_domain::IntegrationEvent) {}
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_shutdown_joins_sampler_but_failed_cleanup_keeps_it_running() {
+        let ports = Arc::new(Ports {
+            fail_cleanup: AtomicBool::new(true),
+        });
+        let sup = ProcessSupervisor::with_stats_interval(
+            ports.clone(),
+            ports.clone(),
+            ports.clone(),
+            ports.clone(),
+            Duration::from_secs(3600),
+        );
+        sup.create_scope();
+        // Start the same coordinator that spawn starts, with no roots to distract from
+        // the idle-timer bug. Observe the task itself, not whether sample() was called.
+        sup.start_sampler();
+        let sampler = sup
+            .inner
+            .sampler_task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        tokio::task::yield_now().await;
+        assert!(!sampler.is_finished());
+        assert!(matches!(
+            sup.shutdown().await,
+            Err(ShutdownError::Unverified(1))
+        ));
+        assert!(!sampler.is_finished(), "failed cleanup stopped observation");
+        ports.fail_cleanup.store(false, Ordering::SeqCst);
+        let before = tokio::time::Instant::now();
+        sup.shutdown().await.unwrap();
+        assert!(
+            sampler.is_finished(),
+            "successful shutdown left the coordinator alive"
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before,
+            "shutdown waited for a sampler tick"
+        );
+        // A retained supervisor and repeated shutdown must not restart its timer.
+        tokio::time::advance(Duration::from_secs(7200)).await;
+        sup.shutdown().await.unwrap();
+        assert!(sampler.is_finished());
     }
 }
