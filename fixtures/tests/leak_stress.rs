@@ -172,6 +172,22 @@ async fn cycle(sup: &shepherd::ProcessSupervisor, kind: usize) {
     drain(output).await;
 }
 async fn run(iterations: usize, seed: u64) {
+    // Warm the whole bounded blocking pool concurrently, not just four short reads
+    // that may all finish on one worker. Keep these runtime-owned threads alive for
+    // the measurement so lazy pool growth/retirement cannot change the baseline.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let barrier = barrier.clone();
+        workers.push(tokio::task::spawn_blocking(move || {
+            barrier.wait();
+        }));
+    }
+    barrier.wait();
+    for worker in workers {
+        worker.await.unwrap();
+    }
+
     let sup = SupervisorBuilder::new()
         .stats_interval(Duration::from_millis(10))
         .build();
@@ -270,6 +286,8 @@ fn exercise(iterations: usize) {
             builder
         };
         builder
+            .max_blocking_threads(4)
+            .thread_keep_alive(Duration::from_secs(3600))
             .enable_all()
             .build()
             .unwrap()

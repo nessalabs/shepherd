@@ -8,9 +8,9 @@ FD/handle, owned-zombie, containment, or domain-coverage assertions.
 
 | Area | Added verification |
 | --- | --- |
-| Scheduling | Both current-thread and two-worker Tokio runtimes; four concurrent scopes with independent verified cleanup. |
+| Scheduling | Both current-thread and two-worker Tokio runtimes, each with four blocking workers; four concurrent scopes with independent verified cleanup. |
 | Mixed lifecycle | Deterministic seeded selection among forced sleepers, natural exits, actual output overflow, scope-body cancellation, partial spawn failure, and concurrent scopes. First six iterations guarantee every scenario executes. |
-| Resource accounting | Warm every scenario and native sampling before the baseline; wait for output EOF; require final descriptors/handles no higher than baseline and no owned Unix zombies. |
+| Resource accounting | Warm every scenario, all four bounded blocking workers concurrently, and native sampling before the baseline; wait for output EOF; require final descriptors/handles no higher than baseline and no owned Unix zombies. |
 | Real launch boundaries | Empty/quoted/backslash/Unicode arguments, Unicode/spaced working directory, explicit/cleared environments, repeated invalid-cwd failures followed by a successful spawn in the same scope. CI injects an environment sentinel that must be removed in the child. |
 | OS resource exhaustion | Separate Unix helper lowers RLIMIT_NOFILE, consumes real descriptors until EMFILE, requires spawn failure with no registered process, restores resources and verifies successful spawn/reap. The test runner's limits are untouched. |
 | Hardware and toolchains | Existing latest-image suites plus Linux ARM64, Intel macOS, Windows ARM64, Ubuntu 22.04 and Windows 2022; optimized workspace tests and Rust 1.83 execution. Each compatibility job prints its actual host/compiler. |
@@ -30,7 +30,13 @@ PROPTEST_CASES=512 cargo test -p shepherd --test properties
 Scenario indices in failure logs/counts are: 0 forced sleeper, 1 natural binary exit,
 2 output overflow, 3 cancelled scope body, 4 partial spawn failure, 5 four-scope fanout.
 A mixed cycle can create multiple processes; counts are cycles, not process totals.
-Native sampling is explicitly warmed to distinguish runtime initialization from leaks.
+Native sampling and the complete bounded blocking pool are explicitly warmed to
+distinguish runtime initialization from leaks. Blocking workers remain alive during
+the measurement (one-hour keep-alive, longer than the workflow timeout). This avoids
+counting lazy worker growth as a process-resource leak while retaining the strict
+zero-growth assertion. Windows logs include read-only native handle-type snapshots;
+all platforms emit counts every 500 cycles. Workflow inputs can select Windows and
+one runtime for focused reproduction.
 
 Still not proven by this matrix:
 
