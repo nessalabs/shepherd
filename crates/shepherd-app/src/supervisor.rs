@@ -108,6 +108,7 @@ struct Inner {
     sampler_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     outputs: Mutex<HashMap<ProcessId, crate::output::ProcessOutput>>,
     scope_results: Mutex<HashMap<ProcessScopeId, ScopeCleanupSender>>,
+    completed_scope_results: Mutex<VecDeque<ProcessScopeId>>,
     stats_interval: Duration,
     completed: Mutex<VecDeque<ProcessId>>,
     reports: Mutex<HashMap<ProcessScopeId, ScopeTerminationReport>>,
@@ -168,6 +169,7 @@ impl ProcessSupervisor {
                 sampler_task: tokio::sync::Mutex::new(None),
                 outputs: Mutex::new(HashMap::new()),
                 scope_results: Mutex::new(HashMap::new()),
+                completed_scope_results: Mutex::new(VecDeque::new()),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
                 completed: Mutex::new(VecDeque::new()),
                 reports: Mutex::new(HashMap::new()),
@@ -877,14 +879,31 @@ impl ProcessSupervisor {
         let report = ScopeTerminationReport { scope, outcomes };
         if report.all_verified() {
             // Publish before removing the live entry so repeat callers cannot see a gap.
-            if let Some(sender) = self
+            let sender = self
                 .inner
                 .scope_results
                 .lock()
                 .expect("scope results mutex")
                 .get(&scope)
-            {
-                sender.send_replace(Some(Ok(report.clone())));
+                .cloned();
+            if let Some(sender) = sender {
+                publish_scope_cleanup_result(&sender, Ok(report.clone()));
+                // Only scoped blocks consume scoped result history. The operation lock
+                // makes verified completion enter this queue exactly once.
+                let mut completed = self
+                    .inner
+                    .completed_scope_results
+                    .lock()
+                    .expect("completed scope results mutex");
+                completed.push_back(scope);
+                while completed.len() > 256 {
+                    let old = completed.pop_front().expect("completed scoped result");
+                    self.inner
+                        .scope_results
+                        .lock()
+                        .expect("scope results mutex")
+                        .remove(&old);
+                }
             }
             self.inner
                 .reports
@@ -914,11 +933,6 @@ impl ProcessSupervisor {
                         .reports
                         .lock()
                         .expect("reports mutex")
-                        .remove(&old);
-                    self.inner
-                        .scope_results
-                        .lock()
-                        .expect("scope results mutex")
                         .remove(&old);
                 }
             }
@@ -1544,6 +1558,55 @@ mod scope_operation_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_scope_history_does_not_evict_scoped_cleanup_results() {
+        let supervisor = supervisor();
+        let first = supervisor.with_scope(Vec::new(), |_| async {}).await;
+        assert!(first.termination.unwrap().all_verified());
+        for _ in 0..650 {
+            let scope = supervisor.create_scope();
+            supervisor
+                .terminate_scope(scope, Default::default())
+                .await
+                .unwrap();
+        }
+        assert!(supervisor
+            .wait_scope_cleanup(first.scope)
+            .await
+            .unwrap()
+            .all_verified());
+        assert_eq!(
+            supervisor
+                .inner
+                .completed_scope_results
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
+        for _ in 0..256 {
+            assert!(supervisor
+                .with_scope(Vec::new(), |_| async {})
+                .await
+                .termination
+                .unwrap()
+                .all_verified());
+        }
+        assert!(
+            matches!(supervisor.wait_scope_cleanup(first.scope).await, Err(TerminateError::UnknownScope(id)) if id == first.scope)
+        );
+        assert_eq!(supervisor.inner.scope_results.lock().unwrap().len(), 256);
+        assert_eq!(
+            supervisor
+                .inner
+                .completed_scope_results
+                .lock()
+                .unwrap()
+                .len(),
+            256
+        );
+    }
+
+    #[tokio::test]
     async fn active_block_retains_external_cleanup_after_report_eviction() {
         let supervisor = supervisor();
         let external = supervisor.clone();
@@ -1563,11 +1626,12 @@ mod scope_operation_tests {
                     .unwrap()
                     .subscribe();
                 for _ in 0..650 {
-                    let old = external.create_scope();
-                    external
-                        .terminate_scope(old, Default::default())
+                    assert!(external
+                        .with_scope(Vec::new(), |_| async {})
                         .await
-                        .unwrap();
+                        .termination
+                        .unwrap()
+                        .all_verified());
                 }
                 assert!(!external
                     .inner

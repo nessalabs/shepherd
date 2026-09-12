@@ -19,6 +19,10 @@ with_scope reports, and 256 unclaimed completed output observers. Live or unveri
 ownership is not evicted to satisfy a history limit. Old completed IDs can return
 UnknownProcess/UnknownScope and old unclaimed output can return None. Callers retain
 ProcessExit/report values or take output observers when they need longer history.
+The two scope report histories advance independently: ordinary scopes cannot evict
+with_scope cleanup results. Only verified completion of a registered scoped block
+consumes its result history, including external termination of that block. Active
+blocks retain their own cleanup channels even after lookup eviction.
 Registered waiters keep their own channel receiver through eviction. Wait and
 termination register while holding the ownership lock, including scope-wide fanout.
 
