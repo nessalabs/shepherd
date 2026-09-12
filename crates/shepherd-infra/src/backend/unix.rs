@@ -39,6 +39,7 @@ type ExitChannels = (
 
 struct ChildSlot {
     output: Option<shepherd_app::output::ProcessOutput>,
+    sampling: Arc<std::sync::atomic::AtomicBool>,
     sender: watch::Sender<Option<Result<RawExit, String>>>,
     // Retain a receiver so the waiter task's `send` is never lost if it fires before the
     // supervisor's monitor subscribes.
@@ -65,6 +66,7 @@ struct State {
 /// A real Unix [`ProcessBackend`].
 #[derive(Clone, Default)]
 pub struct UnixProcessBackend {
+    sampling: super::sampling::SamplingPool,
     state: Arc<Mutex<State>>,
     #[cfg(target_os = "linux")]
     cgroups: Option<Arc<super::cgroup::Cgroups>>,
@@ -77,6 +79,94 @@ impl std::fmt::Debug for UnixProcessBackend {
 }
 
 impl UnixProcessBackend {
+    fn sample_sync(&self, target: &Spawned) -> Result<RawStats, StatsError> {
+        if !identity_still_matches(&target.os) {
+            return Err(StatsError::Backend(
+                "process identity no longer matches".into(),
+            ));
+        }
+        let raw = sample_process(target.os.pid)?;
+        #[cfg(target_os = "linux")]
+        let raw = {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", target.os.pid))
+                .map_err(|e| StatsError::Backend(e.to_string()))?;
+            let fields: Vec<_> = stat
+                .rsplit_once(')')
+                .ok_or_else(|| StatsError::Backend("invalid proc stat".into()))?
+                .1
+                .split_whitespace()
+                .collect();
+            let ticks = fields
+                .get(11)
+                .and_then(|s| s.parse::<u64>().ok())
+                .zip(fields.get(12).and_then(|s| s.parse::<u64>().ok()))
+                .map(|(u, s)| u.saturating_add(s))
+                .ok_or_else(|| StatsError::Backend("invalid CPU counters".into()))?;
+            let now = std::time::Instant::now();
+            let mut state = self.state.lock().expect("unix backend mutex");
+            if !state.children.contains_key(&child_key(&target.os)) {
+                return Err(StatsError::Backend("child reaped during sample".into()));
+            }
+            let previous = state
+                .cpu_samples
+                .insert(child_key(&target.os), (now, ticks));
+            let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+            if hz <= 0 {
+                return Err(StatsError::Backend("invalid clock tick rate".into()));
+            }
+            let cpu_usage = previous
+                .map(|(time, old)| {
+                    ticks.saturating_sub(old) as f64
+                        / hz as f64
+                        / now.duration_since(time).as_secs_f64().max(1e-9)
+                })
+                .unwrap_or(0.0) as f32;
+            RawStats { cpu_usage, ..raw }
+        };
+        #[cfg(target_os = "macos")]
+        let raw = {
+            let task =
+                libproc::proc_pid::pidinfo::<libproc::task_info::TaskInfo>(target.os.pid as i32, 0)
+                    .map_err(StatsError::Backend)?;
+            let mut timebase = mach2::mach_time::mach_timebase_info_data_t { numer: 0, denom: 0 };
+            // TaskInfo reports Mach absolute time units, not nanoseconds on ARM.
+            if unsafe { mach2::mach_time::mach_timebase_info(&mut timebase) } != 0
+                || timebase.denom == 0
+            {
+                return Err(StatsError::Backend("invalid Mach timebase".into()));
+            }
+            let ticks = ((task.pti_total_user as u128 + task.pti_total_system as u128)
+                * timebase.numer as u128
+                / timebase.denom as u128)
+                .min(u64::MAX as u128) as u64;
+            let now = std::time::Instant::now();
+            let mut state = self.state.lock().expect("unix backend mutex");
+            if !state.children.contains_key(&child_key(&target.os)) {
+                return Err(StatsError::Backend("child reaped during sample".into()));
+            }
+            let previous = state
+                .cpu_samples
+                .insert(child_key(&target.os), (now, ticks));
+            let cpu_usage = previous
+                .map(|(time, old)| {
+                    ticks.saturating_sub(old) as f64
+                        / 1e9
+                        / now.duration_since(time).as_secs_f64().max(1e-9)
+                })
+                .unwrap_or(0.0) as f32;
+            RawStats {
+                cpu_usage,
+                memory_rss_bytes: task.pti_resident_size,
+                virtual_memory_bytes: Some(task.pti_virtual_size),
+                ..raw
+            }
+        };
+        if !identity_still_matches(&target.os) {
+            return Err(StatsError::Backend("child changed during sample".into()));
+        }
+        Ok(raw)
+    }
+
     /// Creates an empty backend.
     #[must_use]
     pub fn new() -> Self {
@@ -89,6 +179,7 @@ impl UnixProcessBackend {
     pub fn auto() -> Self {
         super::cgroup::Cgroups::detect()
             .map(|cgroups| Self {
+                sampling: super::sampling::SamplingPool::default(),
                 state: Arc::default(),
                 cgroups: Some(Arc::new(cgroups)),
             })
@@ -99,6 +190,7 @@ impl UnixProcessBackend {
     #[cfg(target_os = "linux")]
     pub fn with_cgroup_root(root: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         Ok(Self {
+            sampling: super::sampling::SamplingPool::default(),
             state: Arc::default(),
             cgroups: Some(Arc::new(super::cgroup::Cgroups::new(root.as_ref())?)),
         })
@@ -163,6 +255,7 @@ impl UnixProcessBackend {
             child_key(&os),
             ChildSlot {
                 output,
+                sampling: Arc::default(),
                 sender: channels.0,
                 _keep: channels.1,
                 #[cfg(target_os = "linux")]
@@ -473,91 +566,20 @@ impl ProcessBackend for UnixProcessBackend {
     }
 
     async fn sample(&self, target: &Spawned) -> Result<RawStats, StatsError> {
-        if !identity_still_matches(&target.os) {
-            return Err(StatsError::Backend(
-                "process identity no longer matches".into(),
-            ));
-        }
-        let raw = sample_process(target.os.pid)?;
-        #[cfg(target_os = "linux")]
-        let raw = {
-            let stat = std::fs::read_to_string(format!("/proc/{}/stat", target.os.pid))
-                .map_err(|e| StatsError::Backend(e.to_string()))?;
-            let fields: Vec<_> = stat
-                .rsplit_once(')')
-                .ok_or_else(|| StatsError::Backend("invalid proc stat".into()))?
-                .1
-                .split_whitespace()
-                .collect();
-            let ticks = fields
-                .get(11)
-                .and_then(|s| s.parse::<u64>().ok())
-                .zip(fields.get(12).and_then(|s| s.parse::<u64>().ok()))
-                .map(|(u, s)| u.saturating_add(s))
-                .ok_or_else(|| StatsError::Backend("invalid CPU counters".into()))?;
-            let now = std::time::Instant::now();
-            let mut state = self.state.lock().expect("unix backend mutex");
-            if !state.children.contains_key(&child_key(&target.os)) {
-                return Err(StatsError::Backend("child reaped during sample".into()));
-            }
-            let previous = state
-                .cpu_samples
-                .insert(child_key(&target.os), (now, ticks));
-            let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-            if hz <= 0 {
-                return Err(StatsError::Backend("invalid clock tick rate".into()));
-            }
-            let cpu_usage = previous
-                .map(|(time, old)| {
-                    ticks.saturating_sub(old) as f64
-                        / hz as f64
-                        / now.duration_since(time).as_secs_f64().max(1e-9)
-                })
-                .unwrap_or(0.0) as f32;
-            RawStats { cpu_usage, ..raw }
-        };
-        #[cfg(target_os = "macos")]
-        let raw = {
-            let task =
-                libproc::proc_pid::pidinfo::<libproc::task_info::TaskInfo>(target.os.pid as i32, 0)
-                    .map_err(StatsError::Backend)?;
-            let mut timebase = mach2::mach_time::mach_timebase_info_data_t { numer: 0, denom: 0 };
-            // TaskInfo reports Mach absolute time units, not nanoseconds on ARM.
-            if unsafe { mach2::mach_time::mach_timebase_info(&mut timebase) } != 0
-                || timebase.denom == 0
-            {
-                return Err(StatsError::Backend("invalid Mach timebase".into()));
-            }
-            let ticks = ((task.pti_total_user as u128 + task.pti_total_system as u128)
-                * timebase.numer as u128
-                / timebase.denom as u128)
-                .min(u64::MAX as u128) as u64;
-            let now = std::time::Instant::now();
-            let mut state = self.state.lock().expect("unix backend mutex");
-            if !state.children.contains_key(&child_key(&target.os)) {
-                return Err(StatsError::Backend("child reaped during sample".into()));
-            }
-            let previous = state
-                .cpu_samples
-                .insert(child_key(&target.os), (now, ticks));
-            let cpu_usage = previous
-                .map(|(time, old)| {
-                    ticks.saturating_sub(old) as f64
-                        / 1e9
-                        / now.duration_since(time).as_secs_f64().max(1e-9)
-                })
-                .unwrap_or(0.0) as f32;
-            RawStats {
-                cpu_usage,
-                memory_rss_bytes: task.pti_resident_size,
-                virtual_memory_bytes: Some(task.pti_virtual_size),
-                ..raw
-            }
-        };
-        if !identity_still_matches(&target.os) {
-            return Err(StatsError::Backend("child changed during sample".into()));
-        }
-        Ok(raw)
+        let active = self
+            .state
+            .lock()
+            .expect("unix backend mutex")
+            .children
+            .get(&child_key(&target.os))
+            .ok_or_else(|| StatsError::Backend("process reaped".into()))?
+            .sampling
+            .clone();
+        let backend = self.clone();
+        let target = *target;
+        self.sampling
+            .run(active, move || backend.sample_sync(&target))
+            .await
     }
 
     fn output(&self, target: &Spawned) -> Option<shepherd_app::output::ProcessOutput> {
