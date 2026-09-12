@@ -705,13 +705,26 @@ impl ProcessBackend for UnixProcessBackend {
         #[cfg(target_os = "linux")]
         if let Some(cgroups) = &self.cgroups {
             if signal == Signal::Kill {
-                return cgroups
+                let result = cgroups
                     .kill(scope)
                     .map_err(|e| TerminateError::Signal(e.to_string()));
+                let state = self.state.lock().expect("unix backend mutex");
+                for slot in state.children.values().filter(|slot| slot.scope == scope) {
+                    let _ = slot.retry.try_send(());
+                }
+                return result;
             }
         }
         let mut state = self.state.lock().expect("unix backend mutex");
-        signal_group(&mut state, scope, to_nix(signal)?)
+        let result = signal_group(&mut state, scope, to_nix(signal)?);
+        if signal == Signal::Kill {
+            // Queue even if failure publication is still in flight; capacity one
+            // coalesces concurrent cleanup callers without losing the reap wakeup.
+            for slot in state.children.values().filter(|slot| slot.scope == scope) {
+                let _ = slot.retry.try_send(());
+            }
+        }
+        result
     }
 
     async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
@@ -1627,6 +1640,43 @@ mod failed_wait_tests {
             .unwrap()
             .children
             .contains_key(&child_key(&root.os)));
+    }
+
+    #[tokio::test]
+    async fn cleanup_scope_retries_failed_wait_without_touching_sibling() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let other = ProcessScopeId::new(2);
+        let spec = ProcessSpec::new("/bin/sleep").arg("30");
+        let root = backend.spawn(scope, &spec).await.unwrap();
+        let sibling = backend.spawn(other, &spec).await.unwrap();
+        let mut observation = {
+            let state = backend.state.lock().unwrap();
+            let slot = &state.children[&child_key(&root.os)];
+            slot.failures.store(1, std::sync::atomic::Ordering::SeqCst);
+            slot.sender.subscribe()
+        };
+        assert!(backend.wait(&root).await.is_err());
+        let cleaned = backend.cleanup_scope(scope).await;
+        // No explicit wait/retry request: cleanup must wake the retained Child owner.
+        let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(&*observation.borrow_and_update(), Some(Ok(_))) {
+                    break;
+                }
+                observation.changed().await.unwrap();
+            }
+        })
+        .await;
+        let sibling_alive = identity_still_matches(&sibling.os);
+        backend.hard_kill_all();
+        let root_exit = backend.wait(&root).await.unwrap();
+        backend.wait(&sibling).await.unwrap();
+        backend.cleanup_scope(other).await.unwrap();
+        assert!(cleaned.is_ok());
+        assert!(recovered.is_ok(), "scope cleanup left failed waiter parked");
+        assert_eq!(root_exit.signal, Some(Signal::Kill));
+        assert!(sibling_alive, "cleanup killed sibling scope");
     }
 
     #[tokio::test]
