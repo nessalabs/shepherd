@@ -60,20 +60,50 @@ impl EventDispatcher {
 /// On [`DomainEvent::ProcessReaped`], records the terminal exit so `wait(pid)` callers wake.
 pub struct WaitNotifierHandler {
     waiters: Arc<dyn Waiters>,
+    registry: Option<SharedRegistry>,
 }
 
 impl WaitNotifierHandler {
     /// Creates the handler with an injected [`Waiters`] port.
     #[must_use]
     pub fn new(waiters: Arc<dyn Waiters>) -> Self {
-        Self { waiters }
+        Self {
+            waiters,
+            registry: None,
+        }
+    }
+
+    pub(crate) fn with_registry(waiters: Arc<dyn Waiters>, registry: SharedRegistry) -> Self {
+        Self {
+            waiters,
+            registry: Some(registry),
+        }
     }
 }
 
 #[async_trait]
 impl EventHandler for WaitNotifierHandler {
     async fn handle(&self, event: &DomainEvent) -> Result<(), HandlerError> {
-        if let DomainEvent::ProcessReaped { pid, exit, .. } = event {
+        if let DomainEvent::ProcessReaped { scope, pid, exit } = event {
+            if !exit.outcome.is_verified() {
+                if let Some(registry) = &self.registry {
+                    let registry = registry
+                        .lock()
+                        .map_err(|_| HandlerError::new(self.name(), "registry mutex poisoned"))?;
+                    // A failed reap must still own a quarantined registry entry. A
+                    // verified correction can prune it and expire from waiter history
+                    // before this older event dispatches; never resurrect that failure.
+                    if registry
+                        .get(*scope)
+                        .and_then(|scope| scope.get(*pid))
+                        .and_then(|process| process.exit())
+                        .is_some_and(|current| !current.outcome.is_verified())
+                    {
+                        self.waiters.signal_exit(*pid, *exit);
+                    }
+                    return Ok(());
+                }
+            }
             self.waiters.signal_exit(*pid, *exit);
         }
         Ok(())
@@ -180,5 +210,115 @@ impl EventHandler for IntegrationTranslator {
     }
     fn name(&self) -> &'static str {
         "IntegrationTranslator"
+    }
+}
+
+#[cfg(test)]
+mod waiter_notification_tests {
+    use super::*;
+    use shepherd_domain::{
+        OsIdentity, ProcessExit, ProcessId, ProcessScopeId, ProcessSpec, ReuseToken,
+        TerminationOutcome, UnverifiedReason,
+    };
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct EvictableWaiters(Mutex<HashMap<ProcessId, ProcessExit>>);
+    impl Waiters for EvictableWaiters {
+        fn signal_exit(&self, pid: ProcessId, exit: ProcessExit) {
+            self.0.lock().unwrap().insert(pid, exit);
+        }
+        fn try_get(&self, pid: ProcessId) -> Option<ProcessExit> {
+            self.0.lock().unwrap().get(&pid).copied()
+        }
+        fn wait(&self, _: ProcessId) -> crate::ports::WaitFuture {
+            unreachable!()
+        }
+    }
+    fn failed_exit(pid: ProcessId) -> ProcessExit {
+        ProcessExit {
+            pid,
+            code: None,
+            signal: None,
+            outcome: TerminationOutcome::CleanupUnverified(UnverifiedReason::ReapFailed),
+            forced: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_failure_cannot_replace_correction_or_resurrect_evicted_history() {
+        let registry = Arc::new(Mutex::new(ScopeRegistry::new()));
+        let waiters = Arc::new(EvictableWaiters::default());
+        let notifier = WaitNotifierHandler::with_registry(waiters.clone(), registry.clone());
+        let (scope, pid, failed) = {
+            let mut registry = registry.lock().unwrap();
+            let scope = registry.create_scope();
+            let pid = registry.next_process_id();
+            let s = registry.get_mut(scope).unwrap();
+            s.attach_spawned(
+                pid,
+                OsIdentity::new(1, ReuseToken::Unavailable),
+                ProcessSpec::new("unused"),
+            )
+            .unwrap();
+            let failed = failed_exit(pid);
+            s.record_reaped(pid, failed).unwrap();
+            (scope, pid, failed)
+        };
+        let stale = DomainEvent::ProcessReaped {
+            scope,
+            pid,
+            exit: failed,
+        };
+        notifier.handle(&stale).await.unwrap();
+        assert_eq!(waiters.try_get(pid), Some(failed));
+        let verified = ProcessExit {
+            code: Some(0),
+            outcome: TerminationOutcome::GracefulSuccess,
+            ..failed
+        };
+        registry
+            .lock()
+            .unwrap()
+            .get_mut(scope)
+            .unwrap()
+            .record_reaped(pid, verified)
+            .unwrap();
+        let corrected = DomainEvent::ProcessReaped {
+            scope,
+            pid,
+            exit: verified,
+        };
+        notifier.handle(&corrected).await.unwrap();
+        notifier.handle(&stale).await.unwrap();
+        assert_eq!(waiters.try_get(pid), Some(verified));
+        RegistryPruneHandler::new(registry)
+            .handle(&corrected)
+            .await
+            .unwrap();
+        // Simulate bounded waiter eviction after other roots complete.
+        waiters.0.lock().unwrap().clear();
+        notifier.handle(&stale).await.unwrap();
+        assert_eq!(waiters.try_get(pid), None);
+        // A verified notification remains deliverable even after registry pruning.
+        notifier.handle(&corrected).await.unwrap();
+        assert_eq!(waiters.try_get(pid), Some(verified));
+    }
+
+    #[tokio::test]
+    async fn compatibility_constructor_delivers_without_a_registry() {
+        let waiters = Arc::new(EvictableWaiters::default());
+        let notifier = WaitNotifierHandler::new(waiters.clone());
+        let pid = ProcessId::new(1);
+        let exit = failed_exit(pid);
+        notifier
+            .handle(&DomainEvent::ProcessReaped {
+                scope: ProcessScopeId::new(1),
+                pid,
+                exit,
+            })
+            .await
+            .unwrap();
+        assert_eq!(waiters.try_get(pid), Some(exit));
     }
 }
