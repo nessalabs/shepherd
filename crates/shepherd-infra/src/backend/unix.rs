@@ -52,6 +52,7 @@ struct ChildSlot {
 struct ScopeGroup {
     pgid: i32,
     live: usize,
+    wait_failed: bool,
 }
 
 #[derive(Default)]
@@ -176,26 +177,6 @@ impl UnixProcessBackend {
             .clone()
     }
 
-    fn existing_pgid(&self, scope: ProcessScopeId) -> Option<i32> {
-        self.state
-            .lock()
-            .expect("unix backend mutex")
-            .scope_groups
-            .get(&scope)
-            .map(|g| g.pgid)
-    }
-
-    /// Pgid to *join* on spawn. An empty group (live == 0) is treated as gone so a later
-    /// spawn creates a fresh group; the stale pgid is still kept for `signal_scope` until then.
-    fn joinable_pgid(&self, scope: ProcessScopeId) -> Option<i32> {
-        self.state
-            .lock()
-            .expect("unix backend mutex")
-            .scope_groups
-            .get(&scope)
-            .and_then(|g| (g.live > 0).then_some(g.pgid))
-    }
-
     fn forget_group(&self, scope: ProcessScopeId) {
         self.state
             .lock()
@@ -228,15 +209,25 @@ impl UnixProcessBackend {
         );
         let pgid = i32::try_from(os.pid).unwrap_or(0);
         if new_group {
-            state
-                .scope_groups
-                .insert(scope, ScopeGroup { pgid, live: 1 });
+            state.scope_groups.insert(
+                scope,
+                ScopeGroup {
+                    pgid,
+                    live: 1,
+                    wait_failed: false,
+                },
+            );
         } else if let Some(group) = state.scope_groups.get_mut(&scope) {
             group.live = group.live.saturating_add(1);
         } else {
-            state
-                .scope_groups
-                .insert(scope, ScopeGroup { pgid, live: 1 });
+            state.scope_groups.insert(
+                scope,
+                ScopeGroup {
+                    pgid,
+                    live: 1,
+                    wait_failed: false,
+                },
+            );
         }
     }
 
@@ -262,11 +253,19 @@ impl UnixProcessBackend {
     ) {
         if raw.is_ok() {
             self.note_os_exit(scope);
+        } else if let Some(group) = self
+            .state
+            .lock()
+            .expect("unix backend mutex")
+            .scope_groups
+            .get_mut(&scope)
+        {
+            group.wait_failed = true;
         }
         let _ = sender.send(Some(raw));
     }
 
-    async fn spawn_in_group(
+    fn spawn_in_group(
         &self,
         spec: &ProcessSpec,
         target_pgid: i32,
@@ -332,33 +331,37 @@ impl ProcessBackend for UnixProcessBackend {
             .map(|c| c.membership(scope))
             .transpose()
             .map_err(|e| SpawnError::Os(e.to_string()))?;
-        let existing_pgid = self.joinable_pgid(scope);
-        let (mut child, new_group) = match self
-            .spawn_in_group(
+        // Serialize quarantine publication with the actual fork/exec admission.
+        let (mut child, new_group) = {
+            let mut state = self.state.lock().expect("unix backend mutex");
+            let existing_pgid = match state.scope_groups.get(&scope) {
+                Some(group) if group.wait_failed => return Err(SpawnError::ScopeClosed(scope)),
+                Some(group) if group.live > 0 => Some(group.pgid),
+                _ => None,
+            };
+            match self.spawn_in_group(
                 spec,
                 existing_pgid.unwrap_or(0),
                 #[cfg(target_os = "linux")]
                 membership.as_ref(),
-            )
-            .await
-        {
-            Ok(child) => (child, existing_pgid.is_none()),
-            Err(_err) if existing_pgid.is_some() => {
-                // The recorded group is gone (last member exited; kernel recycled the pgid).
-                // Forget it and create a fresh group for this still-open scope.
-                self.forget_group(scope);
-                (
-                    self.spawn_in_group(
-                        spec,
-                        0,
-                        #[cfg(target_os = "linux")]
-                        membership.as_ref(),
+            ) {
+                Ok(child) => (child, existing_pgid.is_none()),
+                Err(_err) if existing_pgid.is_some() => {
+                    // The recorded group is gone (last member exited; kernel recycled the pgid).
+                    // Forget it and create a fresh group for this still-open scope.
+                    state.scope_groups.remove(&scope);
+                    (
+                        self.spawn_in_group(
+                            spec,
+                            0,
+                            #[cfg(target_os = "linux")]
+                            membership.as_ref(),
+                        )?,
+                        true,
                     )
-                    .await?,
-                    true,
-                )
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => return Err(err),
         };
 
         let pid = child
@@ -472,14 +475,27 @@ impl ProcessBackend for UnixProcessBackend {
                     .map_err(|e| TerminateError::Signal(e.to_string()));
             }
         }
-        let pgid = self.existing_pgid(scope);
+        let mut state = self.state.lock().expect("unix backend mutex");
+        if state
+            .scope_groups
+            .get(&scope)
+            .is_some_and(|group| group.wait_failed)
+        {
+            if signal == Signal::Kill {
+                kill_registered_roots(&state, scope);
+            }
+            return Err(TerminateError::Signal(
+                "scope group identity unverified after wait failure".into(),
+            ));
+        }
+        let pgid = state.scope_groups.get(&scope).map(|group| group.pgid);
         let Some(pgid) = pgid else {
             return Ok(());
         };
         match killpg(Pid::from_raw(pgid), Some(to_nix(signal))) {
             Ok(()) => Ok(()),
             Err(nix::errno::Errno::ESRCH) => {
-                self.forget_group(scope);
+                state.scope_groups.remove(&scope);
                 Ok(())
             }
             Err(e) => Err(TerminateError::Signal(e.to_string())),
@@ -600,7 +616,11 @@ impl ProcessBackend for UnixProcessBackend {
             return;
         }
         let state = self.state.lock().expect("unix backend mutex");
-        for group in state.scope_groups.values() {
+        for group in state
+            .scope_groups
+            .values()
+            .filter(|group| !group.wait_failed)
+        {
             let _ = killpg(Pid::from_raw(group.pgid), Some(NixSignal::SIGKILL));
         }
         for scope in state
@@ -864,6 +884,8 @@ mod tests {
         #[cfg(target_os = "linux")]
         backend.forget_group(scope);
         backend.hard_kill_all();
+        #[cfg(not(target_os = "linux"))]
+        backend.signal(&root, Signal::Kill).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if matches!(&*recovered.borrow_and_update(), Some(Ok(_))) {
@@ -879,7 +901,81 @@ mod tests {
             Some(Signal::Kill)
         );
         assert!(!backend.state.lock().unwrap().children.contains_key(&key));
+        #[cfg(not(target_os = "linux"))]
+        assert!(backend.cleanup_scope(scope).await.is_err());
+        #[cfg(target_os = "linux")]
         backend.cleanup_scope(scope).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_wait_quarantines_recycled_group() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let other = ProcessScopeId::new(2);
+        let spec = ProcessSpec::new("/bin/sleep").arg("30");
+        let root = backend.spawn(scope, &spec).await.unwrap();
+        let sibling = backend.spawn(other, &spec).await.unwrap();
+        let sender = backend.state.lock().unwrap().children[&child_key(&root.os)]
+            .sender
+            .clone();
+        backend.publish_wait_result(scope, &sender, Err("injected wait failure".into()));
+        {
+            let mut state = backend.state.lock().unwrap();
+            state.scope_groups.get_mut(&scope).unwrap().pgid = sibling.os.pid as i32;
+        }
+        assert!(
+            matches!(backend.spawn(scope, &spec).await, Err(SpawnError::ScopeClosed(id)) if id == scope)
+        );
+        assert!(backend.signal_scope(scope, Signal::Kill).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), backend.wait(&sibling))
+                .await
+                .is_err()
+        );
+        // Remove the sibling group so the global sweep cannot legitimately signal it.
+        // Its registered root is intentionally removed only within this test model.
+        let sibling_slot = backend
+            .state
+            .lock()
+            .unwrap()
+            .children
+            .remove(&child_key(&sibling.os))
+            .unwrap();
+        backend.forget_group(other);
+        backend.hard_kill_all();
+        let mut sibling_exit = sibling_slot.sender.subscribe();
+        let sibling_alive = tokio::time::timeout(Duration::from_millis(30), async {
+            loop {
+                if sibling_exit.borrow_and_update().is_some() {
+                    break;
+                }
+                sibling_exit.changed().await.unwrap();
+            }
+        })
+        .await
+        .is_err();
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .children
+            .insert(child_key(&sibling.os), sibling_slot);
+        backend.signal(&root, Signal::Kill).await.unwrap();
+        backend.signal(&sibling, Signal::Kill).await.unwrap();
+        let mut recovered = sender.subscribe();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(&*recovered.borrow_and_update(), Some(Ok(_))) {
+                    break;
+                }
+                recovered.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        backend.wait(&root).await.unwrap();
+        backend.wait(&sibling).await.unwrap();
+        assert!(sibling_alive, "quarantined pgid killed another scope");
     }
 
     /// The waiter task reaps as soon as the OS child exits. A late `wait()` — the
