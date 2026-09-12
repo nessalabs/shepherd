@@ -388,35 +388,20 @@ impl ProcessSupervisor {
             .expect("scope results mutex")
             .insert(scope, report_tx.clone());
         let worker = self.worker();
+        let worker_report = report_tx.clone();
         let cleanup = tokio::spawn(async move {
             let _ = finished.await;
-            worker.terminate_scope(scope, opts).await
+            worker
+                .cleanup_and_publish_scope(scope, opts, worker_report)
+                .await;
         });
-        let inner = self.inner.clone();
         tokio::spawn(async move {
-            let result = cleanup.await.unwrap_or_else(|error| {
-                Err(TerminateError::Signal(format!(
+            // A normal worker publishes before returning. This observer only handles
+            // failures, so runtime shutdown cannot lose an already completed result.
+            if let Err(error) = cleanup.await {
+                report_tx.send_replace(Some(Err(TerminateError::Signal(format!(
                     "scope cleanup worker failed: {error}"
-                )))
-            });
-            let verified = result.as_ref().is_ok_and(|report| report.all_verified());
-            report_tx.send_replace(Some(result));
-            if verified {
-                // Evict only completed, verified reports. Existing watch receivers
-                // retain their published result independently of this lookup history.
-                let mut completed = inner
-                    .completed_scope_results
-                    .lock()
-                    .expect("completed scope results mutex");
-                completed.push_back(scope);
-                while completed.len() > 256 {
-                    let old = completed.pop_front().expect("completed scope result");
-                    inner
-                        .scope_results
-                        .lock()
-                        .expect("scope results mutex")
-                        .remove(&old);
-                }
+                )))));
             }
         });
         let mut processes = Vec::new();
@@ -455,6 +440,35 @@ impl ProcessSupervisor {
             scope,
             result,
             termination,
+        }
+    }
+
+    async fn cleanup_and_publish_scope(
+        &self,
+        scope: ProcessScopeId,
+        opts: TerminateOptions,
+        report_tx: ScopeCleanupSender,
+    ) {
+        let result = self.terminate_scope(scope, opts).await;
+        let verified = result.as_ref().is_ok_and(|report| report.all_verified());
+        // No suspension between completed cleanup, publication and history retention.
+        report_tx.send_replace(Some(result));
+        if verified {
+            // Existing watch receivers retain their result independently of lookup history.
+            let mut completed = self
+                .inner
+                .completed_scope_results
+                .lock()
+                .expect("completed scope results mutex");
+            completed.push_back(scope);
+            while completed.len() > 256 {
+                let old = completed.pop_front().expect("completed scope result");
+                self.inner
+                    .scope_results
+                    .lock()
+                    .expect("scope results mutex")
+                    .remove(&old);
+            }
         }
     }
 
@@ -1086,6 +1100,50 @@ mod scope_operation_tests {
     fn supervisor() -> ProcessSupervisor {
         let ports = Arc::new(EmptyPorts);
         ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports)
+    }
+
+    #[test]
+    fn completed_cleanup_is_published_without_join_observer_before_runtime_drop() {
+        let supervisor = supervisor();
+        let scope = supervisor.create_scope();
+        let (report, _) = tokio::sync::watch::channel(None);
+        supervisor
+            .inner
+            .scope_results
+            .lock()
+            .unwrap()
+            .insert(scope, report.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Drive the worker body to completion without ever starting its JoinHandle
+        // observer, then destroy the runtime that performed cleanup.
+        runtime.block_on(supervisor.worker().cleanup_and_publish_scope(
+            scope,
+            Default::default(),
+            report,
+        ));
+        drop(runtime);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), supervisor.wait_scope_cleanup(scope))
+                .await
+                .expect("completed worker left report publication to an unpolled observer")
+        });
+        assert!(result.unwrap().all_verified());
+        assert_eq!(
+            supervisor
+                .inner
+                .completed_scope_results
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
