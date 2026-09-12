@@ -38,6 +38,9 @@ report while the runtime remains running.
 Spawns run in owned application workers so cancellation cannot interrupt the
 backend-spawn-to-monitor ownership handoff. Scope operations serialize cleanup
 against an admitted spawn; the guard worker waits for any such spawn to complete.
+Scope creation holds the registry mutex through operation-lock insertion, so a
+concurrent shutdown cannot observe a registered scope without its serialization
+lock. The shared lock order is registry before the operation-lock map.
 Operation locks are allocated only for created scopes and removed after verified
 cleanup, after publishing the cached report. Queued callers recheck that report
 under the retained operation lock; completed or unknown lookups do not recreate

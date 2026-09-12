@@ -195,7 +195,16 @@ impl ProcessSupervisor {
 
     /// Creates a new, open scope and returns its id.
     pub fn create_scope(&self) -> ProcessScopeId {
-        let scope = self.lock_registry().create_scope();
+        self.create_scope_before_publish(|| {})
+    }
+
+    // The callback lets the concurrency regression pause at the publication boundary.
+    fn create_scope_before_publish(&self, before_publish: impl FnOnce()) -> ProcessScopeId {
+        let mut registry = self.lock_registry();
+        let scope = registry.create_scope();
+        before_publish();
+        // Registry -> operation map is the shared lock order. Do not expose the new
+        // scope to shutdown before its serialization lock exists.
         self.inner
             .scope_operations
             .lock()
@@ -1077,6 +1086,61 @@ mod scope_operation_tests {
     fn supervisor() -> ProcessSupervisor {
         let ports = Arc::new(EmptyPorts);
         ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports)
+    }
+
+    #[test]
+    fn shutdown_cannot_observe_scope_before_its_operation_lock_is_published() {
+        let supervisor = supervisor();
+        let creator = supervisor.clone();
+        let (inserted, insertion) = std::sync::mpsc::sync_channel(0);
+        let (release, released) = std::sync::mpsc::sync_channel(0);
+        let creation = std::thread::spawn(move || {
+            creator.create_scope_before_publish(|| {
+                inserted.send(()).unwrap();
+                released.recv().unwrap();
+            })
+        });
+        insertion.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The new registry entry exists, but readers must be blocked until its
+        // operation lock is present. Check this before allowing creation to continue.
+        let registry_hidden = matches!(
+            supervisor.inner.registry.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        let operation_unpublished = supervisor.inner.scope_operations.lock().unwrap().is_empty();
+        let owner = supervisor.clone();
+        let shutdown = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(owner.shutdown())
+        });
+        // Shutdown sets its intent immediately before taking the registry snapshot.
+        // The channel, rather than a sleep, controls the creator's critical section.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !supervisor.inner.shutting_down.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let shutdown_started = supervisor.inner.shutting_down.load(Ordering::SeqCst);
+        release.send(()).unwrap();
+        let scope = creation.join().unwrap();
+        let result = shutdown.join().unwrap();
+        assert!(
+            registry_hidden,
+            "published a scope before its operation lock"
+        );
+        assert!(operation_unpublished);
+        assert!(
+            shutdown_started,
+            "shutdown thread did not reach its registry snapshot"
+        );
+        let report = result.expect("shutdown observed a half-created scope");
+        assert_eq!(report.scopes.len(), 1);
+        assert_eq!(report.scopes[0].scope, scope);
+        assert!(report.scopes[0].all_verified());
+        assert!(supervisor.processes(scope).is_none());
+        assert!(supervisor.scope_operation(scope).is_none());
     }
 
     #[tokio::test]
