@@ -1,0 +1,50 @@
+# Verification coverage and remaining gaps
+
+The audit found that the long stress runner repeated one serial sleeping-root case,
+real-process coverage mostly exercised the current-thread runtime, machine coverage
+relied on moving latest images, and property tests hard-coded 64 cases even when the
+caller requested more. Those gaps are addressed below without weakening existing
+FD/handle, owned-zombie, containment, or domain-coverage assertions.
+
+| Area | Added verification |
+| --- | --- |
+| Scheduling | Both current-thread and two-worker Tokio runtimes; four concurrent scopes with independent verified cleanup. |
+| Mixed lifecycle | Deterministic seeded selection among forced sleepers, natural exits, actual output overflow, scope-body cancellation, partial spawn failure, and concurrent scopes. First six iterations guarantee every scenario executes. |
+| Resource accounting | Warm every scenario and native sampling before the baseline; wait for output EOF; require final descriptors/handles no higher than baseline and no owned Unix zombies. |
+| Real launch boundaries | Empty/quoted/backslash/Unicode arguments, Unicode/spaced working directory, explicit/cleared environments, repeated invalid-cwd failures followed by a successful spawn in the same scope. CI injects an environment sentinel that must be removed in the child. |
+| OS resource exhaustion | Separate Unix helper lowers RLIMIT_NOFILE, consumes real descriptors until EMFILE, requires spawn failure with no registered process, restores resources and verifies successful spawn/reap. The test runner's limits are untouched. |
+| Hardware and toolchains | Existing latest-image suites plus Linux ARM64, Intel macOS, Windows ARM64, Ubuntu 22.04 and Windows 2022; optimized workspace tests and Rust 1.83 execution. Each compatibility job prints its actual host/compiler. |
+| libc | Full workspace tests execute native Linux musl binaries in addition to GNU/Linux tests. |
+| Long stress | Six named OS/architecture images × two runtimes, configurable bounded iteration count and seed; 512 property cases; per-job timeouts; logs and regression artifacts retained even on failure. |
+| CI definitions | Pinned actionlint checks workflow syntax/expressions on every PR. |
+
+The bounded mixed stress test runs under ordinary workspace CI. The long workflow
+remains manual so each pull request does not automatically launch twelve long jobs.
+Example local reproduction:
+
+```sh
+SHEPHERD_STRESS_ITERATIONS=2000 SHEPHERD_STRESS_SEED=20260912 SHEPHERD_STRESS_RUNTIME=both cargo test -p shepherd-fixtures --test leak_stress long_create_kill -- --ignored --nocapture
+PROPTEST_CASES=512 cargo test -p shepherd --test properties
+```
+
+Scenario indices in failure logs/counts are: 0 forced sleeper, 1 natural binary exit,
+2 output overflow, 3 cancelled scope body, 4 partial spawn failure, 5 four-scope fanout.
+A mixed cycle can create multiple processes; counts are cycles, not process totals.
+Native sampling is explicitly warmed to distinguish runtime initialization from leaks.
+
+Still not proven by this matrix:
+
+- Arbitrary kernel versions, cgroup controller/delegation combinations, systemd policies,
+  containers, restricted procfs mounts, or enterprise endpoint-security software.
+- Full machine crash/power loss and every abrupt supervisor-death window. Existing
+  runtime/Drop/backstop tests and documented OS limitations still apply.
+- Permission-denied process inventories across all users and historical ancestry after
+  reparenting; process-tree observations remain best-effort.
+- Real forced PID reuse at wraparound, physical memory exhaustion, and every Windows
+  handle-quota failure. Deterministic identity/failure tests are narrower evidence.
+- Every possible thread/OS interleaving. Loom models selected in-memory synchronization;
+  seeded scenarios make failures reproducible but do not control the OS scheduler.
+
+The machine labels come from GitHub's [hosted runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+Actual execution results must be recorded on the PR; declaring a matrix is not proof
+that those machines passed.

@@ -10,7 +10,7 @@ description = "Pathological helper binaries used by Shepherd's test suite. Not p
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[dev-dependencies]
+[dependencies]
 shepherd = { path = "../crates/shepherd" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 
