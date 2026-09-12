@@ -101,7 +101,7 @@ struct Inner {
     scope_operations: Mutex<HashMap<ProcessScopeId, Arc<tokio::sync::Mutex<()>>>>,
     samples: Mutex<HashMap<ProcessId, Result<ProcessStats, StatsError>>>,
     sampler_started: AtomicBool,
-    sampler_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    sampler_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     stats_interval: Duration,
     reports: Mutex<HashMap<ProcessScopeId, ScopeTerminationReport>>,
     pending_outcomes: Mutex<HashMap<ProcessScopeId, HashMap<ProcessId, TerminationOutcome>>>,
@@ -157,7 +157,7 @@ impl ProcessSupervisor {
                 scope_operations: Mutex::new(HashMap::new()),
                 samples: Mutex::new(HashMap::new()),
                 sampler_started: AtomicBool::new(false),
-                sampler_task: Mutex::new(None),
+                sampler_task: tokio::sync::Mutex::new(None),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
                 reports: Mutex::new(HashMap::new()),
                 pending_outcomes: Mutex::new(HashMap::new()),
@@ -401,7 +401,13 @@ impl ProcessSupervisor {
                 }
             }
         });
-        *self.inner.sampler_task.lock().expect("sampler task mutex") = Some(task);
+        // Startup holds its scope operation lock, so successful shutdown cannot yet
+        // hold the sampler mutex while joining. No suspension during registration.
+        *self
+            .inner
+            .sampler_task
+            .try_lock()
+            .expect("sampler startup serialized with shutdown") = Some(task);
     }
 
     /// Waits for a process to reach its reaped terminal state.
@@ -673,15 +679,13 @@ impl ProcessSupervisor {
         // No future spawn can be admitted, and admitted spawns registered their sampler
         // before releasing the scope operation lock. Stop and join the coordinator now,
         // even if its interval is long and the user retains the supervisor indefinitely.
-        let sampler = self
-            .inner
-            .sampler_task
-            .lock()
-            .expect("sampler task mutex")
-            .take();
-        if let Some(sampler) = sampler {
-            sampler.abort();
-            let _ = sampler.await;
+        let mut sampler = self.inner.sampler_task.lock().await;
+        if let Some(task) = sampler.as_mut() {
+            task.abort();
+            // Keep the handle in Inner until joining finishes. If this shutdown is
+            // cancelled, the next caller must still join the pending destruction.
+            let _ = task.await;
+            *sampler = None;
         }
         Ok(ShutdownReport { scopes: reports })
     }
@@ -832,6 +836,43 @@ mod sampler_shutdown_tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn cancelled_shutdown_preserves_sampler_join_for_retry() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        let ports = Arc::new(Ports {
+            fail_cleanup: AtomicBool::new(false),
+        });
+        let sup = ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports);
+        sup.start_sampler();
+        let sampler = sup
+            .inner
+            .sampler_task
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        let mut shutdown = Box::pin(sup.shutdown());
+        // Do not yield to the runtime: abort is requested, but task destruction has
+        // not run. Cancelling this caller must leave the join handle available.
+        assert!(matches!(
+            shutdown.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        drop(shutdown);
+        assert!(!sampler.is_finished());
+        let mut retry = Box::pin(sup.shutdown());
+        assert!(
+            matches!(retry.as_mut().poll(&mut context), Poll::Pending),
+            "retry reported success before the aborted sampler finished"
+        );
+        retry.await.unwrap();
+        assert!(sampler.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn successful_shutdown_joins_sampler_but_failed_cleanup_keeps_it_running() {
         let ports = Arc::new(Ports {
             fail_cleanup: AtomicBool::new(true),
@@ -851,7 +892,7 @@ mod sampler_shutdown_tests {
             .inner
             .sampler_task
             .lock()
-            .unwrap()
+            .await
             .as_ref()
             .unwrap()
             .abort_handle();
