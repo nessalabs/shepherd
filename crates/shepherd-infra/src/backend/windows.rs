@@ -320,10 +320,7 @@ impl ProcessBackend for WindowsJobBackend {
             loop {
                 #[cfg(test)]
                 let status = if std::mem::take(&mut fail_first_wait) {
-                    Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "injected native wait error",
-                    ))
+                    Err(io::Error::other("injected native wait error"))
                 } else {
                     child.wait().await
                 };
