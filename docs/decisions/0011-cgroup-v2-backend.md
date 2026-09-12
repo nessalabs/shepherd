@@ -85,3 +85,10 @@ and group signals never use that unverified PGID; hard cleanup still attempts re
 root identities. The quarantine remains even if a later root wait recovers, because root
 reap does not establish that the old group ID is safe. Cgroup kill remains independently
 available. On targets without a safe retained root identity, this fails closed.
+
+A failed OS wait retains the actual Tokio Child, not just its last error. A later wait
+requests another native observation through a one-entry coalescing channel; permanent
+errors do not retry autonomously. The waiter owns only a weak backend-state reference.
+Dropping backend state closes the channel and releases an idle failed waiter. The
+supervisor's identity-safe kill backstop runs before that disposal; Child kill-on-drop
+remains disabled because an errored raw PID is not proof of identity.
