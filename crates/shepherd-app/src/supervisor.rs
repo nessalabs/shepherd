@@ -406,17 +406,12 @@ impl ProcessSupervisor {
             // A normal worker publishes before returning. This observer only handles
             // failures, so runtime shutdown cannot lose an already completed result.
             if let Err(error) = cleanup.await {
-                report_tx.send_if_modified(|current| {
-                    if current.as_ref().is_some_and(|result| {
-                        result.as_ref().is_ok_and(|report| report.all_verified())
-                    }) {
-                        return false;
-                    }
-                    *current = Some(Err(TerminateError::Signal(format!(
+                publish_scope_cleanup_result(
+                    &report_tx,
+                    Err(TerminateError::Signal(format!(
                         "scope cleanup worker failed: {error}"
-                    ))));
-                    true
-                });
+                    ))),
+                );
             }
         });
         let mut processes = Vec::new();
@@ -480,16 +475,7 @@ impl ProcessSupervisor {
         };
         // No suspension between completed cleanup, publication and history retention.
         // Never replace a concurrently published verified external cleanup with error.
-        report_tx.send_if_modified(|current| {
-            if current
-                .as_ref()
-                .is_some_and(|result| result.as_ref().is_ok_and(|report| report.all_verified()))
-            {
-                return false;
-            }
-            *current = Some(result);
-            true
-        });
+        publish_scope_cleanup_result(&report_tx, result);
         let verified = report_tx
             .borrow()
             .as_ref()
@@ -1044,6 +1030,22 @@ impl ProcessSupervisor {
     }
 }
 
+fn publish_scope_cleanup_result(
+    sender: &ScopeCleanupSender,
+    result: Result<ScopeTerminationReport, TerminateError>,
+) {
+    sender.send_if_modified(|current| {
+        if current
+            .as_ref()
+            .is_some_and(|result| result.as_ref().is_ok_and(|report| report.all_verified()))
+        {
+            return false;
+        }
+        *current = Some(result);
+        true
+    });
+}
+
 type ScopeCleanupSender =
     tokio::sync::watch::Sender<Option<Result<ScopeTerminationReport, TerminateError>>>;
 struct ScopeExit {
@@ -1168,6 +1170,30 @@ mod scope_operation_tests {
     fn supervisor() -> ProcessSupervisor {
         let ports = Arc::new(EmptyPorts);
         ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports)
+    }
+
+    #[test]
+    fn worker_error_publication_cannot_downgrade_verified_external_cleanup() {
+        let supervisor = supervisor();
+        let scope = supervisor.create_scope();
+        let report = ScopeTerminationReport {
+            scope,
+            outcomes: Vec::new(),
+        };
+        let (sender, receiver) = tokio::sync::watch::channel(Some(Ok(report)));
+        // Both normal cleanup errors and the JoinError observer use this atomic helper.
+        publish_scope_cleanup_result(&sender, Err(TerminateError::UnknownScope(scope)));
+        publish_scope_cleanup_result(
+            &sender,
+            Err(TerminateError::Signal("worker panicked".into())),
+        );
+        assert!(receiver
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .all_verified());
     }
 
     #[tokio::test]
