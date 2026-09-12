@@ -787,28 +787,25 @@ impl ProcessBackend for UnixProcessBackend {
         if let Some(cgroups) = &self.cgroups {
             if let Err(error) = cgroups.kill(scope) {
                 tracing::error!(%scope, %error, "cgroup hard kill failed; attempting registered roots only");
-                let state = self.state.lock().expect("unix backend mutex");
-                kill_registered_roots(&state, scope);
             }
+            let state = self.state.lock().expect("unix backend mutex");
+            kill_registered_roots(&state, Some(scope));
             return;
         }
         let mut state = self.state.lock().expect("unix backend mutex");
         if let Err(error) = signal_group(&mut state, scope, NixSignal::SIGKILL) {
             tracing::error!(%error, "cannot safely signal scope group after anchor loss");
-            kill_registered_roots(&state, scope);
         }
+        // Cleanup may have retired the group while a failed reap retained a root.
+        kill_registered_roots(&state, Some(scope));
     }
 
     fn hard_kill_all(&self) {
         #[cfg(target_os = "linux")]
         if let Some(cgroups) = &self.cgroups {
-            let failed = cgroups.kill_all();
-            if !failed.is_empty() {
-                let state = self.state.lock().expect("unix backend mutex");
-                for scope in failed {
-                    kill_registered_roots(&state, scope);
-                }
-            }
+            let _ = cgroups.kill_all();
+            let state = self.state.lock().expect("unix backend mutex");
+            kill_registered_roots(&state, None);
             return;
         }
         let mut state = self.state.lock().expect("unix backend mutex");
@@ -816,9 +813,9 @@ impl ProcessBackend for UnixProcessBackend {
         for scope in scopes {
             if let Err(error) = signal_group(&mut state, scope, NixSignal::SIGKILL) {
                 tracing::error!(%error, "cannot safely signal scope group after anchor loss");
-                kill_registered_roots(&state, scope);
             }
         }
+        kill_registered_roots(&state, None);
     }
 }
 
@@ -857,11 +854,11 @@ fn signal_group(
     }
 }
 
-fn kill_registered_roots(state: &State, scope: ProcessScopeId) {
+fn kill_registered_roots(state: &State, scope: Option<ProcessScopeId>) {
     for ((pid, token), slot) in state
         .children
         .iter()
-        .filter(|(_, slot)| slot.scope == scope)
+        .filter(|(_, slot)| scope.map_or(true, |scope| slot.scope == scope))
     {
         #[cfg(target_os = "linux")]
         if let Some(fd) = &slot.pidfd {
@@ -1395,6 +1392,64 @@ mod anchor_tests {
                         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
             );
         }
+    }
+
+    async fn removed_group_backstop(all: bool) {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let other = ProcessScopeId::new(2);
+        let spec = ProcessSpec::new("/bin/sleep").arg("30");
+        let root = backend.spawn(scope, &spec).await.unwrap();
+        let sibling = backend.spawn(other, &spec).await.unwrap();
+        let group = backend
+            .state
+            .lock()
+            .unwrap()
+            .scope_groups
+            .remove(&scope)
+            .unwrap();
+        if all {
+            backend.hard_kill_all();
+        } else {
+            backend.hard_kill_scope(scope);
+        }
+        let result = tokio::time::timeout(Duration::from_secs(2), backend.wait(&root)).await;
+        // Restore the real anchor's group before cleanup, including on regression failure.
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .scope_groups
+            .insert(scope, group);
+        let sibling_alive = identity_still_matches(&sibling.os);
+        backend.hard_kill_all();
+        if result.is_err() {
+            let _ = backend.wait(&root).await;
+        }
+        let sibling_exit = backend.wait(&sibling).await.unwrap();
+        backend.cleanup_scope(scope).await.unwrap();
+        backend.cleanup_scope(other).await.unwrap();
+        assert_eq!(
+            result
+                .expect("retained root was hidden by missing group")
+                .unwrap()
+                .signal,
+            Some(Signal::Kill)
+        );
+        assert_eq!(sibling_exit.signal, Some(Signal::Kill));
+        if !all {
+            assert!(sibling_alive, "scope backstop killed sibling scope");
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_backstop_reaches_root_after_group_removal() {
+        removed_group_backstop(false).await;
+    }
+
+    #[tokio::test]
+    async fn global_backstop_reaches_root_after_group_removal() {
+        removed_group_backstop(true).await;
     }
 
     #[tokio::test]
