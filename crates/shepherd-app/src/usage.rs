@@ -40,7 +40,8 @@ pub enum UsageSelection {
     ProcessGroup,
 }
 
-/// A sum and the number of processes contributing to it. None means no data.
+/// A sum and the number of processes contributing to it. None means no data
+/// (zero contributors) or integer overflow (nonzero contributors).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageTotal<T> {
     pub value: Option<T>,

@@ -148,6 +148,21 @@ async fn cycle(sup: &shepherd::ProcessSupervisor, kind: usize) {
     };
     let pid = sup.spawn(scope, spec).await.unwrap();
     let output = sup.take_output(pid).unwrap();
+    if kind == 0 {
+        let tree = shepherd::process_observer()
+            .tree_usage(sup.os_pid(pid).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(tree.usage.totals(None).resident_bytes.contributors, 1);
+        match sup.scope_usage(scope).await {
+            Ok(_) => {}
+            Err(shepherd::ObservationError::Unsupported) => assert_eq!(
+                sup.capabilities().descendant_containment,
+                shepherd::Containment::ProcessGroup
+            ),
+            Err(e) => panic!("scope usage failed during stable workload: {e}"),
+        }
+    }
     if kind == 1 {
         assert!(sup.wait(pid).await.unwrap().outcome.is_verified());
     }

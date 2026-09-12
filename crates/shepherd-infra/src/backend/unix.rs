@@ -565,13 +565,14 @@ impl ProcessBackend for UnixProcessBackend {
         }
         #[cfg(target_os = "linux")]
         {
-            let directory = self
+            let cgroups = self
                 .cgroups
-                .as_ref()
-                .ok_or(shepherd_app::ObservationError::Unsupported)?
-                .accounting_directory(scope)
-                .map_err(|e| shepherd_app::ObservationError::Backend(e.to_string()))?;
+                .clone()
+                .ok_or(shepherd_app::ObservationError::Unsupported)?;
             return crate::usage::blocking(move || {
+                let directory = cgroups
+                    .accounting_directory(scope)
+                    .map_err(|e| shepherd_app::ObservationError::Backend(e.to_string()))?;
                 super::cgroup::accounting(directory)
                     .map(shepherd_app::ScopeUsage::Accounting)
                     .map_err(|e| shepherd_app::ObservationError::Backend(e.to_string()))
