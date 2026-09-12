@@ -253,6 +253,17 @@ impl ProcessSupervisor {
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return Err(SpawnError::ScopeClosed(scope));
         }
+        // Cleanup can publish its report and remove the scope while this spawn
+        // waits on the old operation lock. Preserve the closed-scope error then.
+        if self
+            .inner
+            .reports
+            .lock()
+            .expect("reports mutex")
+            .contains_key(&scope)
+        {
+            return Err(SpawnError::ScopeClosed(scope));
+        }
         {
             let registry = self.lock_registry();
             let s = registry.get(scope).ok_or(SpawnError::UnknownScope(scope))?;
@@ -997,5 +1008,83 @@ impl Drop for ScopeCleanupBackstop {
                 "scope cleanup interrupted or unverified; synchronous backstop issued".into(),
             ))));
         }
+    }
+}
+
+#[cfg(test)]
+mod spawn_cleanup_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::future::Future;
+    use std::task::Context;
+
+    // This regression closes an empty scope: no process operation should be reached.
+    struct EmptyPorts;
+    #[async_trait]
+    impl ProcessBackend for EmptyPorts {
+        async fn spawn(&self, _: ProcessScopeId, _: &ProcessSpec) -> Result<Spawned, SpawnError> {
+            panic!("a queued spawn must not reach the backend after scope cleanup")
+        }
+        async fn signal(&self, _: &Spawned, _: Signal) -> Result<(), TerminateError> {
+            unreachable!()
+        }
+        async fn signal_scope(&self, _: ProcessScopeId, _: Signal) -> Result<(), TerminateError> {
+            Ok(())
+        }
+        async fn wait(&self, _: &Spawned) -> Result<shepherd_domain::RawExit, WaitError> {
+            unreachable!()
+        }
+        async fn sample(&self, _: &Spawned) -> Result<shepherd_domain::RawStats, StatsError> {
+            unreachable!()
+        }
+        fn capabilities(&self) -> shepherd_domain::Capabilities {
+            unreachable!()
+        }
+        fn hard_kill_all(&self) {}
+        fn hard_kill_scope(&self, _: ProcessScopeId) {}
+    }
+    #[async_trait]
+    impl Clock for EmptyPorts {
+        fn now(&self) -> Instant {
+            unreachable!()
+        }
+        async fn sleep(&self, _: Duration) {
+            unreachable!()
+        }
+    }
+    impl Waiters for EmptyPorts {
+        fn signal_exit(&self, _: ProcessId, _: ProcessExit) {
+            unreachable!()
+        }
+        fn try_get(&self, _: ProcessId) -> Option<ProcessExit> {
+            unreachable!()
+        }
+        fn wait(&self, _: ProcessId) -> crate::ports::WaitFuture {
+            unreachable!()
+        }
+    }
+    #[async_trait]
+    impl IntegrationEventPublisher for EmptyPorts {
+        async fn publish(&self, _: shepherd_domain::IntegrationEvent) {}
+    }
+
+    #[tokio::test]
+    async fn spawn_queued_behind_cleanup_reports_scope_closed() {
+        let ports = Arc::new(EmptyPorts);
+        let sup = ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports);
+        let scope = sup.create_scope();
+        let operation = sup.scope_operation(scope).unwrap();
+        let held = operation.lock().await;
+        let mut cleanup = std::pin::pin!(sup.terminate_scope(scope, TerminateOptions::default()));
+        let mut spawn = std::pin::pin!(sup.spawn_owned(scope, ProcessSpec::new("unused")));
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        // Explicit polls establish FIFO lock order, with spawn retaining the old lock
+        // while cleanup will remove both the registry entry and its lock-map entry.
+        assert!(cleanup.as_mut().poll(&mut cx).is_pending());
+        assert!(spawn.as_mut().poll(&mut cx).is_pending());
+        drop(held);
+        assert!(cleanup.await.unwrap().all_verified());
+        assert!(sup.processes(scope).is_none());
+        assert!(matches!(spawn.await, Err(SpawnError::ScopeClosed(id)) if id == scope));
     }
 }
