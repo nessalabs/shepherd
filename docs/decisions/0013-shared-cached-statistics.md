@@ -28,3 +28,8 @@ Unsupported platforms continue to report Unsupported rather than invented usage.
 
 The registry is checked again before publishing a completed sample. Reaping drops
 cache entries and CPU baselines. Hundreds of roots share a task, not OS threads.
+
+The cache contract test runs on every CI platform, including Windows with this
+phase's NullBackend fallback. It verifies caching and post-exit invalidation,
+without claiming real Windows resource measurements. Real CPU/RSS observations
+are tested on Unix and real I/O counters on Linux in this phase.
