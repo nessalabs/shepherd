@@ -2,6 +2,9 @@
 #![cfg(any(unix, windows))]
 use shepherd::{GracePeriod, OutputMode, ProcessSpec, SupervisorBuilder, TerminateOptions};
 use std::time::Duration;
+#[cfg(windows)]
+#[path = "support/windows_handles.rs"]
+mod windows_handles;
 #[cfg(unix)]
 fn handles() -> usize {
     #[cfg(target_os = "linux")]
@@ -211,6 +214,8 @@ async fn run(iterations: usize, seed: u64) {
         .all_verified());
     tokio::time::sleep(Duration::from_millis(100)).await;
     let before = handles();
+    #[cfg(windows)]
+    windows_handles::describe("baseline");
     let mut counts = [0usize; 6];
     let mut state = seed;
     for i in 0..iterations {
@@ -222,6 +227,9 @@ async fn run(iterations: usize, seed: u64) {
             ((state >> 32) as usize) % 6
         };
         counts[kind] += 1;
+        if i > 0 && i % 500 == 0 {
+            eprintln!("resource checkpoint: iteration={i} handles={}", handles());
+        }
         tokio::time::timeout(Duration::from_secs(20), cycle(&sup, kind))
             .await
             .unwrap_or_else(|_| {
@@ -232,6 +240,8 @@ async fn run(iterations: usize, seed: u64) {
     drop(sup);
     tokio::time::sleep(Duration::from_millis(200)).await;
     let after = handles();
+    #[cfg(windows)]
+    windows_handles::describe("after cleanup");
     eprintln!("resource inspection: {iterations} mixed cycles; seed={seed}; scenario counts={counts:?}; handles before={before}, after={after}");
     assert!(
         after <= before,
