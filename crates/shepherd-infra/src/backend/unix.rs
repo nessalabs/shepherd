@@ -378,7 +378,13 @@ impl ProcessBackend for UnixProcessBackend {
         let mut readers = Vec::new();
         if let Some(output) = &output {
             use shepherd_app::output::OutputStream;
-            if let Some(stdout) = child.stdout.take() {
+            if let Some(stdout) = child.child.as_mut().expect("owned child").stdout.take() {
+                let stdout = tokio::process::ChildStdout::from_std(stdout).map_err(|error| {
+                    // Pipe conversion failed before registration; this child is still
+                    // exclusively owned, and NativeChild's drop guard will reap it.
+                    let _ = child.child.as_mut().expect("owned child").kill();
+                    SpawnError::Os(error.to_string())
+                })?;
                 readers.push((
                     OutputStream::Stdout,
                     tokio::spawn(crate::output::drain(
@@ -388,7 +394,13 @@ impl ProcessBackend for UnixProcessBackend {
                     )),
                 ));
             }
-            if let Some(stderr) = child.stderr.take() {
+            if let Some(stderr) = child.child.as_mut().expect("owned child").stderr.take() {
+                let stderr = tokio::process::ChildStderr::from_std(stderr).map_err(|error| {
+                    // Pipe conversion failed before registration; this child is still
+                    // exclusively owned, and NativeChild's drop guard will reap it.
+                    let _ = child.child.as_mut().expect("owned child").kill();
+                    SpawnError::Os(error.to_string())
+                })?;
                 readers.push((
                     OutputStream::Stderr,
                     tokio::spawn(crate::output::drain(
