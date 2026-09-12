@@ -97,12 +97,14 @@ removal, independent sampling under stalled targets, bounded retained output and
 scope histories, scope-local output ownership, admitted-spawn shutdown ordering,
 dead process-group anchors, and typed closed-scope races. Further review covered
 verified-only scope completion events, outcomes surviving failed/canceled cleanup,
-constant-time partial output eviction, retired operation locks, and cleanup-worker
-panics. The macOS CPU-unit finding was checked against pinned XNU source and
+constant-time partial output eviction, retired/atomically published operation locks,
+cleanup-worker panics and result publication before runtime backstop disarm. Successful
+shutdown stops and joins the sampler. Bounded event publication is present in the
+introducing PR as well as final hardening. The macOS CPU-unit finding was checked against pinned XNU source and
 mutation-tested on Apple Silicon; the required single conversion remains intact.
 ADRs 0011, 0013–0015, 0017 and 0019 record these decisions and limitations.
 
-The final integrated production changes at
+An integrated review checkpoint at
 `a461bbb79010f63e2dafbe7f2dd46df0699e0a1a` passed:
 
 - [All 18 CI jobs](https://github.com/nessalabs/shepherd/actions/runs/34683443584),
