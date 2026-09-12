@@ -424,3 +424,6 @@ populated=0 → remove containment directory → return report (ADR 0011).
 
 Interval sampling: Weak supervisor → snapshot live roots → backend observations →
 check still live → cache. `stats(pid)` reads cache; reap removes cache and CPU baseline.
+
+Capture output: OS stdout/stderr → independent readers → OutputSink bounded queue
++ capped tail → ProcessOutput observer. Observer ownership never extends child lifetime.

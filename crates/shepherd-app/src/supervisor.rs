@@ -105,12 +105,28 @@ struct Inner {
     scope_operations: Mutex<HashMap<ProcessScopeId, Arc<ScopeOperation>>>,
     samples: Mutex<HashMap<ProcessId, Result<ProcessStats, StatsError>>>,
     sampler_started: AtomicBool,
+    outputs: Mutex<HashMap<ProcessId, crate::output::ProcessOutput>>,
+    completed: Mutex<VecDeque<ProcessId>>,
     sampler_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     stats_interval: Duration,
     reports: Mutex<HashMap<ProcessScopeId, ScopeTerminationReport>>,
     pending_outcomes: Mutex<HashMap<ProcessScopeId, HashMap<ProcessId, TerminationOutcome>>>,
     completed_scopes: Mutex<VecDeque<ProcessScopeId>>,
     shutdown_serial: tokio::sync::Mutex<()>,
+}
+
+// Claims and completion share this lock order; only retained captures consume history.
+fn retain_completed_output(inner: &Inner, pid: ProcessId) {
+    let mut completed = inner.completed.lock().expect("completed mutex");
+    let mut outputs = inner.outputs.lock().expect("outputs mutex");
+    if outputs.contains_key(&pid) && !completed.contains(&pid) {
+        completed.push_back(pid);
+        while completed.len() > 256 {
+            if let Some(old) = completed.pop_front() {
+                outputs.remove(&old);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for ProcessSupervisor {
@@ -164,6 +180,8 @@ impl ProcessSupervisor {
                 scope_operations: Mutex::new(HashMap::new()),
                 samples: Mutex::new(HashMap::new()),
                 sampler_started: AtomicBool::new(false),
+                outputs: Mutex::new(HashMap::new()),
+                completed: Mutex::new(VecDeque::new()),
                 sampler_task: tokio::sync::Mutex::new(None),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
                 reports: Mutex::new(HashMap::new()),
@@ -334,11 +352,34 @@ impl ProcessSupervisor {
             .lock()
             .expect("spawn_times mutex")
             .insert(pid, self.inner.clock.now());
+        if let Some(output) = self.inner.backend.output(&spawned) {
+            self.inner
+                .outputs
+                .lock()
+                .expect("outputs mutex")
+                .insert(pid, output);
+        }
         // Start ownership monitoring before any cancellable dispatch.
         self.start_monitor(scope, pid, spawned);
         self.start_sampler();
         self.inner.dispatcher.dispatch(&events).await;
         Ok(pid)
+    }
+
+    /// Transfers the capture observer to the caller, at most once per process.
+    /// Call after spawn, or after wait for post-mortem output. Unclaimed observers
+    /// retain the most recent 256 unclaimed captures from verified completed processes.
+    pub fn take_output(&self, pid: ProcessId) -> Option<crate::output::ProcessOutput> {
+        // Serialize claims with completion so neither path leaves a stale history slot.
+        let mut completed = self.inner.completed.lock().expect("completed mutex");
+        let output = self
+            .inner
+            .outputs
+            .lock()
+            .expect("outputs mutex")
+            .remove(&pid);
+        completed.retain(|retained| *retained != pid);
+        output
     }
 
     /// Returns the most recent interval sample, without performing backend I/O.
@@ -650,6 +691,7 @@ impl ProcessSupervisor {
                     }
                 }
             }
+            retain_completed_output(&self.inner, pid);
             // Publish the correction before cancellation can interrupt dispatch/prune.
             // The Waiters contract prevents a delayed old failure from downgrading it.
             self.inner.waiters.signal_exit(pid, exit);
@@ -924,6 +966,7 @@ impl ProcessSupervisor {
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let wait_result = inner.backend.wait(&spawned).await;
+            let verified_reap = wait_result.is_ok();
             let events = {
                 let mut registry = inner.registry.lock().expect("registry mutex");
                 let Some(s) = registry.get_mut(scope) else {
@@ -987,6 +1030,13 @@ impl ProcessSupervisor {
                 events
             };
             inner.samples.lock().expect("samples mutex").remove(&pid);
+            // Evict before external publication: a stalled publisher must not bypass
+            // the retention bound after waiters have observed the terminal exit.
+            // A failed reap may leave a live producer behind this observer. Only
+            // verified completions are eligible for bounded post-mortem eviction.
+            if verified_reap {
+                retain_completed_output(&inner, pid);
+            }
             inner.dispatcher.dispatch(&events).await;
             inner
                 .spawn_times

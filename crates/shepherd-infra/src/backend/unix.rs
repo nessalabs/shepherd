@@ -42,6 +42,7 @@ struct WaitChannels {
 }
 
 struct ChildSlot {
+    output: Option<shepherd_app::output::ProcessOutput>,
     sampling: Arc<std::sync::atomic::AtomicBool>,
     scope: ProcessScopeId,
     retry: tokio::sync::mpsc::Sender<()>,
@@ -197,12 +198,14 @@ impl UnixProcessBackend {
         os: OsIdentity,
         channels: WaitChannels,
         new_group: bool,
+        output: Option<shepherd_app::output::ProcessOutput>,
         #[cfg(target_os = "linux")] pidfd: Option<OwnedFd>,
     ) {
         let mut state = self.state.lock().expect("unix backend mutex");
         state.children.insert(
             child_key(&os),
             ChildSlot {
+                output,
                 sampling: Arc::default(),
                 scope,
                 sender: channels.sender,
@@ -259,6 +262,9 @@ impl UnixProcessBackend {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if matches!(spec.output, shepherd_domain::OutputMode::Capture { .. }) {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
         }
@@ -362,6 +368,49 @@ impl ProcessBackend for UnixProcessBackend {
         #[cfg(target_os = "linux")]
         let pidfd = open_pidfd(pid);
 
+        let output = match spec.output {
+            shepherd_domain::OutputMode::Discard => None,
+            shepherd_domain::OutputMode::Capture {
+                buffer_bytes,
+                tail_bytes,
+            } => Some(crate::output::capture(buffer_bytes, tail_bytes)),
+        };
+        let mut readers = Vec::new();
+        if let Some(output) = &output {
+            use shepherd_app::output::OutputStream;
+            if let Some(stdout) = child.child.as_mut().expect("owned child").stdout.take() {
+                let stdout = tokio::process::ChildStdout::from_std(stdout).map_err(|error| {
+                    // Pipe conversion failed before registration; this child is still
+                    // exclusively owned, and NativeChild's drop guard will reap it.
+                    let _ = child.child.as_mut().expect("owned child").kill();
+                    SpawnError::Os(error.to_string())
+                })?;
+                readers.push((
+                    OutputStream::Stdout,
+                    tokio::spawn(crate::output::drain(
+                        stdout,
+                        output.clone(),
+                        OutputStream::Stdout,
+                    )),
+                ));
+            }
+            if let Some(stderr) = child.child.as_mut().expect("owned child").stderr.take() {
+                let stderr = tokio::process::ChildStderr::from_std(stderr).map_err(|error| {
+                    // Pipe conversion failed before registration; this child is still
+                    // exclusively owned, and NativeChild's drop guard will reap it.
+                    let _ = child.child.as_mut().expect("owned child").kill();
+                    SpawnError::Os(error.to_string())
+                })?;
+                readers.push((
+                    OutputStream::Stderr,
+                    tokio::spawn(crate::output::drain(
+                        stderr,
+                        output.clone(),
+                        OutputStream::Stderr,
+                    )),
+                ));
+            }
+        }
         let (exit_tx, keep_rx) = watch::channel(None);
         let (retry_tx, mut retry_rx) = tokio::sync::mpsc::channel(1);
         #[cfg(test)]
@@ -377,6 +426,7 @@ impl ProcessBackend for UnixProcessBackend {
                 failures: failures.clone(),
             },
             new_group,
+            output.clone(),
             #[cfg(target_os = "linux")]
             pidfd,
         );
@@ -409,6 +459,9 @@ impl ProcessBackend for UnixProcessBackend {
                 if reaped || ownership_lost || retry_rx.recv().await.is_none() {
                     break;
                 }
+            }
+            if let Some(output) = output {
+                crate::output::finish_readers(readers, output).await;
             }
         });
 
@@ -586,6 +639,15 @@ impl ProcessBackend for UnixProcessBackend {
         self.sampling
             .run(active, move || backend.sample_sync(&target))
             .await
+    }
+
+    fn output(&self, target: &Spawned) -> Option<shepherd_app::output::ProcessOutput> {
+        self.state
+            .lock()
+            .expect("unix backend mutex")
+            .children
+            .get(&child_key(&target.os))
+            .and_then(|slot| slot.output.clone())
     }
 
     fn capabilities(&self) -> Capabilities {

@@ -240,3 +240,15 @@ transition). Contains no I/O errors.
 
 ### InvalidTransition
 A domain error indicating an illegal lifecycle transition was attempted.
+
+### ProcessOutput
+Application observation handle for a shared consuming byte queue and post-mortem tail.
+
+### OutputStream
+Application value distinguishing stdout and stderr.
+
+### OutputChunk
+Application value carrying a stream tag and raw bytes.
+
+### OutputSnapshot
+Application value containing drained chunks, tail, overflow count, reader errors and EOF flags.
