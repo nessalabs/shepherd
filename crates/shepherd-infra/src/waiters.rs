@@ -115,7 +115,17 @@ mod tests {
         waiters.signal_exit(pid, failed);
         assert_eq!(waiters.try_get(pid), Some(exit));
         assert_eq!(waiters.wait(pid).await, exit);
-        assert_eq!(waiters.slots.lock().unwrap().completed.iter().filter(|id| **id == pid).count(), 1);
+        assert_eq!(
+            waiters
+                .slots
+                .lock()
+                .unwrap()
+                .completed
+                .iter()
+                .filter(|id| **id == pid)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -132,7 +142,17 @@ mod tests {
         waiters.signal_exit(pid, exit);
         assert_eq!(waiters.try_get(pid), Some(exit));
         assert_eq!(waiters.wait(pid).await, exit);
-        assert_eq!(waiters.slots.lock().unwrap().completed.iter().filter(|id| **id == pid).count(), 1);
+        assert_eq!(
+            waiters
+                .slots
+                .lock()
+                .unwrap()
+                .completed
+                .iter()
+                .filter(|id| **id == pid)
+                .count(),
+            1
+        );
     }
 }
 
