@@ -17,6 +17,7 @@ use crate::registry::ScopeRegistry;
 pub type SharedRegistry = Arc<Mutex<ScopeRegistry>>;
 
 /// Routes committed domain events to the registered handlers in deterministic order.
+#[derive(Clone)]
 pub struct EventDispatcher {
     handlers: Vec<Arc<dyn EventHandler>>,
 }
