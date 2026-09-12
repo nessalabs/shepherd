@@ -8,7 +8,7 @@ ports drive spawn, signal, wait/reap, sample, scope cleanup, synchronous kill an
 output observation. The facade selects real platform adapters and a no-op publisher.
 ADRs 0001–0020 and DIAGRAMS.md describe the implemented decisions.
 
-Public operations: create_scope, spawn, processes, capabilities, cached stats, wait,
+Public operations: create_scope/try_create_scope, spawn, processes, capabilities, cached stats, wait,
 terminate, terminate_scope, shutdown, take_output, with_scope/with_scope_options and
 wait_scope_cleanup. Raw Child ownership is never exposed. WithScopeResult preserves
 the closure value or initial spawn error alongside an independent cleanup result.
@@ -100,7 +100,9 @@ verified-only scope completion events, outcomes surviving failed/canceled cleanu
 constant-time partial output eviction, retired/atomically published operation locks,
 cleanup-worker panics and result publication before runtime backstop disarm. Successful
 shutdown stops and joins the sampler. Bounded event publication is present in the
-introducing PR as well as final hardening. The macOS CPU-unit finding was checked against pinned XNU source and
+introducing PR as well as final hardening. Root reap is independent of inherited-pipe
+EOF; active scoped blocks retain external cleanup results; scoped report history has
+its own budget; checked scope creation rejects shutdown without allocating state. The macOS CPU-unit finding was checked against pinned XNU source and
 mutation-tested on Apple Silicon; the required single conversion remains intact.
 ADRs 0011, 0013–0015, 0017 and 0019 record these decisions and limitations.
 
