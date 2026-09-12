@@ -1,9 +1,13 @@
 //! The `ProcessSupervisor` application service.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use futures_util::future::{AbortHandle, Abortable};
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::FutureExt;
 
 use shepherd_domain::{
     ProcessExit, ProcessId, ProcessScopeId, ProcessSpec, ProcessStats, Signal, TerminationOutcome,
@@ -99,6 +103,10 @@ struct Inner {
     spawn_times: Mutex<HashMap<ProcessId, Instant>>,
     shutting_down: Arc<AtomicBool>,
     scope_operations: Mutex<HashMap<ProcessScopeId, Arc<ScopeOperation>>>,
+    samples: Mutex<HashMap<ProcessId, Result<ProcessStats, StatsError>>>,
+    sampler_started: AtomicBool,
+    sampler_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    stats_interval: Duration,
     reports: Mutex<HashMap<ProcessScopeId, ScopeTerminationReport>>,
     pending_outcomes: Mutex<HashMap<ProcessScopeId, HashMap<ProcessId, TerminationOutcome>>>,
     completed_scopes: Mutex<VecDeque<ProcessScopeId>>,
@@ -122,6 +130,19 @@ impl ProcessSupervisor {
         waiters: Arc<dyn Waiters>,
         publisher: Arc<dyn IntegrationEventPublisher>,
     ) -> Self {
+        Self::with_stats_interval(backend, clock, waiters, publisher, Duration::from_secs(1))
+    }
+
+    /// Constructs a supervisor with one shared interval sampler, started on first spawn.
+    /// Zero intervals are clamped to one millisecond.
+    #[must_use]
+    pub fn with_stats_interval(
+        backend: Arc<dyn ProcessBackend>,
+        clock: Arc<dyn Clock>,
+        waiters: Arc<dyn Waiters>,
+        publisher: Arc<dyn IntegrationEventPublisher>,
+        stats_interval: Duration,
+    ) -> Self {
         let registry: SharedRegistry = Arc::new(Mutex::new(ScopeRegistry::new()));
         let shutting_down = Arc::new(AtomicBool::new(false));
         let handlers: Vec<Arc<dyn EventHandler>> = vec![
@@ -141,6 +162,10 @@ impl ProcessSupervisor {
                 dispatcher: EventDispatcher::new(handlers),
                 spawn_times: Mutex::new(HashMap::new()),
                 scope_operations: Mutex::new(HashMap::new()),
+                samples: Mutex::new(HashMap::new()),
+                sampler_started: AtomicBool::new(false),
+                sampler_task: tokio::sync::Mutex::new(None),
+                stats_interval: stats_interval.max(Duration::from_millis(1)),
                 reports: Mutex::new(HashMap::new()),
                 pending_outcomes: Mutex::new(HashMap::new()),
                 completed_scopes: Mutex::new(VecDeque::new()),
@@ -311,44 +336,116 @@ impl ProcessSupervisor {
             .insert(pid, self.inner.clock.now());
         // Start ownership monitoring before any cancellable dispatch.
         self.start_monitor(scope, pid, spawned);
+        self.start_sampler();
         self.inner.dispatcher.dispatch(&events).await;
         Ok(pid)
     }
 
-    /// Samples current resource usage for a live process.
-    ///
-    /// # Errors
-    /// Returns [`StatsError`] if the process is unknown/not live or sampling fails.
+    /// Returns the most recent interval sample, without performing backend I/O.
+    /// CPU is a fraction of one core. Uptime is measured at sample time.
+    /// Returns NotReady until the first observation, or the last sampling error.
     pub async fn stats(&self, pid: ProcessId) -> Result<ProcessStats, StatsError> {
-        let (spawned, start) = {
-            let registry = self.lock_registry();
-            let scope = registry
-                .scope_of(pid)
-                .ok_or(StatsError::UnknownProcess(pid))?;
-            let s = registry.get(scope).expect("scope exists");
-            let process = s.get(pid).ok_or(StatsError::UnknownProcess(pid))?;
-            if !process.state().is_live() {
-                return Err(StatsError::UnknownProcess(pid));
+        let registry = self.lock_registry();
+        let live = registry
+            .scope_of(pid)
+            .and_then(|id| registry.get(id))
+            .and_then(|s| s.get(pid))
+            .is_some_and(|p| p.state().is_live());
+        if !live {
+            return Err(StatsError::UnknownProcess(pid));
+        }
+        self.inner
+            .samples
+            .lock()
+            .expect("samples mutex")
+            .get(&pid)
+            .cloned()
+            .unwrap_or(Err(StatsError::NotReady(pid)))
+    }
+
+    fn start_sampler(&self) {
+        if self.inner.sampler_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        let interval = self.inner.stats_interval;
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut pending = FuturesUnordered::new();
+            let mut active = HashMap::<ProcessId, AbortHandle>::new();
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let Some(inner) = weak.upgrade() else { break; };
+                        let targets = {
+                            let registry = inner.registry.lock().expect("registry mutex");
+                            registry.scope_ids().into_iter().flat_map(|id| {
+                                let scope = registry.get(id).expect("scope exists");
+                                scope.live_process_ids().into_iter().map(|pid| {
+                                    (pid, Spawned {
+                                        os: scope.get(pid).expect("process exists").os_identity(),
+                                    })
+                                }).collect::<Vec<_>>()
+                            }).collect::<Vec<_>>()
+                        };
+                        let live: HashSet<_> = targets.iter().map(|(pid, _)| *pid).collect();
+                        for (pid, abort) in &active {
+                            if !live.contains(pid) {
+                                abort.abort();
+                            }
+                        }
+                        for (pid, target) in targets {
+                            // One observation per root, with no queue of missed intervals.
+                            if active.contains_key(&pid) { continue; }
+                            let backend = Arc::clone(&inner.backend);
+                            let (abort, registration) = AbortHandle::new_pair();
+                            active.insert(pid, abort);
+                            pending.push(async move {
+                                let observed = Abortable::new(async {
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(1),
+                                        std::panic::AssertUnwindSafe(backend.sample(&target)).catch_unwind(),
+                                    ).await {
+                                        Ok(Ok(result)) => result,
+                                        Ok(Err(_)) => Err(StatsError::Backend("sampler panicked".into())),
+                                        Err(_) => Err(StatsError::Backend("sampler timeout".into())),
+                                    }
+                                }, registration).await;
+                                (pid, observed)
+                            }.boxed());
+                        }
+                    }
+                    Some((pid, observed)) = pending.next(), if !pending.is_empty() => {
+                        active.remove(&pid);
+                        let Ok(observed) = observed else { continue; };
+                        let Some(inner) = weak.upgrade() else { break; };
+                        let sample = observed.map(|raw| {
+                            let start = inner.spawn_times.lock().expect("spawn times mutex")
+                                .get(&pid).copied();
+                            let uptime = start.map(|s| inner.clock.now().saturating_duration_since(s))
+                                .unwrap_or_default();
+                            ProcessStats::from_raw(pid, raw, uptime)
+                        });
+                        // Recheck under registry -> samples lock order: a result after reap
+                        // must never resurrect a cache entry.
+                        let registry = inner.registry.lock().expect("registry mutex");
+                        let live = registry.scope_of(pid).and_then(|id| registry.get(id))
+                            .and_then(|s| s.get(pid)).is_some_and(|p| p.state().is_live());
+                        if live {
+                            inner.samples.lock().expect("samples mutex").insert(pid, sample);
+                        }
+                    }
+                }
             }
-            let start = self
-                .inner
-                .spawn_times
-                .lock()
-                .expect("spawn_times mutex")
-                .get(&pid)
-                .copied();
-            (
-                Spawned {
-                    os: process.os_identity(),
-                },
-                start,
-            )
-        };
-        let raw = self.inner.backend.sample(&spawned).await?;
-        let uptime = start
-            .map(|s| self.inner.clock.now().saturating_duration_since(s))
-            .unwrap_or_default();
-        Ok(ProcessStats::from_raw(pid, raw, uptime))
+        });
+        // Startup holds its scope operation lock, so successful shutdown cannot yet
+        // hold the sampler mutex while joining. No suspension during registration.
+        *self
+            .inner
+            .sampler_task
+            .try_lock()
+            .expect("sampler startup serialized with shutdown") = Some(task);
     }
 
     /// Waits for a process to reach its reaped terminal state.
@@ -800,6 +897,17 @@ impl ProcessSupervisor {
         if unverified > 0 {
             return Err(ShutdownError::Unverified(unverified));
         }
+        // No future spawn can be admitted, and admitted spawns registered their sampler
+        // before releasing the scope operation lock. Stop and join the coordinator now,
+        // even if its interval is long and the user retains the supervisor indefinitely.
+        let mut sampler = self.inner.sampler_task.lock().await;
+        if let Some(task) = sampler.as_mut() {
+            task.abort();
+            // Keep the handle in Inner until joining finishes. If this shutdown is
+            // cancelled, the next caller must still join the pending destruction.
+            let _ = task.await;
+            *sampler = None;
+        }
         Ok(ShutdownReport { scopes: reports })
     }
 
@@ -878,6 +986,7 @@ impl ProcessSupervisor {
                 });
                 events
             };
+            inner.samples.lock().expect("samples mutex").remove(&pid);
             inner.dispatcher.dispatch(&events).await;
             inner
                 .spawn_times
@@ -885,6 +994,152 @@ impl ProcessSupervisor {
                 .expect("spawn_times mutex")
                 .remove(&pid);
         });
+    }
+}
+
+#[cfg(test)]
+mod sampler_shutdown_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    struct Ports {
+        fail_cleanup: AtomicBool,
+    }
+    #[async_trait]
+    impl ProcessBackend for Ports {
+        async fn spawn(&self, _: ProcessScopeId, _: &ProcessSpec) -> Result<Spawned, SpawnError> {
+            unreachable!()
+        }
+        async fn signal(&self, _: &Spawned, _: Signal) -> Result<(), TerminateError> {
+            unreachable!()
+        }
+        async fn signal_scope(&self, _: ProcessScopeId, _: Signal) -> Result<(), TerminateError> {
+            if self.fail_cleanup.load(Ordering::SeqCst) {
+                Err(TerminateError::Signal("injected cleanup failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn wait(&self, _: &Spawned) -> Result<shepherd_domain::RawExit, WaitError> {
+            unreachable!()
+        }
+        async fn sample(&self, _: &Spawned) -> Result<shepherd_domain::RawStats, StatsError> {
+            unreachable!()
+        }
+        fn capabilities(&self) -> shepherd_domain::Capabilities {
+            unreachable!()
+        }
+        fn hard_kill_all(&self) {}
+    }
+    #[async_trait]
+    impl Clock for Ports {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+        async fn sleep(&self, duration: Duration) {
+            tokio::time::sleep(duration).await;
+        }
+    }
+    impl Waiters for Ports {
+        fn signal_exit(&self, _: ProcessId, _: ProcessExit) {
+            unreachable!()
+        }
+        fn try_get(&self, _: ProcessId) -> Option<ProcessExit> {
+            unreachable!()
+        }
+        fn wait(&self, _: ProcessId) -> crate::ports::WaitFuture {
+            unreachable!()
+        }
+    }
+    #[async_trait]
+    impl IntegrationEventPublisher for Ports {
+        async fn publish(&self, _: shepherd_domain::IntegrationEvent) {}
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_shutdown_preserves_sampler_join_for_retry() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        let ports = Arc::new(Ports {
+            fail_cleanup: AtomicBool::new(false),
+        });
+        let sup = ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports);
+        sup.start_sampler();
+        let sampler = sup
+            .inner
+            .sampler_task
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        let mut shutdown = Box::pin(sup.shutdown());
+        // Do not yield to the runtime: abort is requested, but task destruction has
+        // not run. Cancelling this caller must leave the join handle available.
+        assert!(matches!(
+            shutdown.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        drop(shutdown);
+        assert!(!sampler.is_finished());
+        let mut retry = Box::pin(sup.shutdown());
+        assert!(
+            matches!(retry.as_mut().poll(&mut context), Poll::Pending),
+            "retry reported success before the aborted sampler finished"
+        );
+        retry.await.unwrap();
+        assert!(sampler.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_shutdown_joins_sampler_but_failed_cleanup_keeps_it_running() {
+        let ports = Arc::new(Ports {
+            fail_cleanup: AtomicBool::new(true),
+        });
+        let sup = ProcessSupervisor::with_stats_interval(
+            ports.clone(),
+            ports.clone(),
+            ports.clone(),
+            ports.clone(),
+            Duration::from_secs(3600),
+        );
+        sup.create_scope();
+        // Start the same coordinator that spawn starts, with no roots to distract from
+        // the idle-timer bug. Observe the task itself, not whether sample() was called.
+        sup.start_sampler();
+        let sampler = sup
+            .inner
+            .sampler_task
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        tokio::task::yield_now().await;
+        assert!(!sampler.is_finished());
+        assert!(matches!(
+            sup.shutdown().await,
+            Err(ShutdownError::Unverified(1))
+        ));
+        assert!(!sampler.is_finished(), "failed cleanup stopped observation");
+        ports.fail_cleanup.store(false, Ordering::SeqCst);
+        let before = tokio::time::Instant::now();
+        sup.shutdown().await.unwrap();
+        assert!(
+            sampler.is_finished(),
+            "successful shutdown left the coordinator alive"
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before,
+            "shutdown waited for a sampler tick"
+        );
+        // A retained supervisor and repeated shutdown must not restart its timer.
+        tokio::time::advance(Duration::from_secs(7200)).await;
+        sup.shutdown().await.unwrap();
+        assert!(sampler.is_finished());
     }
 }
 

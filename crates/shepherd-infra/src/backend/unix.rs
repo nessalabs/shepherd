@@ -42,6 +42,7 @@ struct WaitChannels {
 }
 
 struct ChildSlot {
+    sampling: Arc<std::sync::atomic::AtomicBool>,
     scope: ProcessScopeId,
     retry: tokio::sync::mpsc::Sender<()>,
     #[cfg(test)]
@@ -63,6 +64,8 @@ struct ScopeGroup {
 #[derive(Default)]
 struct State {
     children: HashMap<ChildKey, ChildSlot>,
+    #[cfg(target_os = "linux")]
+    cpu_samples: HashMap<ChildKey, (std::time::Instant, u64)>,
     scope_groups: HashMap<ProcessScopeId, ScopeGroup>,
     /// Serializes spawns per scope so the first process creates exactly one process group.
     scope_locks: HashMap<ProcessScopeId, Arc<tokio::sync::Mutex<()>>>,
@@ -71,6 +74,7 @@ struct State {
 /// A real Unix [`ProcessBackend`].
 #[derive(Clone, Default)]
 pub struct UnixProcessBackend {
+    sampling: super::sampling::SamplingPool,
     state: Arc<Mutex<State>>,
     #[cfg(target_os = "linux")]
     cgroups: Option<Arc<super::cgroup::Cgroups>>,
@@ -83,6 +87,56 @@ impl std::fmt::Debug for UnixProcessBackend {
 }
 
 impl UnixProcessBackend {
+    fn sample_sync(&self, target: &Spawned) -> Result<RawStats, StatsError> {
+        if !identity_still_matches(&target.os) {
+            return Err(StatsError::Backend(
+                "process identity no longer matches".into(),
+            ));
+        }
+        let raw = sample_process(target.os.pid)?;
+        #[cfg(target_os = "linux")]
+        let raw = {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", target.os.pid))
+                .map_err(|e| StatsError::Backend(e.to_string()))?;
+            let fields: Vec<_> = stat
+                .rsplit_once(')')
+                .ok_or_else(|| StatsError::Backend("invalid proc stat".into()))?
+                .1
+                .split_whitespace()
+                .collect();
+            let ticks = fields
+                .get(11)
+                .and_then(|s| s.parse::<u64>().ok())
+                .zip(fields.get(12).and_then(|s| s.parse::<u64>().ok()))
+                .map(|(u, s)| u.saturating_add(s))
+                .ok_or_else(|| StatsError::Backend("invalid CPU counters".into()))?;
+            let now = std::time::Instant::now();
+            let mut state = self.state.lock().expect("unix backend mutex");
+            if !state.children.contains_key(&child_key(&target.os)) {
+                return Err(StatsError::Backend("child reaped during sample".into()));
+            }
+            let previous = state
+                .cpu_samples
+                .insert(child_key(&target.os), (now, ticks));
+            let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+            if hz <= 0 {
+                return Err(StatsError::Backend("invalid clock tick rate".into()));
+            }
+            let cpu_usage = previous
+                .map(|(time, old)| {
+                    ticks.saturating_sub(old) as f64
+                        / hz as f64
+                        / now.duration_since(time).as_secs_f64().max(1e-9)
+                })
+                .unwrap_or(0.0) as f32;
+            RawStats { cpu_usage, ..raw }
+        };
+        if !identity_still_matches(&target.os) {
+            return Err(StatsError::Backend("child changed during sample".into()));
+        }
+        Ok(raw)
+    }
+
     /// Creates an empty backend.
     #[must_use]
     pub fn new() -> Self {
@@ -95,6 +149,7 @@ impl UnixProcessBackend {
     pub fn auto() -> Self {
         super::cgroup::Cgroups::detect()
             .map(|cgroups| Self {
+                sampling: super::sampling::SamplingPool::default(),
                 state: Arc::default(),
                 cgroups: Some(Arc::new(cgroups)),
             })
@@ -105,6 +160,7 @@ impl UnixProcessBackend {
     #[cfg(target_os = "linux")]
     pub fn with_cgroup_root(root: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         Ok(Self {
+            sampling: super::sampling::SamplingPool::default(),
             state: Arc::default(),
             cgroups: Some(Arc::new(super::cgroup::Cgroups::new(root.as_ref())?)),
         })
@@ -147,6 +203,7 @@ impl UnixProcessBackend {
         state.children.insert(
             child_key(&os),
             ChildSlot {
+                sampling: Arc::default(),
                 scope,
                 sender: channels.sender,
                 _keep: channels.keep,
@@ -487,6 +544,12 @@ impl ProcessBackend for UnixProcessBackend {
                 .children
                 .remove(&key);
         }
+        #[cfg(target_os = "linux")]
+        self.state
+            .lock()
+            .expect("unix backend mutex")
+            .cpu_samples
+            .remove(&key);
         exit.map_err(WaitError::Backend)
     }
 
@@ -509,21 +572,29 @@ impl ProcessBackend for UnixProcessBackend {
     }
 
     async fn sample(&self, target: &Spawned) -> Result<RawStats, StatsError> {
-        if !identity_still_matches(&target.os) {
-            return Err(StatsError::Backend(
-                "process identity no longer matches".into(),
-            ));
-        }
-        sample_process(target.os.pid)
+        let active = self
+            .state
+            .lock()
+            .expect("unix backend mutex")
+            .children
+            .get(&child_key(&target.os))
+            .ok_or_else(|| StatsError::Backend("process reaped".into()))?
+            .sampling
+            .clone();
+        let backend = self.clone();
+        let target = *target;
+        self.sampling
+            .run(active, move || backend.sample_sync(&target))
+            .await
     }
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             descendant_containment: self.containment(),
-            cpu: Support::Unsupported,
+            cpu: cpu_support(),
             rss: rss_support(),
             peak_rss: peak_support(),
-            io: Support::Unsupported,
+            io: cpu_support(),
             force_termination: true,
         }
     }
@@ -737,6 +808,15 @@ fn pidfd_kill(fd: i32, signal: NixSignal) -> Result<(), TerminateError> {
 }
 
 #[cfg(target_os = "linux")]
+fn cpu_support() -> Support {
+    Support::Supported
+}
+#[cfg(not(target_os = "linux"))]
+fn cpu_support() -> Support {
+    Support::Unsupported
+}
+
+#[cfg(target_os = "linux")]
 fn rss_support() -> Support {
     Support::Supported
 }
@@ -794,13 +874,20 @@ fn sample_process(pid: u32) -> Result<RawStats, StatsError> {
             state = parse_state(rest.trim());
         }
     }
+    let io = std::fs::read_to_string(format!("/proc/{pid}/io"))
+        .map_err(|e| StatsError::Backend(e.to_string()))?;
+    let io_field = |key: &str| {
+        io.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .and_then(|v| v.trim().parse().ok())
+    };
     Ok(RawStats {
         cpu_usage: 0.0,
         memory_rss_bytes: rss,
         virtual_memory_bytes: vsize,
         peak_rss_bytes: peak,
-        io_read_bytes: None,
-        io_write_bytes: None,
+        io_read_bytes: io_field("read_bytes:"),
+        io_write_bytes: io_field("write_bytes:"),
         descendant_count: None,
         state,
     })
