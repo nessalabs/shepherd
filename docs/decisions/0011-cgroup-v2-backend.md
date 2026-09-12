@@ -32,6 +32,12 @@ Scopes remain registered until both root outcomes and containment cleanup are
 verified. Shutdown counts cleanup errors and retries remaining scopes on a later
 call; the latest 256 completed scope reports make repeated cleanup idempotent. Failed reap
 outcomes remain observable across retries instead of becoming an empty success.
+Root outcomes observed while a scope drains are saved before pruning, including
+when the termination caller has cancelled. Retries merge this pending evidence;
+verified completion removes it and retains only the bounded final report.
+ScopeClosed delivery is deferred until that verified commit, including for empty
+scopes. The corresponding ScopeTerminated publication is scheduled once, remains
+best effort, and holds only event handlers, never supervisor/backend ownership.
 Root children are separately waited and reaped. Descendant zombies belong to their
 OS parent/reaper; emptiness means no live descendant, not that Shepherd can wait
 for arbitrary non-child processes. Tests use a subreaper to verify their reaping.
