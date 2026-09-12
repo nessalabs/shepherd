@@ -131,7 +131,7 @@ fn spawn_sleep_writing_pid(pid_file: &std::path::Path) -> ProcessSpec {
 }
 
 async fn read_os_pid(pid_file: &std::path::Path) -> u32 {
-    for _ in 0..50 {
+    for _ in 0..250 {
         if let Ok(text) = std::fs::read_to_string(pid_file) {
             if let Ok(pid) = text.trim().parse::<u32>() {
                 return pid;

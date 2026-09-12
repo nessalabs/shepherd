@@ -23,15 +23,16 @@
 
 use std::sync::Arc;
 
+pub use shepherd_app::output::{OutputChunk, OutputSnapshot, OutputStream, ProcessOutput};
 pub use shepherd_app::ports::{IntegrationEventPublisher, ProcessBackend, Spawned};
 pub use shepherd_app::{
     HandlerError, ProcessSupervisor, ScopeTerminationReport, ShutdownError, ShutdownReport,
     SpawnError, StatsError, TerminateError, TerminateOptions, WaitError,
 };
 pub use shepherd_domain::{
-    Capabilities, Containment, DomainEvent, EnvPolicy, GracePeriod, IntegrationEvent, ProcessExit,
-    ProcessId, ProcessScopeId, ProcessSpec, ProcessState, ProcessStats, Signal, Support,
-    TerminationOutcome, UnverifiedReason,
+    Capabilities, Containment, DomainEvent, EnvPolicy, GracePeriod, IntegrationEvent, OutputMode,
+    ProcessExit, ProcessId, ProcessScopeId, ProcessSpec, ProcessState, ProcessStats, Signal,
+    Support, TerminationOutcome, UnverifiedReason,
 };
 pub use shepherd_infra::NullBackend;
 #[cfg(unix)]

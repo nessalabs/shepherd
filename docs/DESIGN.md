@@ -491,7 +491,7 @@ Status legend: ✅ done · 🚧 partial · ⬜ planned.
    `/proc` stats) with isolation/termination/descendant tests. cgroup v2 (`cgroup.kill`,
    detached-child containment) is implemented ([0011](./decisions/0011-cgroup-v2-backend.md)); privileged runtime tests passed in [CI run 34674051633](https://github.com/nessalabs/shepherd/actions/runs/34674051633).
 4. ✅ **Stats sampler** — one shared cached sampler, Linux CPU/RSS/I/O, resource fixtures/tests (ADR 0013). Platform extensions follow in item 6.
-5. ⬜ **Output plumbing** — bounded byte queue + tail capture + output-stress tests.
+5. ✅ **Output plumbing** — bounded byte queue + tail capture + output-stress tests (ADR 0014).
 6. ⬜ **macOS + Windows backends** — validated via CI.
 7. ⬜ **Hardening** — property/`loom`/stress/race suites; finalize the guarantee table.
 

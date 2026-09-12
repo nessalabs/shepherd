@@ -97,6 +97,7 @@ struct Inner {
     scope_operations: Mutex<HashMap<ProcessScopeId, Arc<tokio::sync::Mutex<()>>>>,
     samples: Mutex<HashMap<ProcessId, Result<ProcessStats, StatsError>>>,
     sampler_started: AtomicBool,
+    outputs: Mutex<HashMap<ProcessId, crate::output::ProcessOutput>>,
     stats_interval: Duration,
 }
 
@@ -148,6 +149,7 @@ impl ProcessSupervisor {
                 scope_operations: Mutex::new(HashMap::new()),
                 samples: Mutex::new(HashMap::new()),
                 sampler_started: AtomicBool::new(false),
+                outputs: Mutex::new(HashMap::new()),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
                 shutting_down: Arc::clone(&shutting_down),
             }),
@@ -247,11 +249,28 @@ impl ProcessSupervisor {
             .lock()
             .expect("spawn_times mutex")
             .insert(pid, self.inner.clock.now());
+        if let Some(output) = self.inner.backend.output(&spawned) {
+            self.inner
+                .outputs
+                .lock()
+                .expect("outputs mutex")
+                .insert(pid, output);
+        }
         // Start ownership monitoring before any cancellable dispatch.
         self.start_monitor(scope, pid, spawned);
         self.start_sampler();
         self.inner.dispatcher.dispatch(&events).await;
         Ok(pid)
+    }
+
+    /// Transfers the capture observer to the caller, at most once per process.
+    /// Call after spawn, or after wait for post-mortem output.
+    pub fn take_output(&self, pid: ProcessId) -> Option<crate::output::ProcessOutput> {
+        self.inner
+            .outputs
+            .lock()
+            .expect("outputs mutex")
+            .remove(&pid)
     }
 
     /// Returns the most recent interval sample, without performing backend I/O.

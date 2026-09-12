@@ -91,3 +91,9 @@ Cgroup containment does not imply cleanup after abrupt supervisor SIGKILL.
 Configure sampling with `.stats_interval(Duration::from_millis(250))` on the builder.
 `stats(pid).await` returns the last interval observation (`StatsError::NotReady`
 before the first sample). CPU 1.0 means one fully used core; uptime is at sample time.
+
+Capture bytes with `ProcessSpec::output(OutputMode::Capture { buffer_bytes: 65536,
+tail_bytes: 4096 })`. Call `supervisor.take_output(pid)` once; its observer
+`read()` drains the bounded queue and returns the tail, dropped-byte count, and
+EOF/error status. Both pipes share the byte budget. Retaining the observer never
+keeps a process alive.

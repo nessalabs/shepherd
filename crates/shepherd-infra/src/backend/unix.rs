@@ -32,8 +32,13 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 /// `(os_pid, reuse_token)` so a recycled pid cannot overwrite an unreaped slot.
 type ChildKey = (u32, u64);
+type ExitChannels = (
+    watch::Sender<Option<Result<RawExit, String>>>,
+    watch::Receiver<Option<Result<RawExit, String>>>,
+);
 
 struct ChildSlot {
+    output: Option<shepherd_app::output::ProcessOutput>,
     sender: watch::Sender<Option<Result<RawExit, String>>>,
     // Retain a receiver so the waiter task's `send` is never lost if it fires before the
     // supervisor's monitor subscribes.
@@ -148,17 +153,18 @@ impl UnixProcessBackend {
         &self,
         scope: ProcessScopeId,
         os: OsIdentity,
-        sender: watch::Sender<Option<Result<RawExit, String>>>,
-        keep: watch::Receiver<Option<Result<RawExit, String>>>,
+        channels: ExitChannels,
         new_group: bool,
+        output: Option<shepherd_app::output::ProcessOutput>,
         #[cfg(target_os = "linux")] pidfd: Option<OwnedFd>,
     ) {
         let mut state = self.state.lock().expect("unix backend mutex");
         state.children.insert(
             child_key(&os),
             ChildSlot {
-                sender,
-                _keep: keep,
+                output,
+                sender: channels.0,
+                _keep: channels.1,
                 #[cfg(target_os = "linux")]
                 pidfd,
             },
@@ -202,6 +208,9 @@ impl UnixProcessBackend {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if matches!(spec.output, shepherd_domain::OutputMode::Capture { .. }) {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
         }
@@ -292,13 +301,44 @@ impl ProcessBackend for UnixProcessBackend {
         #[cfg(target_os = "linux")]
         let pidfd = open_pidfd(pid);
 
+        let output = match spec.output {
+            shepherd_domain::OutputMode::Discard => None,
+            shepherd_domain::OutputMode::Capture {
+                buffer_bytes,
+                tail_bytes,
+            } => Some(crate::output::capture(buffer_bytes, tail_bytes)),
+        };
+        let mut readers = Vec::new();
+        if let Some(output) = &output {
+            use shepherd_app::output::OutputStream;
+            if let Some(stdout) = child.stdout.take() {
+                readers.push((
+                    OutputStream::Stdout,
+                    tokio::spawn(crate::output::drain(
+                        stdout,
+                        output.clone(),
+                        OutputStream::Stdout,
+                    )),
+                ));
+            }
+            if let Some(stderr) = child.stderr.take() {
+                readers.push((
+                    OutputStream::Stderr,
+                    tokio::spawn(crate::output::drain(
+                        stderr,
+                        output.clone(),
+                        OutputStream::Stderr,
+                    )),
+                ));
+            }
+        }
         let (exit_tx, keep_rx) = watch::channel(None);
         self.register_child(
             scope,
             os,
-            exit_tx.clone(),
-            keep_rx,
+            (exit_tx.clone(), keep_rx),
             new_group,
+            output.clone(),
             #[cfg(target_os = "linux")]
             pidfd,
         );
@@ -314,6 +354,9 @@ impl ProcessBackend for UnixProcessBackend {
                 }),
                 Err(error) => Err(error.to_string()),
             };
+            if let Some(output) = output {
+                crate::output::finish_readers(readers, output).await;
+            }
             let _ = exit_tx.send(Some(raw));
             this.note_os_exit(scope);
         });
@@ -475,6 +518,15 @@ impl ProcessBackend for UnixProcessBackend {
             return Err(StatsError::Backend("child changed during sample".into()));
         }
         Ok(raw)
+    }
+
+    fn output(&self, target: &Spawned) -> Option<shepherd_app::output::ProcessOutput> {
+        self.state
+            .lock()
+            .expect("unix backend mutex")
+            .children
+            .get(&child_key(&target.os))
+            .and_then(|slot| slot.output.clone())
     }
 
     fn capabilities(&self) -> Capabilities {

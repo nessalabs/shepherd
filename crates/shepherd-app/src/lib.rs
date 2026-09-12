@@ -22,3 +22,5 @@ pub use ports::{
 };
 pub use registry::ScopeRegistry;
 pub use supervisor::{ProcessSupervisor, ScopeTerminationReport, ShutdownReport};
+
+pub mod output;

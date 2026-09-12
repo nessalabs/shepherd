@@ -71,6 +71,11 @@ pub trait ProcessBackend: Send + Sync {
     /// Samples current resource usage.
     async fn sample(&self, target: &Spawned) -> Result<RawStats, StatsError>;
 
+    /// Returns a cloneable output observer when capture was requested.
+    fn output(&self, _target: &Spawned) -> Option<crate::output::ProcessOutput> {
+        None
+    }
+
     /// The runtime-detected guarantees of this backend.
     fn capabilities(&self) -> Capabilities;
 
