@@ -294,7 +294,7 @@ impl UnixProcessBackend {
         spec: &ProcessSpec,
         target_pgid: i32,
         #[cfg(target_os = "linux")] membership: Option<&std::fs::File>,
-    ) -> Result<tokio::process::Child, SpawnError> {
+    ) -> Result<NativeChild, SpawnError> {
         let mut cmd = tokio::process::Command::new(&spec.program);
         cmd.args(&spec.args)
             .stdin(Stdio::null())
@@ -332,7 +332,16 @@ impl UnixProcessBackend {
         // supervisor is dropped. The supervisor's CleanupGuard calls `hard_kill_all`.
         cmd.kill_on_drop(false);
 
-        cmd.spawn().map_err(|e| SpawnError::Os(e.to_string()))
+        let changes = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+            .map_err(|e| SpawnError::Os(e.to_string()))?;
+        let child = cmd
+            .as_std_mut()
+            .spawn()
+            .map_err(|e| SpawnError::Os(e.to_string()))?;
+        Ok(NativeChild {
+            child: Some(child),
+            changes,
+        })
     }
 }
 
@@ -407,7 +416,13 @@ impl ProcessBackend for UnixProcessBackend {
         let mut readers = Vec::new();
         if let Some(output) = &output {
             use shepherd_app::output::OutputStream;
-            if let Some(stdout) = child.stdout.take() {
+            if let Some(stdout) = child.child.as_mut().expect("owned child").stdout.take() {
+                let stdout = tokio::process::ChildStdout::from_std(stdout).map_err(|error| {
+                    // Pipe conversion failed before registration; this child is still
+                    // exclusively owned, and NativeChild's drop guard will reap it.
+                    let _ = child.child.as_mut().expect("owned child").kill();
+                    SpawnError::Os(error.to_string())
+                })?;
                 readers.push((
                     OutputStream::Stdout,
                     tokio::spawn(crate::output::drain(
@@ -417,7 +432,13 @@ impl ProcessBackend for UnixProcessBackend {
                     )),
                 ));
             }
-            if let Some(stderr) = child.stderr.take() {
+            if let Some(stderr) = child.child.as_mut().expect("owned child").stderr.take() {
+                let stderr = tokio::process::ChildStderr::from_std(stderr).map_err(|error| {
+                    // Pipe conversion failed before registration; this child is still
+                    // exclusively owned, and NativeChild's drop guard will reap it.
+                    let _ = child.child.as_mut().expect("owned child").kill();
+                    SpawnError::Os(error.to_string())
+                })?;
                 readers.push((
                     OutputStream::Stderr,
                     tokio::spawn(crate::output::drain(
@@ -457,6 +478,13 @@ impl ProcessBackend for UnixProcessBackend {
                     &failures,
                 )
                 .await;
+                let ownership_lost = status
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.raw_os_error() == Some(libc::ECHILD));
+                if ownership_lost {
+                    child.child.take();
+                }
                 let raw = status
                     .map(|status| RawExit {
                         code: status.code(),
@@ -466,7 +494,7 @@ impl ProcessBackend for UnixProcessBackend {
                     .map_err(|error| error.to_string());
                 let reaped = raw.is_ok();
                 publish_wait_result(&state, scope, &exit_tx, raw);
-                if reaped || retry_rx.recv().await.is_none() {
+                if reaped || ownership_lost || retry_rx.recv().await.is_none() {
                     break;
                 }
             }
@@ -513,39 +541,48 @@ impl ProcessBackend for UnixProcessBackend {
         scope: ProcessScopeId,
         signal: Signal,
     ) -> Result<(), TerminateError> {
-        #[cfg(target_os = "linux")]
-        if let Some(cgroups) = &self.cgroups {
-            if signal == Signal::Kill {
-                return cgroups
-                    .kill(scope)
-                    .map_err(|e| TerminateError::Signal(e.to_string()));
+        let result = (|| {
+            #[cfg(target_os = "linux")]
+            if let Some(cgroups) = &self.cgroups {
+                if signal == Signal::Kill {
+                    return cgroups
+                        .kill(scope)
+                        .map_err(|e| TerminateError::Signal(e.to_string()));
+                }
+            }
+            let mut state = self.state.lock().expect("unix backend mutex");
+            if state
+                .scope_groups
+                .get(&scope)
+                .is_some_and(|group| group.wait_failed)
+            {
+                if signal == Signal::Kill {
+                    kill_registered_roots(&state, scope);
+                }
+                return Err(TerminateError::Signal(
+                    "scope group identity unverified after wait failure".into(),
+                ));
+            }
+            let pgid = state.scope_groups.get(&scope).map(|group| group.pgid);
+            let Some(pgid) = pgid else {
+                return Ok(());
+            };
+            match killpg(Pid::from_raw(pgid), Some(to_nix(signal))) {
+                Ok(()) => Ok(()),
+                Err(nix::errno::Errno::ESRCH) => {
+                    state.scope_groups.remove(&scope);
+                    Ok(())
+                }
+                Err(e) => Err(TerminateError::Signal(e.to_string())),
+            }
+        })();
+        if signal == Signal::Kill {
+            let state = self.state.lock().expect("unix backend mutex");
+            for slot in state.children.values().filter(|slot| slot.scope == scope) {
+                let _ = slot.retry.try_send(());
             }
         }
-        let mut state = self.state.lock().expect("unix backend mutex");
-        if state
-            .scope_groups
-            .get(&scope)
-            .is_some_and(|group| group.wait_failed)
-        {
-            if signal == Signal::Kill {
-                kill_registered_roots(&state, scope);
-            }
-            return Err(TerminateError::Signal(
-                "scope group identity unverified after wait failure".into(),
-            ));
-        }
-        let pgid = state.scope_groups.get(&scope).map(|group| group.pgid);
-        let Some(pgid) = pgid else {
-            return Ok(());
-        };
-        match killpg(Pid::from_raw(pgid), Some(to_nix(signal))) {
-            Ok(()) => Ok(()),
-            Err(nix::errno::Errno::ESRCH) => {
-                state.scope_groups.remove(&scope);
-                Ok(())
-            }
-            Err(e) => Err(TerminateError::Signal(e.to_string())),
-        }
+        result
     }
 
     async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
@@ -717,10 +754,37 @@ fn publish_wait_result(
     let _ = sender.send(Some(raw));
 }
 
+struct NativeChild {
+    child: Option<std::process::Child>,
+    changes: tokio::signal::unix::Signal,
+}
+impl NativeChild {
+    fn id(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
+    }
+}
+impl Drop for NativeChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            // Never block an executor or retry a numeric wait after an error. This
+            // path owns a child whose wait ownership has not been lost to ECHILD.
+            let _ = std::thread::Builder::new()
+                .name("shepherd-orphan-reap".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
+        }
+    }
+}
+
 async fn wait_os_child(
-    child: &mut tokio::process::Child,
+    child: &mut NativeChild,
     #[cfg(test)] failures: &std::sync::atomic::AtomicUsize,
 ) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(test)]
+    if failures.load(std::sync::atomic::Ordering::SeqCst) == usize::MAX {
+        return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+    }
     #[cfg(test)]
     if failures
         .fetch_update(
@@ -732,7 +796,21 @@ async fn wait_os_child(
     {
         return Err(std::io::Error::other("injected OS wait failure"));
     }
-    child.wait().await
+    loop {
+        match child.child.as_mut().expect("owned child").try_wait()? {
+            Some(status) => {
+                child.child.take();
+                return Ok(status);
+            }
+            None => {
+                child
+                    .changes
+                    .recv()
+                    .await
+                    .ok_or_else(|| std::io::Error::other("SIGCHLD stream closed"))?;
+            }
+        }
+    }
 }
 
 fn child_key(os: &OsIdentity) -> ChildKey {
@@ -1190,6 +1268,113 @@ mod tests {
         })
         .await
         .unwrap();
+        backend.wait(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn echild_stops_native_wait_ownership_permanently() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let root = backend
+            .spawn(scope, &ProcessSpec::new("/bin/sleep").arg("30"))
+            .await
+            .unwrap();
+        // Model a caller violating exclusive reap ownership before our task polls.
+        unsafe {
+            libc::kill(root.os.pid as i32, libc::SIGKILL);
+        }
+        assert_eq!(
+            unsafe { libc::waitpid(root.os.pid as i32, std::ptr::null_mut(), 0) },
+            root.os.pid as i32
+        );
+        let first = backend.wait(&root).await.unwrap_err();
+        assert!(first
+            .to_string()
+            .contains(&std::io::Error::from_raw_os_error(libc::ECHILD).to_string()));
+        assert!(backend.state.lock().unwrap().children[&child_key(&root.os)]
+            .retry
+            .is_closed());
+        let sibling = backend
+            .spawn(ProcessScopeId::new(2), &ProcessSpec::new("true"))
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            assert!(backend.wait(&root).await.is_err());
+        }
+        assert_eq!(backend.wait(&sibling).await.unwrap().code, Some(0));
+        backend.hard_kill_all();
+        assert!(backend.wait(&root).await.is_err());
+    }
+
+    #[test]
+    fn runtime_drop_reaps_still_owned_root() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let backend = UnixProcessBackend::new();
+        let root = runtime.block_on(async {
+            let root = backend
+                .spawn(
+                    ProcessScopeId::new(1),
+                    &ProcessSpec::new("/bin/sleep").arg("30"),
+                )
+                .await
+                .unwrap();
+            backend.hard_kill_all();
+            root
+        });
+        drop(runtime);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while identity_still_matches(&root.os) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !identity_still_matches(&root.os),
+            "cancelled native waiter failed to reap owned root"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_kill_requests_reap_without_fresh_wait_call() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let root = backend
+            .spawn(scope, &ProcessSpec::new("/bin/sleep").arg("30"))
+            .await
+            .unwrap();
+        let sibling = backend
+            .spawn(
+                ProcessScopeId::new(2),
+                &ProcessSpec::new("/bin/sleep").arg("30"),
+            )
+            .await
+            .unwrap();
+        let mut observation = {
+            let state = backend.state.lock().unwrap();
+            let slot = &state.children[&child_key(&root.os)];
+            slot.failures.store(1, std::sync::atomic::Ordering::SeqCst);
+            slot.sender.subscribe()
+        };
+        assert!(backend.wait(&root).await.is_err());
+        let _ = backend.cleanup_scope(scope).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(&*observation.borrow_and_update(), Some(Ok(_))) {
+                    break;
+                }
+                observation.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), backend.wait(&sibling))
+                .await
+                .is_err()
+        );
+        backend.hard_kill_all();
+        backend.wait(&sibling).await.unwrap();
         backend.wait(&root).await.unwrap();
     }
 
