@@ -50,6 +50,8 @@ struct ScopeGroup {
 #[derive(Default)]
 struct State {
     children: HashMap<ChildKey, ChildSlot>,
+    #[cfg(target_os = "linux")]
+    cpu_samples: HashMap<ChildKey, (std::time::Instant, u64)>,
     scope_groups: HashMap<ProcessScopeId, ScopeGroup>,
     /// Serializes spawns per scope so the first process creates exactly one process group.
     scope_locks: HashMap<ProcessScopeId, Arc<tokio::sync::Mutex<()>>>,
@@ -398,6 +400,12 @@ impl ProcessBackend for UnixProcessBackend {
             .expect("unix backend mutex")
             .children
             .remove(&key);
+        #[cfg(target_os = "linux")]
+        self.state
+            .lock()
+            .expect("unix backend mutex")
+            .cpu_samples
+            .remove(&key);
         exit.map_err(WaitError::Backend)
     }
 
@@ -425,16 +433,57 @@ impl ProcessBackend for UnixProcessBackend {
                 "process identity no longer matches".into(),
             ));
         }
-        sample_process(target.os.pid)
+        let raw = sample_process(target.os.pid)?;
+        #[cfg(target_os = "linux")]
+        let raw = {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", target.os.pid))
+                .map_err(|e| StatsError::Backend(e.to_string()))?;
+            let fields: Vec<_> = stat
+                .rsplit_once(')')
+                .ok_or_else(|| StatsError::Backend("invalid proc stat".into()))?
+                .1
+                .split_whitespace()
+                .collect();
+            let ticks = fields
+                .get(11)
+                .and_then(|s| s.parse::<u64>().ok())
+                .zip(fields.get(12).and_then(|s| s.parse::<u64>().ok()))
+                .map(|(u, s)| u.saturating_add(s))
+                .ok_or_else(|| StatsError::Backend("invalid CPU counters".into()))?;
+            let now = std::time::Instant::now();
+            let mut state = self.state.lock().expect("unix backend mutex");
+            if !state.children.contains_key(&child_key(&target.os)) {
+                return Err(StatsError::Backend("child reaped during sample".into()));
+            }
+            let previous = state
+                .cpu_samples
+                .insert(child_key(&target.os), (now, ticks));
+            let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+            if hz <= 0 {
+                return Err(StatsError::Backend("invalid clock tick rate".into()));
+            }
+            let cpu_usage = previous
+                .map(|(time, old)| {
+                    ticks.saturating_sub(old) as f64
+                        / hz as f64
+                        / now.duration_since(time).as_secs_f64().max(1e-9)
+                })
+                .unwrap_or(0.0) as f32;
+            RawStats { cpu_usage, ..raw }
+        };
+        if !identity_still_matches(&target.os) {
+            return Err(StatsError::Backend("child changed during sample".into()));
+        }
+        Ok(raw)
     }
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             descendant_containment: self.containment(),
-            cpu: Support::Unsupported,
+            cpu: cpu_support(),
             rss: rss_support(),
             peak_rss: peak_support(),
-            io: Support::Unsupported,
+            io: cpu_support(),
             force_termination: true,
         }
     }
@@ -554,6 +603,15 @@ fn pidfd_kill(fd: i32, signal: NixSignal) -> Result<(), TerminateError> {
 }
 
 #[cfg(target_os = "linux")]
+fn cpu_support() -> Support {
+    Support::Supported
+}
+#[cfg(not(target_os = "linux"))]
+fn cpu_support() -> Support {
+    Support::Unsupported
+}
+
+#[cfg(target_os = "linux")]
 fn rss_support() -> Support {
     Support::Supported
 }
@@ -602,13 +660,20 @@ fn sample_process(pid: u32) -> Result<RawStats, StatsError> {
             state = parse_state(rest.trim());
         }
     }
+    let io = std::fs::read_to_string(format!("/proc/{pid}/io"))
+        .map_err(|e| StatsError::Backend(e.to_string()))?;
+    let io_field = |key: &str| {
+        io.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .and_then(|v| v.trim().parse().ok())
+    };
     Ok(RawStats {
         cpu_usage: 0.0,
         memory_rss_bytes: rss,
         virtual_memory_bytes: vsize,
         peak_rss_bytes: peak,
-        io_read_bytes: None,
-        io_write_bytes: None,
+        io_read_bytes: io_field("read_bytes:"),
+        io_write_bytes: io_field("write_bytes:"),
         descendant_count: None,
         state,
     })

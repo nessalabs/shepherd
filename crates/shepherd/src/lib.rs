@@ -44,6 +44,7 @@ pub use shepherd_infra::{
 pub struct SupervisorBuilder {
     backend: Option<Arc<dyn ProcessBackend>>,
     publisher: Option<Arc<dyn IntegrationEventPublisher>>,
+    stats_interval: std::time::Duration,
 }
 
 impl std::fmt::Debug for SupervisorBuilder {
@@ -65,6 +66,7 @@ impl SupervisorBuilder {
         Self {
             backend: None,
             publisher: None,
+            stats_interval: std::time::Duration::from_secs(1),
         }
     }
 
@@ -82,6 +84,13 @@ impl SupervisorBuilder {
         self
     }
 
+    /// Sets the shared sampling interval (default one second; minimum one millisecond).
+    #[must_use]
+    pub fn stats_interval(mut self, interval: std::time::Duration) -> Self {
+        self.stats_interval = interval;
+        self
+    }
+
     /// Builds the supervisor.
     #[must_use]
     pub fn build(self) -> ProcessSupervisor {
@@ -91,7 +100,13 @@ impl SupervisorBuilder {
         let publisher = self
             .publisher
             .unwrap_or_else(|| Arc::new(NoopIntegrationPublisher)); // ADR 0007
-        ProcessSupervisor::new(backend, clock, waiters, publisher)
+        ProcessSupervisor::with_stats_interval(
+            backend,
+            clock,
+            waiters,
+            publisher,
+            self.stats_interval,
+        )
     }
 }
 

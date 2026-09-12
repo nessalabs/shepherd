@@ -22,3 +22,4 @@ they do not replace that document.
 
 | [0011](./0011-cgroup-v2-backend.md) | Pre-exec cgroup membership, atomic kill, verified emptiness |
 | [0012](./0012-privileged-cgroup-ci.md) | Hosted privileged cgroup tests fail closed |
+| [0013](./0013-shared-cached-statistics.md) | Shared sampler, cached observations, real per-root CPU |

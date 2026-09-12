@@ -421,3 +421,6 @@ sequenceDiagram
 
 Cgroup cleanup: serialize scope operations → root termination/reap → cgroup.kill →
 populated=0 → remove containment directory → return report (ADR 0011).
+
+Interval sampling: Weak supervisor → snapshot live roots → backend observations →
+check still live → cache. `stats(pid)` reads cache; reap removes cache and CPU baseline.

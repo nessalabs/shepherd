@@ -101,3 +101,16 @@ jobs:
           test_bin=$(find target/debug/deps -maxdepth 1 -name 'cgroup_integration-*' -type f -executable | head -n 1)
           test -n "$test_bin"
           sudo env SHEPHERD_CGROUP_ROOT=/sys/fs/cgroup/shepherd-ci "$test_bin" --ignored --test-threads=1 --nocapture
+
+  resource:
+    name: cached stats + real resource observations (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p shepherd-fixtures --test resource_integration -- --nocapture

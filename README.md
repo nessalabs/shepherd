@@ -73,7 +73,8 @@ cargo fmt --all --check                                  # format
 | Root process tracking | yes | yes | (null backend) |
 | Descendant cleanup | `cgroup.kill` with emptiness verification; fallback best-effort (`killpg`) | best-effort | — |
 | Force termination | yes | yes | — |
-| RSS / peak RSS stats | yes (`/proc`) | — | — |
+| RSS / peak RSS stats | yes (cached `/proc`) | — | — |
+| CPU / I/O stats | yes (cached per-root counters) | — | — |
 
 Guarantees are reported at runtime through the `Capabilities` type. See the design doc for
 the full target matrix (including Linux cgroup v2, Windows Job Objects, and honest macOS
@@ -86,3 +87,7 @@ Apache-2.0.
 Linux selects containment at construction. Use `supervisor.capabilities()` to inspect
 it. Privileged test requirements and commands: [ADR 0012](docs/decisions/0012-privileged-cgroup-ci.md).
 Cgroup containment does not imply cleanup after abrupt supervisor SIGKILL.
+
+Configure sampling with `.stats_interval(Duration::from_millis(250))` on the builder.
+`stats(pid).await` returns the last interval observation (`StatsError::NotReady`
+before the first sample). CPU 1.0 means one fully used core; uptime is at sample time.

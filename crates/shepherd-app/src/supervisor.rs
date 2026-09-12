@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use shepherd_domain::{
     ProcessExit, ProcessId, ProcessScopeId, ProcessSpec, ProcessStats, Signal, TerminationOutcome,
@@ -95,6 +95,9 @@ struct Inner {
     spawn_times: Mutex<HashMap<ProcessId, Instant>>,
     shutting_down: Arc<AtomicBool>,
     scope_operations: Mutex<HashMap<ProcessScopeId, Arc<tokio::sync::Mutex<()>>>>,
+    samples: Mutex<HashMap<ProcessId, Result<ProcessStats, StatsError>>>,
+    sampler_started: AtomicBool,
+    stats_interval: Duration,
 }
 
 impl std::fmt::Debug for ProcessSupervisor {
@@ -114,6 +117,19 @@ impl ProcessSupervisor {
         waiters: Arc<dyn Waiters>,
         publisher: Arc<dyn IntegrationEventPublisher>,
     ) -> Self {
+        Self::with_stats_interval(backend, clock, waiters, publisher, Duration::from_secs(1))
+    }
+
+    /// Constructs a supervisor with one shared interval sampler, started on first spawn.
+    /// Zero intervals are clamped to one millisecond.
+    #[must_use]
+    pub fn with_stats_interval(
+        backend: Arc<dyn ProcessBackend>,
+        clock: Arc<dyn Clock>,
+        waiters: Arc<dyn Waiters>,
+        publisher: Arc<dyn IntegrationEventPublisher>,
+        stats_interval: Duration,
+    ) -> Self {
         let registry: SharedRegistry = Arc::new(Mutex::new(ScopeRegistry::new()));
         let shutting_down = Arc::new(AtomicBool::new(false));
         let handlers: Vec<Arc<dyn EventHandler>> = vec![
@@ -130,6 +146,9 @@ impl ProcessSupervisor {
                 dispatcher: EventDispatcher::new(handlers),
                 spawn_times: Mutex::new(HashMap::new()),
                 scope_operations: Mutex::new(HashMap::new()),
+                samples: Mutex::new(HashMap::new()),
+                sampler_started: AtomicBool::new(false),
+                stats_interval: stats_interval.max(Duration::from_millis(1)),
                 shutting_down: Arc::clone(&shutting_down),
             }),
             cleanup: Arc::new(CleanupGuard {
@@ -230,44 +249,106 @@ impl ProcessSupervisor {
             .insert(pid, self.inner.clock.now());
         // Start ownership monitoring before any cancellable dispatch.
         self.start_monitor(scope, pid, spawned);
+        self.start_sampler();
         self.inner.dispatcher.dispatch(&events).await;
         Ok(pid)
     }
 
-    /// Samples current resource usage for a live process.
-    ///
-    /// # Errors
-    /// Returns [`StatsError`] if the process is unknown/not live or sampling fails.
+    /// Returns the most recent interval sample, without performing backend I/O.
+    /// CPU is a fraction of one core. Uptime is measured at sample time.
+    /// Returns NotReady until the first observation, or the last sampling error.
     pub async fn stats(&self, pid: ProcessId) -> Result<ProcessStats, StatsError> {
-        let (spawned, start) = {
-            let registry = self.lock_registry();
-            let scope = registry
-                .scope_of(pid)
-                .ok_or(StatsError::UnknownProcess(pid))?;
-            let s = registry.get(scope).expect("scope exists");
-            let process = s.get(pid).ok_or(StatsError::UnknownProcess(pid))?;
-            if !process.state().is_live() {
-                return Err(StatsError::UnknownProcess(pid));
+        let registry = self.lock_registry();
+        let live = registry
+            .scope_of(pid)
+            .and_then(|id| registry.get(id))
+            .and_then(|s| s.get(pid))
+            .is_some_and(|p| p.state().is_live());
+        if !live {
+            return Err(StatsError::UnknownProcess(pid));
+        }
+        self.inner
+            .samples
+            .lock()
+            .expect("samples mutex")
+            .get(&pid)
+            .cloned()
+            .unwrap_or(Err(StatsError::NotReady(pid)))
+    }
+
+    fn start_sampler(&self) {
+        if self.inner.sampler_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        let interval = self.inner.stats_interval;
+        tokio::spawn(async move {
+            loop {
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                let targets = {
+                    let registry = inner.registry.lock().expect("registry mutex");
+                    registry
+                        .scope_ids()
+                        .into_iter()
+                        .flat_map(|id| {
+                            let scope = registry.get(id).expect("scope exists");
+                            scope
+                                .live_process_ids()
+                                .into_iter()
+                                .map(|pid| {
+                                    (
+                                        pid,
+                                        Spawned {
+                                            os: scope
+                                                .get(pid)
+                                                .expect("process exists")
+                                                .os_identity(),
+                                        },
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for (pid, target) in targets {
+                    let sample =
+                        tokio::time::timeout(Duration::from_secs(1), inner.backend.sample(&target))
+                            .await
+                            .unwrap_or_else(|_| Err(StatsError::Backend("sampler timeout".into())))
+                            .map(|raw| {
+                                let start = inner
+                                    .spawn_times
+                                    .lock()
+                                    .expect("spawn times mutex")
+                                    .get(&pid)
+                                    .copied();
+                                let uptime = start
+                                    .map(|s| inner.clock.now().saturating_duration_since(s))
+                                    .unwrap_or_default();
+                                ProcessStats::from_raw(pid, raw, uptime)
+                            });
+                    // Keep the same registry -> samples lock order as stats and the monitor.
+                    // A sample finishing after reap must not resurrect a cache entry.
+                    let registry = inner.registry.lock().expect("registry mutex");
+                    let live = registry
+                        .scope_of(pid)
+                        .and_then(|id| registry.get(id))
+                        .and_then(|s| s.get(pid))
+                        .is_some_and(|p| p.state().is_live());
+                    if live {
+                        inner
+                            .samples
+                            .lock()
+                            .expect("samples mutex")
+                            .insert(pid, sample);
+                    }
+                }
+                drop(inner);
+                tokio::time::sleep(interval).await;
             }
-            let start = self
-                .inner
-                .spawn_times
-                .lock()
-                .expect("spawn_times mutex")
-                .get(&pid)
-                .copied();
-            (
-                Spawned {
-                    os: process.os_identity(),
-                },
-                start,
-            )
-        };
-        let raw = self.inner.backend.sample(&spawned).await?;
-        let uptime = start
-            .map(|s| self.inner.clock.now().saturating_duration_since(s))
-            .unwrap_or_default();
-        Ok(ProcessStats::from_raw(pid, raw, uptime))
+        });
     }
 
     /// Waits for a process to reach its reaped terminal state.
@@ -498,6 +579,7 @@ impl ProcessSupervisor {
                 events.extend(s.record_reaped(pid, exit).unwrap_or_default());
                 events
             };
+            inner.samples.lock().expect("samples mutex").remove(&pid);
             inner.dispatcher.dispatch(&events).await;
             inner
                 .spawn_times
