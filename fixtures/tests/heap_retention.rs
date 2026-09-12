@@ -1,6 +1,11 @@
 //! Run alone: the allocator measures this entire process, including runtime tasks.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+// Reuse the audited native counter; allocation measurement itself stays safe.
+#[allow(unsafe_code)]
+#[path = "support/resources.rs"]
+mod resources;
 use shepherd::{GracePeriod, OutputMode, ProcessSpec, SupervisorBuilder, TerminateOptions};
+use shepherd_test_support::{HeapConfig, RuntimeFlavor, TestEnvironment};
 use std::{sync::Arc, time::Duration};
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -51,7 +56,7 @@ async fn cycle(sup: &shepherd::ProcessSupervisor) {
     .expect("completed process retained its output buffer");
 }
 
-async fn exercise() {
+async fn exercise(config: &HeapConfig) {
     let barrier = Arc::new(std::sync::Barrier::new(5));
     let mut workers = Vec::new();
     for _ in 0..4 {
@@ -69,13 +74,14 @@ async fn exercise() {
         .stats_interval(Duration::from_millis(10))
         .build();
     // Fill and turn over the bounded 256-entry histories before taking a baseline.
-    for _ in 0..512 {
+    for _ in 0..config.warmup_cycles {
         cycle(&sup).await;
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
+    let baseline_handles = resources::handles();
     let baseline = dhat::HeapStats::get();
-    for batch in 0..4 {
-        for _ in 0..256 {
+    for batch in 0..config.batches {
+        for _ in 0..config.cycles_per_batch {
             cycle(&sup).await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -88,11 +94,22 @@ async fn exercise() {
     }
     sup.shutdown().await.unwrap();
     drop(sup);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let final_handles = resources::handles();
+    assert!(
+        final_handles <= baseline_handles,
+        "native resource growth: {baseline_handles} -> {final_handles}"
+    );
+    #[cfg(unix)]
+    resources::assert_no_owned_zombies();
+    eprintln!("heap workload native handles: {baseline_handles} -> {final_handles}");
 }
 
 #[test]
 #[ignore = "isolated allocation instrumented CI job"]
 fn long_lived_supervisor_releases_heap() {
+    let config = TestEnvironment::from_env().heap();
+    eprintln!("heap config: {config:?}");
     let _profiler = dhat::Profiler::builder()
         .testing()
         .trim_backtraces(Some(4))
@@ -117,8 +134,8 @@ fn long_lived_supervisor_releases_heap() {
     );
     drop(retained);
     assert!(within(&baseline, &dhat::HeapStats::get()));
-    for multi in [false, true] {
-        let mut builder = if multi {
+    for flavor in config.runtimes {
+        let mut builder = if *flavor == RuntimeFlavor::Multi {
             let mut b = tokio::runtime::Builder::new_multi_thread();
             b.worker_threads(2);
             b
@@ -127,12 +144,12 @@ fn long_lived_supervisor_releases_heap() {
         };
         let runtime = builder
             .max_blocking_threads(4)
-            .thread_keep_alive(Duration::from_secs(3600))
+            .thread_keep_alive(config.timeout + Duration::from_secs(60))
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(600), exercise())
+            tokio::time::timeout(config.timeout, exercise(&config))
                 .await
                 .unwrap();
         });

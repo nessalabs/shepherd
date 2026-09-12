@@ -26,7 +26,7 @@ The isolated `heap_retention` test uses the development-only `dhat` allocator to
 count live Rust heap bytes and allocations, rather than resident memory. Ordinary
 allocator caching of freed memory does not count as a live allocation here.
 
-Each Tokio runtime runs one supervisor through 512 warm-up process lifecycles,
+By default, each Tokio runtime runs one supervisor through 512 warm-up process lifecycles,
 then 1,024 measured lifecycles. Every child writes to both captured streams, exits,
 and receives verified scope cleanup. The supervisor stays alive throughout. The
 warm-up exceeds the 256-entry history limits; shutting down between cycles cannot
@@ -45,7 +45,12 @@ back within the limits. These controls do not leak memory themselves.
 Only this test executable uses `dhat`; consumers keep their own allocator. Native
 allocations made outside Rust's global allocator are outside its measurements.
 Failure profiles are retained as CI artifacts. Linux, macOS, and Windows run this
-isolated test with both Tokio runtime flavors.
+isolated test with both Tokio runtime flavors. It also requires final FD/handle
+counts no higher than the warm baseline and no owned Unix zombies.
+
+`TestEnvironment::heap()` centralizes workload sizing and runtime selection.
+[Environment settings](TEST_ENVIRONMENT.md) document batch and timeout overrides;
+the warm-up and batch sizes remain fixed to cover history eviction.
 
 ## Object ownership
 
