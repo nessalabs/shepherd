@@ -104,6 +104,9 @@ struct Inner {
     outputs: Mutex<HashMap<ProcessId, crate::output::ProcessOutput>>,
     completed: Mutex<VecDeque<ProcessId>>,
     stats_interval: Duration,
+    reports: Mutex<HashMap<ProcessScopeId, ScopeTerminationReport>>,
+    completed_scopes: Mutex<VecDeque<ProcessScopeId>>,
+    shutdown_serial: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for ProcessSupervisor {
@@ -157,6 +160,9 @@ impl ProcessSupervisor {
                 outputs: Mutex::new(HashMap::new()),
                 completed: Mutex::new(VecDeque::new()),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
+                reports: Mutex::new(HashMap::new()),
+                completed_scopes: Mutex::new(VecDeque::new()),
+                shutdown_serial: tokio::sync::Mutex::new(()),
                 shutting_down: Arc::clone(&shutting_down),
             }),
             cleanup: Arc::new(CleanupGuard {
@@ -208,6 +214,15 @@ impl ProcessSupervisor {
         let operation = self.scope_operation(scope);
         let _serial = operation.lock().await;
         if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return Err(SpawnError::ScopeClosed(scope));
+        }
+        if self
+            .inner
+            .reports
+            .lock()
+            .expect("reports mutex")
+            .contains_key(&scope)
+        {
             return Err(SpawnError::ScopeClosed(scope));
         }
         {
@@ -481,12 +496,22 @@ impl ProcessSupervisor {
     ) -> Result<ScopeTerminationReport, TerminateError> {
         let operation = self.scope_operation(scope);
         let _serial = operation.lock().await;
+        if let Some(report) = self
+            .inner
+            .reports
+            .lock()
+            .expect("reports mutex")
+            .get(&scope)
+            .cloned()
+        {
+            return Ok(report);
+        }
         let (events, live) = {
             let mut registry = self.lock_registry();
             let s = registry
                 .get_mut(scope)
                 .ok_or(TerminateError::UnknownScope(scope))?;
-            (s.begin_scope_termination(), s.live_process_ids())
+            (s.begin_scope_termination(), s.process_ids())
         };
         self.inner.dispatcher.dispatch(&events).await;
 
@@ -516,7 +541,31 @@ impl ProcessSupervisor {
         // grandchildren the per-root path does not track individually.
         self.inner.backend.cleanup_scope(scope).await?;
 
-        Ok(ScopeTerminationReport { scope, outcomes })
+        let report = ScopeTerminationReport { scope, outcomes };
+        if report.all_verified() {
+            self.inner
+                .reports
+                .lock()
+                .expect("reports mutex")
+                .insert(scope, report.clone());
+            self.lock_registry().remove(scope);
+            let mut completed = self
+                .inner
+                .completed_scopes
+                .lock()
+                .expect("completed scopes mutex");
+            completed.push_back(scope);
+            while completed.len() > 256 {
+                if let Some(old) = completed.pop_front() {
+                    self.inner
+                        .reports
+                        .lock()
+                        .expect("reports mutex")
+                        .remove(&old);
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Terminates all scopes and cleans up. Safe to call more than once.
@@ -524,21 +573,23 @@ impl ProcessSupervisor {
     /// # Errors
     /// Returns [`ShutdownError::Unverified`] if any scope could not be verified as cleaned up.
     pub async fn shutdown(&self) -> Result<ShutdownReport, ShutdownError> {
-        if self.inner.shutting_down.swap(true, Ordering::SeqCst) {
-            return Ok(ShutdownReport { scopes: Vec::new() });
-        }
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
+        let _serial = self.inner.shutdown_serial.lock().await;
         let scopes = self.lock_registry().scope_ids();
         let mut reports = Vec::new();
         let mut unverified = 0usize;
         for scope in scopes {
-            if let Ok(report) = self
+            match self
                 .terminate_scope(scope, TerminateOptions::default())
                 .await
             {
-                if !report.all_verified() {
-                    unverified += 1;
+                Ok(report) => {
+                    if !report.all_verified() {
+                        unverified += 1;
+                    }
+                    reports.push(report);
                 }
-                reports.push(report);
+                Err(_) => unverified += 1,
             }
         }
         if unverified > 0 {

@@ -1,4 +1,3 @@
-#![cfg(unix)]
 use shepherd::{ProcessSpec, StatsError, SupervisorBuilder, TerminateOptions};
 use std::time::Duration;
 
@@ -41,6 +40,7 @@ async fn cached_samples_and_isolation() {
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn real_cpu_and_rss_move() {
     let sup = SupervisorBuilder::new()
