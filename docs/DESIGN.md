@@ -291,7 +291,7 @@ supervisor.terminate(pid, options).await        -> Result<ProcessExit, Terminate
 supervisor.terminate_scope(scope_id, options).await -> Result<ScopeTerminationReport, _>
 supervisor.wait(pid).await                      -> Result<ProcessExit, _>
 supervisor.shutdown().await                     -> Result<ShutdownReport, ShutdownError>
-supervisor.with_scope(specs, |scope| async { .. }).await  // async scope guard (§7.3) — planned
+supervisor.with_scope(specs, |scope| async { .. }).await  // -> WithScopeResult<T>; cancellation report via wait_scope_cleanup
 ```
 
 Raw mutable `Child` ownership is never exposed. All cleanup APIs are idempotent.
@@ -349,7 +349,7 @@ reported as success.
 worker can deadlock the runtime, and `Drop` frequently runs during runtime shutdown (no
 reactor) or panic unwinding. `Drop` also cannot return a `Result`, so it cannot surface a
 typed outcome. Therefore the **full, verified, typed** cleanup is delivered through the
-explicit async path and the **async scope guard** (`with_scope`, *planned*), which runs
+explicit async path and the **async scope guard** (`with_scope`, ADR 0017), which runs
 verified cleanup on *any* block exit — normal return, `?` error, or cancellation — while
 still in async context. `Drop` is only the last-ditch honest backstop.
 
@@ -501,7 +501,7 @@ Status legend: ✅ done · 🚧 partial · ⬜ planned.
 6. 🚧 **macOS + Windows backends** — implemented (ADRs 0015–0016); Windows runtime CI pending.
 7. ⬜ **Hardening** — property/`loom`/stress/race suites; finalize the guarantee table.
 
-Also ⬜: the `with_scope` async scope guard (§7.3).
+Also ✅: `with_scope` async scope guard, including cancellation reports (ADR 0017).
 
 Platform backend implementation may be delegated to subagents to keep the main context clean.
 

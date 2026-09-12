@@ -26,3 +26,4 @@ they do not replace that document.
 | [0014](./0014-bounded-byte-output.md) | Bounded combined byte queue, capped tail, transferable observer |
 | [0015](./0015-macos-libproc-observations.md) | macOS libproc stats and Mach time conversion |
 | [0016](./0016-windows-job-object-backend.md) | Windows Job Object containment before execution |
+| [0017](./0017-async-scopes-and-cancellation.md) | Closure result plus report, cancellation cleanup workers, independent nesting |

@@ -431,3 +431,7 @@ Capture output: OS stdout/stderr → independent readers → OutputSink bounded 
 Windows spawn: CREATE_SUSPENDED → assign scope Job Object → resume → monitor wait.
 Windows cleanup: force → root wait → ActiveProcesses=0 → close Job Object.
 macOS stats: libproc counters → Mach time conversion → shared interval cache.
+
+with_scope: caller closure → exit signal guard → independent cleanup worker →
+two-phase termination/reap → retained report. Future cancellation drops the closure;
+wait_scope_cleanup observes the worker result. Internal workers own Inner only.
