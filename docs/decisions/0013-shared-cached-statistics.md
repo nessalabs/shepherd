@@ -39,7 +39,7 @@ phase's NullBackend fallback. It verifies caching and post-exit invalidation,
 without claiming real Windows resource measurements. Real CPU/RSS observations
 are tested on Unix and real I/O counters on Linux in this phase.
 
-Native Unix observations run on Tokio's blocking pool, outside the coordinator.
+Native Unix and Windows observations run on Tokio's blocking pool, outside the coordinator.
 Each backend admits at most sixteen native reads, and each owned root permits
 only one queued or running read. Both admission permits move into the blocking
 closure: an async timeout cancels waiting, not the OS syscall, and cannot cause
@@ -48,3 +48,9 @@ root permit. Saturating all native slots delays observations but never blocks
 async runtime progress; native calls cannot be forcibly preempted. Identity and
 accounting checks remain on both sides of the observation, and no backend state
 lock spans filesystem reads.
+
+Successful supervisor shutdown joins the async coordinator, not outstanding native
+reads. Up to sixteen such calls per backend may outlive that shutdown or a sample
+timeout; their closures retain backend state (and exact Windows process handles)
+until returning. They are not detached per-root OS threads, but bounded work on
+Tokio's blocking pool; the host runtime's blocking-task shutdown rules still apply.

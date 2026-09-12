@@ -122,8 +122,16 @@ fn default_backend() -> Arc<dyn ProcessBackend> {
     Arc::new(UnixProcessBackend::new())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn default_backend() -> Arc<dyn ProcessBackend> {
+    Arc::new(shepherd_infra::WindowsJobBackend::new())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn default_backend() -> Arc<dyn ProcessBackend> {
     // Honest default: no Job Object adapter yet (ADR 0006).
     Arc::new(NullBackend::new())
 }
+
+#[cfg(windows)]
+pub use shepherd_infra::WindowsJobBackend;

@@ -427,3 +427,7 @@ check still live → cache. `stats(pid)` reads cache; reap removes cache and CPU
 
 Capture output: OS stdout/stderr → independent readers → OutputSink bounded queue
 + capped tail → ProcessOutput observer. Observer ownership never extends child lifetime.
+
+Windows spawn: CREATE_SUSPENDED → assign scope Job Object → resume → monitor wait.
+Windows cleanup: force → root wait → ActiveProcesses=0 → close Job Object.
+macOS stats: libproc counters → Mach time conversion → shared interval cache.
