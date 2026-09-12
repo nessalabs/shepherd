@@ -61,6 +61,20 @@ async fn external_tree_is_read_only_and_refreshable() {
         .unwrap();
     let observer = process_observer();
     let first = chain(&observer, root.id()).await;
+    let usage = observer.tree_usage(root.id()).await.unwrap();
+    assert_eq!(usage.usage.entries.len(), 3);
+    assert_eq!(usage.usage.totals(None).resident_bytes.contributors, 3);
+    assert_eq!(
+        usage.usage.totals(None).resident_bytes.value,
+        Some(
+            usage
+                .usage
+                .entries
+                .iter()
+                .map(|e| e.measurement.as_ref().unwrap().resident_bytes)
+                .sum()
+        )
+    );
     let refreshed = observer.refresh_tree(first.root).await.unwrap();
     assert_eq!(first, refreshed);
     // Snapshot enumeration and tree filtering are independent of any supervisor.

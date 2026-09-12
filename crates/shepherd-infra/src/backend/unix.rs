@@ -520,6 +520,72 @@ impl UnixProcessBackend {
 
 #[async_trait]
 impl ProcessBackend for UnixProcessBackend {
+    async fn scope_usage(
+        &self,
+        scope: ProcessScopeId,
+    ) -> Result<shepherd_app::ScopeUsage, shepherd_app::ObservationError> {
+        #[cfg(target_os = "macos")]
+        {
+            let state = self.state.clone();
+            return crate::usage::blocking(move || {
+                let pgid = {
+                    let locked = state.lock().expect("unix backend mutex");
+                    let group = locked.scope_groups.get(&scope).ok_or_else(|| {
+                        shepherd_app::ObservationError::Backend("scope group unavailable".into())
+                    })?;
+                    if !locked
+                        .anchors
+                        .get(&scope)
+                        .is_some_and(|a| !a.kill_issued && a.exit.borrow().is_none())
+                    {
+                        return Err(shepherd_app::ObservationError::Backend(
+                            "scope anchor unavailable".into(),
+                        ));
+                    }
+                    group.pgid
+                };
+                let usage = crate::usage::group(pgid)?;
+                let locked = state.lock().expect("unix backend mutex");
+                if locked
+                    .scope_groups
+                    .get(&scope)
+                    .is_none_or(|g| g.pgid != pgid)
+                    || !locked
+                        .anchors
+                        .get(&scope)
+                        .is_some_and(|a| !a.kill_issued && a.exit.borrow().is_none())
+                {
+                    return Err(shepherd_app::ObservationError::Backend(
+                        "scope changed during observation".into(),
+                    ));
+                }
+                Ok(shepherd_app::ScopeUsage::Sampled(usage))
+            })
+            .await;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let cgroups = self
+                .cgroups
+                .clone()
+                .ok_or(shepherd_app::ObservationError::Unsupported)?;
+            return crate::usage::blocking(move || {
+                let directory = cgroups
+                    .accounting_directory(scope)
+                    .map_err(|e| shepherd_app::ObservationError::Backend(e.to_string()))?;
+                super::cgroup::accounting(directory)
+                    .map(shepherd_app::ScopeUsage::Accounting)
+                    .map_err(|e| shepherd_app::ObservationError::Backend(e.to_string()))
+            })
+            .await;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = scope;
+            Err(shepherd_app::ObservationError::Unsupported)
+        }
+    }
+
     async fn spawn(
         &self,
         scope: ProcessScopeId,

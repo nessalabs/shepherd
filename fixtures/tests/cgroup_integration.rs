@@ -174,3 +174,47 @@ async fn nested_cgroups_are_removed_after_kill_and_reap() {
     .expect("supervisor cgroup leaked after cleanup");
     std::fs::remove_dir(ancestor).unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires delegated cgroup v2; privileged CI runs explicitly"]
+async fn scope_accounting_reads_its_own_cgroup_and_fails_after_cleanup() {
+    use shepherd::{AccountingSource, ScopeUsage};
+    let root = shepherd_test_support::TestEnvironment::from_env().cgroup_root();
+    let backend = UnixProcessBackend::with_cgroup_root(root).unwrap();
+    let sup = SupervisorBuilder::new().backend(Arc::new(backend)).build();
+    let one = sup.create_scope();
+    let two = sup.create_scope();
+    let first = sup
+        .spawn(
+            one,
+            ProcessSpec::new(env!("CARGO_BIN_EXE_resource_workload")).arg("cpu"),
+        )
+        .await
+        .unwrap();
+    sup.spawn(two, ProcessSpec::new(env!("CARGO_BIN_EXE_sleep_forever")))
+        .await
+        .unwrap();
+    let ScopeUsage::Accounting(a) = sup.scope_usage(one).await.unwrap() else {
+        panic!("cgroup accounting required");
+    };
+    assert_eq!(a.source, AccountingSource::LinuxCgroup);
+    assert!(
+        a.cpu_time.is_some(),
+        "cpu.stat must be available on the privileged runner"
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let ScopeUsage::Accounting(b) = sup.scope_usage(one).await.unwrap() else {
+        unreachable!()
+    };
+    assert!(b.cpu_time.unwrap() > a.cpu_time.unwrap());
+    assert_eq!(b.peak_commit_bytes, None);
+    assert!(sup
+        .terminate_scope(one, TerminateOptions::default())
+        .await
+        .unwrap()
+        .all_verified());
+    assert!(sup.wait(first).await.is_ok());
+    assert!(sup.scope_usage(one).await.is_err());
+    assert!(sup.scope_usage(two).await.is_ok());
+    sup.shutdown().await.unwrap();
+}

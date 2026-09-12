@@ -191,6 +191,90 @@ impl WindowsJobBackend {
 }
 #[async_trait]
 impl ProcessBackend for WindowsJobBackend {
+    async fn scope_usage(
+        &self,
+        scope: ProcessScopeId,
+    ) -> Result<shepherd_app::ScopeUsage, shepherd_app::ObservationError> {
+        let state = self.state.clone();
+        crate::usage::blocking(move || {
+            // Duplicate the read handle while protected; perform queries without holding
+            // lifecycle locks. Do not cache the duplicate beyond this bounded operation.
+            let job = {
+                let state = state.lock().expect("job mutex");
+                let job = state.jobs.get(&scope).ok_or_else(|| {
+                    shepherd_app::ObservationError::Backend("scope job unavailable".into())
+                })?;
+                let mut handle = std::ptr::null_mut();
+                // SAFETY: live job handle under lock, valid output slot, current process.
+                if unsafe {
+                    windows_sys::Win32::Foundation::DuplicateHandle(
+                        GetCurrentProcess(),
+                        raw(job),
+                        GetCurrentProcess(),
+                        &mut handle,
+                        windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY,
+                        0,
+                        0,
+                    )
+                } == 0
+                {
+                    return Err(shepherd_app::ObservationError::Backend(
+                        io::Error::last_os_error().to_string(),
+                    ));
+                }
+                owned(handle).map_err(|e| shepherd_app::ObservationError::Backend(e.to_string()))?
+            };
+            // SAFETY: correctly sized initialized accounting records and live handle.
+            unsafe {
+                let mut basic: JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION = std::mem::zeroed();
+                let mut extended: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                for (class, buffer, size) in [
+                    (
+                        JobObjectBasicAndIoAccountingInformation,
+                        (&mut basic as *mut JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION)
+                            .cast::<std::ffi::c_void>(),
+                        std::mem::size_of_val(&basic) as u32,
+                    ),
+                    (
+                        JobObjectExtendedLimitInformation,
+                        (&mut extended as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION)
+                            .cast::<std::ffi::c_void>(),
+                        std::mem::size_of_val(&extended) as u32,
+                    ),
+                ] {
+                    if QueryInformationJobObject(
+                        raw(&job),
+                        class,
+                        buffer,
+                        size,
+                        std::ptr::null_mut(),
+                    ) == 0
+                    {
+                        return Err(shepherd_app::ObservationError::Backend(
+                            io::Error::last_os_error().to_string(),
+                        ));
+                    }
+                }
+                let ticks = (basic.BasicInfo.TotalUserTime as u64)
+                    .checked_add(basic.BasicInfo.TotalKernelTime as u64)
+                    .and_then(|v| v.checked_mul(100));
+                Ok(shepherd_app::ScopeUsage::Accounting(
+                    shepherd_app::ScopeAccounting {
+                        source: shepherd_app::AccountingSource::WindowsJob,
+                        sampled_at: Instant::now(),
+                        cpu_time: ticks.map(Duration::from_nanos),
+                        memory_bytes: None,
+                        peak_commit_bytes: Some(extended.PeakJobMemoryUsed as u64),
+                        io_read_bytes: Some(basic.IoInfo.ReadTransferCount),
+                        io_write_bytes: Some(basic.IoInfo.WriteTransferCount),
+                        member_count: Some(basic.BasicInfo.ActiveProcesses as u64),
+                    },
+                ))
+            }
+        })
+        .await
+    }
+
     async fn spawn(
         &self,
         scope: ProcessScopeId,

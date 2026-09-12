@@ -127,6 +127,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p shepherd-fixtures --test resource_integration -- --nocapture
+      - name: Aggregate usage, external roots, and scope isolation
+        run: cargo test --locked -p shepherd-fixtures --test usage_integration --test observation_integration -- --nocapture
+      - name: Accounting conversion and failure regressions
+        run: "cargo test --locked -p shepherd-infra usage:: -- --nocapture"
 
   output-stress:
     timeout-minutes: 20
@@ -240,3 +244,24 @@ jobs:
           gh release download v1.7.12 --repo rhysd/actionlint --pattern actionlint_1.7.12_linux_amd64.tar.gz --dir "$RUNNER_TEMP/actionlint"
           tar -xzf "$RUNNER_TEMP/actionlint/actionlint_1.7.12_linux_amd64.tar.gz" -C "$RUNNER_TEMP/actionlint"
       - run: '"$RUNNER_TEMP/actionlint/actionlint" -shellcheck= -pyflakes='
+
+  macos-accounting:
+    name: macOS native accounting (${{ matrix.os }})
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: Swatinem/rust-cache@v2
+      - name: CPU units, memory, flavor fallback, and access errors
+        run: "cargo test --locked -p shepherd-infra usage::macos:: -- --nocapture"
+      - name: Owned and external aggregates with lifecycle races
+        run: cargo test --locked -p shepherd-fixtures --test usage_integration --test observation_integration -- --nocapture
+      - name: Native live, zombie, and reaped query contract
+        run: |
+          clang -Wall -Wextra -Werror -O2 docs/research/macos-rusage-probe.c -o /tmp/shepherd-rusage-probe
+          /tmp/shepherd-rusage-probe

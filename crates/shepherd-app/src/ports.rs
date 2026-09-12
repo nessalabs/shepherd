@@ -71,6 +71,14 @@ pub trait ProcessBackend: Send + Sync {
     /// Samples current resource usage.
     async fn sample(&self, target: &Spawned) -> Result<RawStats, StatsError>;
 
+    /// Read-only scope accounting; unsupported adapters fail explicitly.
+    async fn scope_usage(
+        &self,
+        _scope: ProcessScopeId,
+    ) -> Result<crate::ScopeUsage, crate::ObservationError> {
+        Err(crate::ObservationError::Unsupported)
+    }
+
     /// Returns a cloneable output observer when capture was requested.
     fn output(&self, _target: &Spawned) -> Option<crate::output::ProcessOutput> {
         None

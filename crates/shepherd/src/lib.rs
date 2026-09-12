@@ -147,3 +147,5 @@ pub use shepherd_domain::{ObservedProcess, ObservedProcessIdentity, ProcessSnaps
 pub fn process_observer() -> ProcessObserver {
     ProcessObserver::new(Arc::new(shepherd_infra::SystemProcessObserver::default()))
 }
+
+pub use shepherd_app::usage::*;

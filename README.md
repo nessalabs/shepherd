@@ -54,6 +54,7 @@ The domain's purity, the layering, and the ubiquitous language are enforced by t
 
 ## Documentation
 
+- [`docs/AGGREGATE_STATISTICS.md`](docs/AGGREGATE_STATISTICS.md) — aggregate process and scope measurements, with a linked beginner primer.
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture and implementation plan.
 - [`docs/DIAGRAMS.md`](docs/DIAGRAMS.md) — class and state diagrams.
 - [`docs/GLOSSARY.md`](docs/GLOSSARY.md) — the ubiquitous language (enforced in CI).
@@ -148,3 +149,16 @@ Observation identities must never be used as authority to signal or reap.
 
 This API exposes topology and names, not aggregate resource usage. Existing managed
 root statistics remain available through `supervisor.stats(process_id)`.
+
+### Aggregate resource usage
+
+`observer.tree_usage(os_pid).await` measures a visible root and its descendants.
+`observer.refresh_tree_usage(&previous).await` checks the root identity and refreshes
+its usage. Compare snapshots with `next.usage.totals(Some(&previous.usage))` for CPU
+cores and current memory totals, including contributor counts. The first snapshot
+has no CPU rate. Missing measurements are explicit errors, never fabricated zeroes.
+
+`supervisor.scope_usage(scope_id).await` returns sampled group usage on macOS or
+native accounting on Linux cgroups and Windows Jobs. Unsupported backends fail
+explicitly. These are read-only, on-demand APIs; see the
+[aggregate statistics guide](docs/AGGREGATE_STATISTICS.md) for field meanings and limits.
