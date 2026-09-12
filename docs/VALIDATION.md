@@ -68,11 +68,11 @@ SHEPHERD_STRESS_ITERATIONS=2000 cargo test -p shepherd-fixtures --test leak_stre
 ```
 
 The manual stress workflow runs long loops on Linux, macOS and Windows. Privileged
-cgroup prerequisites and a fail-closed command are in ADR 0012. Final Phase F CI and
+cgroup prerequisites and a fail-closed command are in ADR 0012. Initial Phase F CI and
 manual stress execution both passed on implementation commit
 `0e88cbb5e9937140decf7a6c04bbc4789c53b1a8`:
 
-- [Final implementation CI](https://github.com/nessalabs/shepherd/actions/runs/34675344960):
+- [Initial implementation CI](https://github.com/nessalabs/shepherd/actions/runs/34675344960):
   all 18 jobs passed, including privileged cgroup containment, all three real platform
   backends, output/resource/leak tests, property/loom suites, MSRV lint, DDD fitness,
   and 100% domain line coverage.
@@ -89,6 +89,33 @@ The Unix jobs found no owned zombies; Windows additionally exercises Job Object
 active-process verification. These are measured runtime results, not inferred from
 cross-compilation. All ten skeptical-review items are satisfied within the explicit
 OS and runtime limits below; this document and OWNERSHIP.md supply the final review.
+
+## Review corrections
+
+The subsequent review loop added regression coverage and fixes for nested cgroup
+removal, independent sampling under stalled targets, bounded retained output and
+scope histories, scope-local output ownership, admitted-spawn shutdown ordering,
+dead process-group anchors, and typed closed-scope races. Further review covered
+verified-only scope completion events, outcomes surviving failed/canceled cleanup,
+constant-time partial output eviction, retired operation locks, and cleanup-worker
+panics. The macOS CPU-unit finding was checked against pinned XNU source and
+mutation-tested on Apple Silicon; the required single conversion remains intact.
+ADRs 0011, 0013–0015, 0017 and 0019 record these decisions and limitations.
+
+The final integrated production changes at
+`a461bbb79010f63e2dafbe7f2dd46df0699e0a1a` passed:
+
+- [All 18 CI jobs](https://github.com/nessalabs/shepherd/actions/runs/34683443584),
+  including privileged cgroups, 100% domain line coverage and all three OS backends.
+- [2,000-cycle stress on all three OSes](https://github.com/nessalabs/shepherd/actions/runs/34683477380).
+  Resource counts were unchanged: Linux 12→12, macOS 17→17, Windows 89→89.
+- Local Rust 1.83 workspace clippy/tests, Linux and Windows cross-clippy, architecture
+  fitness, both loom models and 2,000 cycles with 10→10 macOS descriptors.
+
+Fixes are carried in their introducing PRs and merged forward without rewriting
+history. Previously hardened behavior is also backported where an earlier PR would
+otherwise retain a review defect. These results supplement, rather than replace,
+the explicit platform limits below.
 
 ## OS limits
 
