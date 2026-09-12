@@ -33,3 +33,10 @@ Job accounting is used for containment emptiness, not mislabeled per-root stats.
 Virtual memory and descendant counts remain None. Output shares the bounded byte
 adapter. The Windows CI matrix executes real tree, orphan, isolation, Drop,
 kernel-close, resource and output tests.
+
+Native sampling uses the shared bounded blocking-observation helper (ADR 0013).
+A sample retains an Arc-owned exact process handle through native calls, even if
+its async waiter times out or the root registry entry is removed. The job mutex
+is released before GetProcessTimes/memory/I/O calls and reacquired only to update
+CPU history after checking the child is still registered. The per-child permit
+prevents repeated timed-out requests from spawning overlapping native work.

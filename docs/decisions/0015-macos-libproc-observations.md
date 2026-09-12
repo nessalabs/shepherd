@@ -35,3 +35,8 @@ reported approximately one core for the single-thread burner. Removing it would
 report approximately 0.024 cores; applying it twice would report approximately
 41.7 cores. Preserve the conversion and verify units against the specific libproc
 flavor instead of assuming all macOS time fields use nanoseconds.
+
+libproc and Mach observation calls execute on the bounded blocking pool described
+in ADR 0013, with per-child admission retained until the native call actually ends.
+The existing Mach conversion is unchanged; backend accounting locks do not span
+libproc calls.
