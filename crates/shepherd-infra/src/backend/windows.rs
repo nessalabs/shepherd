@@ -115,7 +115,8 @@ fn resume(pid: u32) -> io::Result<()> {
 }
 struct Slot {
     scope: ProcessScopeId,
-    process: OwnedHandle,
+    process: Arc<OwnedHandle>,
+    sampling: Arc<AtomicBool>,
     exit: watch::Sender<Option<Result<RawExit, String>>>,
     output: Option<ProcessOutput>,
     killed: Arc<AtomicBool>,
@@ -129,9 +130,56 @@ struct State {
 /// One Job Object per scope, with kernel KILL_ON_JOB_CLOSE protection.
 #[derive(Clone, Default)]
 pub struct WindowsJobBackend {
+    sampling: super::sampling::SamplingPool,
     state: Arc<Mutex<State>>,
 }
 impl WindowsJobBackend {
+    fn sample_sync(
+        &self,
+        target: &Spawned,
+        process: Arc<OwnedHandle>,
+    ) -> Result<RawStats, StatsError> {
+        // Retain the exact handle independently of registry removal. Native calls
+        // execute without the job mutex, so sampling cannot block signals or reap.
+        let (_, ticks) = times(raw(&process)).map_err(|e| StatsError::Backend(e.to_string()))?;
+        let now = Instant::now();
+        let mut memory: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        let mut io: IO_COUNTERS = unsafe { std::mem::zeroed() };
+        bool_result(unsafe {
+            K32GetProcessMemoryInfo(
+                raw(&process),
+                &mut memory,
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            )
+        })
+        .map_err(|e| StatsError::Backend(e.to_string()))?;
+        bool_result(unsafe { GetProcessIoCounters(raw(&process), &mut io) })
+            .map_err(|e| StatsError::Backend(e.to_string()))?;
+        let mut state = self.state.lock().expect("job mutex");
+        let slot = state
+            .children
+            .get_mut(&key(target))
+            .ok_or_else(|| StatsError::Backend("process reaped during sample".into()))?;
+        let cpu_usage = slot
+            .previous
+            .map(|(time, old)| {
+                ticks.saturating_sub(old) as f64
+                    / 1e7
+                    / now.duration_since(time).as_secs_f64().max(1e-9)
+            })
+            .unwrap_or(0.0) as f32;
+        slot.previous = Some((now, ticks));
+        Ok(RawStats {
+            cpu_usage,
+            memory_rss_bytes: memory.WorkingSetSize as u64,
+            virtual_memory_bytes: None,
+            peak_rss_bytes: Some(memory.PeakWorkingSetSize as u64),
+            io_read_bytes: Some(io.ReadTransferCount),
+            io_write_bytes: Some(io.WriteTransferCount),
+            descendant_count: None,
+            state: ProcessState::Unknown,
+        })
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -216,7 +264,8 @@ impl ProcessBackend for WindowsJobBackend {
                 key(&spawned),
                 Slot {
                     scope,
-                    process,
+                    process: Arc::new(process),
+                    sampling: Arc::default(),
                     exit: tx.clone(),
                     output: output.clone(),
                     killed: killed.clone(),
@@ -361,45 +410,19 @@ impl ProcessBackend for WindowsJobBackend {
         result.map_err(WaitError::Backend)
     }
     async fn sample(&self, target: &Spawned) -> Result<RawStats, StatsError> {
-        let mut state = self.state.lock().expect("job mutex");
-        let slot = state
-            .children
-            .get_mut(&key(target))
-            .ok_or_else(|| StatsError::Backend("process reaped".into()))?;
-        let (_, ticks) =
-            times(raw(&slot.process)).map_err(|e| StatsError::Backend(e.to_string()))?;
-        let now = Instant::now();
-        let cpu_usage = slot
-            .previous
-            .map(|(time, old)| {
-                ticks.saturating_sub(old) as f64
-                    / 1e7
-                    / now.duration_since(time).as_secs_f64().max(1e-9)
-            })
-            .unwrap_or(0.0) as f32;
-        slot.previous = Some((now, ticks));
-        let mut memory: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
-        let mut io: IO_COUNTERS = unsafe { std::mem::zeroed() };
-        bool_result(unsafe {
-            K32GetProcessMemoryInfo(
-                raw(&slot.process),
-                &mut memory,
-                std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-            )
-        })
-        .map_err(|e| StatsError::Backend(e.to_string()))?;
-        bool_result(unsafe { GetProcessIoCounters(raw(&slot.process), &mut io) })
-            .map_err(|e| StatsError::Backend(e.to_string()))?;
-        Ok(RawStats {
-            cpu_usage,
-            memory_rss_bytes: memory.WorkingSetSize as u64,
-            virtual_memory_bytes: None,
-            peak_rss_bytes: Some(memory.PeakWorkingSetSize as u64),
-            io_read_bytes: Some(io.ReadTransferCount),
-            io_write_bytes: Some(io.WriteTransferCount),
-            descendant_count: None,
-            state: ProcessState::Unknown,
-        })
+        let (process, active) = {
+            let state = self.state.lock().expect("job mutex");
+            let slot = state
+                .children
+                .get(&key(target))
+                .ok_or_else(|| StatsError::Backend("process reaped".into()))?;
+            (slot.process.clone(), slot.sampling.clone())
+        };
+        let backend = self.clone();
+        let target = *target;
+        self.sampling
+            .run(active, move || backend.sample_sync(&target, process))
+            .await
     }
     fn output(&self, target: &Spawned) -> Option<ProcessOutput> {
         self.state

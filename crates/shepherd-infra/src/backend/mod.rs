@@ -15,3 +15,5 @@ mod cgroup;
 mod windows;
 #[cfg(windows)]
 pub use windows::WindowsJobBackend;
+#[cfg(any(unix, windows))]
+mod sampling;
