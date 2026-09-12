@@ -40,6 +40,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Record machine and compiler
         shell: bash
         run: |
@@ -52,8 +55,7 @@ jobs:
           SHEPHERD_STRESS_SEED: ${{ inputs.seed }}
           SHEPHERD_STRESS_RUNTIME: ${{ matrix.runtime }}
         run: |
-          set -o pipefail
-          cargo test --locked -p shepherd-fixtures --test leak_stress long_create_kill -- --ignored --nocapture 2>&1 | tee stress.log
+          python tools/run-stress.py --log stress.log -- cargo test --locked -p shepherd-fixtures --test leak_stress long_create_kill -- --ignored --nocapture
       - name: Larger generated traces and cancellation races
         shell: bash
         env:
@@ -68,6 +70,7 @@ jobs:
           name: stress-${{ matrix.os }}-${{ matrix.runtime }}
           path: |
             stress.log
+            stress.diagnostics.txt
             properties.log
             **/*.proptest-regressions
             **/proptest-regressions/**
