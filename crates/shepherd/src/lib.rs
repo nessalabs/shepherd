@@ -26,9 +26,9 @@ use std::sync::Arc;
 pub use shepherd_app::output::{OutputChunk, OutputSnapshot, OutputStream, ProcessOutput};
 pub use shepherd_app::ports::{IntegrationEventPublisher, ProcessBackend, Spawned};
 pub use shepherd_app::{
-    HandlerError, ProcessSupervisor, ScopeTerminationReport, ScopedProcesses, ShutdownError,
-    ShutdownReport, SpawnError, StatsError, TerminateError, TerminateOptions, WaitError,
-    WithScopeResult,
+    HandlerError, ProcessSupervisor, ScopeCreationError, ScopeTerminationReport, ScopedProcesses,
+    ShutdownError, ShutdownReport, SpawnError, StatsError, TerminateError, TerminateOptions,
+    WaitError, WithScopeResult,
 };
 pub use shepherd_domain::{
     Capabilities, Containment, DomainEvent, EnvPolicy, GracePeriod, IntegrationEvent, OutputMode,

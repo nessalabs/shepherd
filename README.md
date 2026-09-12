@@ -32,6 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Scope creation is allowed only before shutdown starts. The existing `create_scope()`
+method panics after that point; use `try_create_scope()` to handle
+`ScopeCreationError::SupervisorClosed`, including creation racing with shutdown.
+Rejected creation allocates no scope id or retained state.
+
 ## Architecture (Domain-Driven Design)
 
 Shepherd is one bounded context split into layers with a strict *dependencies point inward*

@@ -90,3 +90,7 @@ The channel is registered before the scope becomes visible to shutdown; the acti
 body and cleanup worker retain it independently of bounded report lookup history.
 A body finishing after that history expires still observes the verified report,
 and its worker preserves that result instead of repeating expired scope lookup.
+
+Like `create_scope`, `with_scope` and `with_scope_options` require admission before
+shutdown starts and panic if that precondition is violated. `try_create_scope`
+provides checked manual admission without changing the existing scoped-result shape.
