@@ -920,9 +920,9 @@ fn kill_registered_roots(state: &State, scope: ProcessScopeId) {
         #[cfg(target_os = "linux")]
         if let Some(fd) = &slot.pidfd {
             let _ = pidfd_kill(fd.as_raw_fd(), NixSignal::SIGKILL);
-            if matches!(&*slot.sender.borrow(), Some(Err(_))) {
-                let _ = slot.retry.try_send(());
-            }
+            // Buffer the reap request even if a concurrent failed observation has
+            // not been published yet. A successful waiter ignores this token.
+            let _ = slot.retry.try_send(());
             continue;
         }
         #[cfg(not(target_os = "linux"))]
@@ -930,9 +930,7 @@ fn kill_registered_roots(state: &State, scope: ProcessScopeId) {
         if *token != 0 && read_start_time(*pid) == Some(*token) {
             let _ = kill(Pid::from_raw(*pid as i32), Some(NixSignal::SIGKILL));
         }
-        if matches!(&*slot.sender.borrow(), Some(Err(_))) {
-            let _ = slot.retry.try_send(());
-        }
+        let _ = slot.retry.try_send(());
     }
 }
 
@@ -1115,6 +1113,37 @@ mod tests {
             backend.wait(&root).await.unwrap().signal,
             Some(Signal::Kill)
         );
+    }
+
+    #[tokio::test]
+    async fn hard_kill_before_first_wait_error_still_requests_reap() {
+        let backend = UnixProcessBackend::new();
+        let root = backend
+            .spawn(
+                ProcessScopeId::new(1),
+                &ProcessSpec::new("/bin/sleep").arg("30"),
+            )
+            .await
+            .unwrap();
+        let mut observation = {
+            let state = backend.state.lock().unwrap();
+            let slot = &state.children[&child_key(&root.os)];
+            slot.failures.store(1, std::sync::atomic::Ordering::SeqCst);
+            slot.sender.subscribe()
+        };
+        // No yield: the wait task has not published its injected error yet.
+        backend.hard_kill_all();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(&*observation.borrow_and_update(), Some(Ok(_))) {
+                    break;
+                }
+                observation.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        backend.wait(&root).await.unwrap();
     }
 
     #[tokio::test]
