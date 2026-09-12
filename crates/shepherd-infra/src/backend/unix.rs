@@ -429,6 +429,18 @@ impl UnixProcessBackend {
         }
     }
 
+    fn publish_wait_result(
+        &self,
+        scope: ProcessScopeId,
+        sender: &watch::Sender<Option<Result<RawExit, String>>>,
+        raw: Result<RawExit, String>,
+    ) {
+        if raw.is_ok() {
+            self.note_os_exit(scope);
+        }
+        let _ = sender.send(Some(raw));
+    }
+
     fn spawn_in_group(
         &self,
         spec: &ProcessSpec,
@@ -603,8 +615,7 @@ impl ProcessBackend for UnixProcessBackend {
             };
             // Root reap is independent of inherited pipe lifetimes. Keep owning the
             // readers here, but let termination observers see the actual exit now.
-            this.note_os_exit(scope);
-            let _ = exit_tx.send(Some(raw));
+            this.publish_wait_result(scope, &exit_tx, raw);
             if let Some(output) = output {
                 crate::output::finish_readers(readers, output).await;
             }
@@ -691,17 +702,13 @@ impl ProcessBackend for UnixProcessBackend {
                 return Err(WaitError::Backend("waiter channel closed".into()));
             }
         };
-        self.state
-            .lock()
-            .expect("unix backend mutex")
-            .children
-            .remove(&key);
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        self.state
-            .lock()
-            .expect("unix backend mutex")
-            .cpu_samples
-            .remove(&key);
+        // Failed wait is not reap evidence; retain exact identity for kill backstops.
+        if exit.is_ok() {
+            let mut state = self.state.lock().expect("unix backend mutex");
+            state.children.remove(&key);
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            state.cpu_samples.remove(&key);
+        }
         exit.map_err(WaitError::Backend)
     }
 
@@ -902,11 +909,30 @@ mod cgroup_backstop_tests {
             cgroups.kill(scope).unwrap_err().raw_os_error(),
             Some(libc::EBADF)
         );
+        let sender = backend.state.lock().unwrap().children[&child_key(&root.os)]
+            .sender
+            .clone();
+        backend.publish_wait_result(scope, &sender, Err("injected wait failure".into()));
+        assert!(backend.wait(&root).await.is_err());
+        assert!(backend.state.lock().unwrap().children[&child_key(&root.os)]
+            .pidfd
+            .is_some());
+        let mut recovered = sender.subscribe();
         if all {
             backend.hard_kill_all();
         } else {
             backend.hard_kill_scope(scope);
         }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(&*recovered.borrow_and_update(), Some(Ok(_))) {
+                    break;
+                }
+                recovered.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("failed wait discarded root kill identity");
         let exit = tokio::time::timeout(Duration::from_secs(5), backend.wait(&root))
             .await
             .expect("failed cgroup write abandoned its registered root")
@@ -1472,6 +1498,47 @@ mod anchor_tests {
                 .signal,
             Some(Signal::Kill)
         );
+        backend.cleanup_scope(scope).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod failed_wait_tests {
+    use super::*;
+    use std::time::Duration;
+    #[tokio::test]
+    async fn failed_wait_retains_identity_until_verified_reap() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let root = backend
+            .spawn(scope, &ProcessSpec::new("/bin/sleep").arg("30"))
+            .await
+            .unwrap();
+        let key = child_key(&root.os);
+        let sender = backend.state.lock().unwrap().children[&key].sender.clone();
+        backend.publish_wait_result(scope, &sender, Err("injected wait failure".into()));
+        assert!(backend.wait(&root).await.is_err());
+        assert!(backend.state.lock().unwrap().children.contains_key(&key));
+        assert_eq!(backend.state.lock().unwrap().scope_groups[&scope].live, 1);
+        // The real OS waiter remains alive and replaces the injected failure only
+        // after it has actually reaped this process.
+        let mut recovered = sender.subscribe();
+        backend.hard_kill_all();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(&*recovered.borrow_and_update(), Some(Ok(_))) {
+                    break;
+                }
+                recovered.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            backend.wait(&root).await.unwrap().signal,
+            Some(Signal::Kill)
+        );
+        assert!(!backend.state.lock().unwrap().children.contains_key(&key));
         backend.cleanup_scope(scope).await.unwrap();
     }
 }

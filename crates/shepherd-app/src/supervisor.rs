@@ -528,13 +528,19 @@ impl ProcessSupervisor {
     }
 
     /// Transfers the capture observer to the caller, at most once per process.
-    /// Call after spawn, or after wait for post-mortem output.
+    /// Call after spawn, or after wait for post-mortem output. Unclaimed observers
+    /// retain the most recent 256 unclaimed captures from verified completed processes.
     pub fn take_output(&self, pid: ProcessId) -> Option<crate::output::ProcessOutput> {
-        self.inner
+        // Serialize claims with completion so neither path leaves a stale history slot.
+        let mut completed = self.inner.completed.lock().expect("completed mutex");
+        let output = self
+            .inner
             .outputs
             .lock()
             .expect("outputs mutex")
-            .remove(&pid)
+            .remove(&pid);
+        completed.retain(|retained| *retained != pid);
+        output
     }
 
     /// Returns the most recent interval sample, without performing backend I/O.
@@ -1169,10 +1175,14 @@ impl ProcessSupervisor {
             // verified completions are eligible for bounded post-mortem eviction.
             if verified_reap {
                 let mut completed = inner.completed.lock().expect("completed mutex");
-                completed.push_back(pid);
-                while completed.len() > 256 {
-                    if let Some(old) = completed.pop_front() {
-                        inner.outputs.lock().expect("outputs mutex").remove(&old);
+                let mut outputs = inner.outputs.lock().expect("outputs mutex");
+                // Discarded or already claimed output consumes no observer history.
+                if outputs.contains_key(&pid) {
+                    completed.push_back(pid);
+                    while completed.len() > 256 {
+                        if let Some(old) = completed.pop_front() {
+                            outputs.remove(&old);
+                        }
                     }
                 }
             }
