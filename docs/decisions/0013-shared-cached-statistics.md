@@ -11,7 +11,9 @@ coordinator retains only a Weak reference between scheduling/publication steps;
 it never owns a CleanupGuard. Construction outside a runtime remains valid.
 Successful shutdown aborts and joins the coordinator, cancelling pending sample
 futures and its timer immediately even while the supervisor is retained. Failed
-cleanup leaves sampling active until a later successful shutdown.
+cleanup leaves sampling active until a later successful shutdown. The join handle
+remains in supervisor state until joining finishes, so cancelling shutdown during
+that join cannot let a retry report success before sampler destruction completes.
 `SupervisorBuilder::stats_interval` defaults to one second and clamps zero to 1 ms.
 
 `stats(pid)` reads the cache only. `NotReady` distinguishes the initial interval
