@@ -15,3 +15,8 @@ pub use backend::UnixProcessBackend;
 pub use clock::SystemClock;
 pub use publisher::{BroadcastIntegrationPublisher, NoopIntegrationPublisher};
 pub use waiters::InMemoryWaiters;
+
+mod output;
+
+#[cfg(windows)]
+pub use backend::WindowsJobBackend;

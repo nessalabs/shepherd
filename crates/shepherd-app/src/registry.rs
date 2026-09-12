@@ -72,3 +72,41 @@ impl ScopeRegistry {
             .map(|(id, _)| *id)
     }
 }
+
+#[cfg(test)]
+mod loom_tests {
+    use super::*;
+    use loom::sync::{Arc, Mutex};
+    use shepherd_domain::{OsIdentity, ProcessSpec, ReuseToken};
+    #[test]
+    fn loom_registry_spawn_vs_close_and_unique_ids() {
+        loom::model(|| {
+            let mut registry = ScopeRegistry::new();
+            let scope = registry.create_scope();
+            let registry = Arc::new(Mutex::new(registry));
+            let first = registry.clone();
+            let spawn = loom::thread::spawn(move || {
+                let mut r = first.lock().unwrap();
+                let pid = r.next_process_id();
+                let s = r.get_mut(scope).unwrap();
+                let result = s.attach_spawned(
+                    pid,
+                    OsIdentity::new(1, ReuseToken::StartTime(1)),
+                    ProcessSpec::new("model"),
+                );
+                if result.is_err() {
+                    assert!(!s.is_open());
+                }
+                pid
+            });
+            let second = registry.clone();
+            let close = loom::thread::spawn(move || {
+                let mut r = second.lock().unwrap();
+                r.get_mut(scope).unwrap().begin_scope_termination();
+                r.next_process_id()
+            });
+            assert_ne!(spawn.join().unwrap(), close.join().unwrap());
+            assert!(!registry.lock().unwrap().get(scope).unwrap().is_open());
+        });
+    }
+}

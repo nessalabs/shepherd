@@ -131,7 +131,7 @@ fn spawn_sleep_writing_pid(pid_file: &std::path::Path) -> ProcessSpec {
 }
 
 async fn read_os_pid(pid_file: &std::path::Path) -> u32 {
-    for _ in 0..50 {
+    for _ in 0..250 {
         if let Ok(text) = std::fs::read_to_string(pid_file) {
             if let Ok(pid) = text.trim().parse::<u32>() {
                 return pid;
@@ -243,4 +243,48 @@ async fn scope_can_be_reused_after_natural_exit() {
         .expect("reusing an open scope after natural exit must succeed");
     let exit = sup.terminate(second, short_opts()).await.unwrap();
     assert!(exit.outcome.is_verified());
+}
+
+#[tokio::test]
+async fn roots_can_exit_and_reuse_scope_without_losing_original_descendants() {
+    use std::sync::Arc;
+    let sup = SupervisorBuilder::new()
+        .backend(Arc::new(shepherd::UnixProcessBackend::new()))
+        .build();
+    assert_eq!(
+        sup.capabilities().descendant_containment,
+        shepherd::Containment::ProcessGroup
+    );
+    let scope = sup.create_scope();
+    let file = std::env::temp_dir().join(format!("shepherd-orphan-group-{}", std::process::id()));
+    let _ = std::fs::remove_file(&file);
+    let root = sup
+        .spawn(
+            scope,
+            ProcessSpec::new(env!("CARGO_BIN_EXE_job_tree"))
+                .arg(file.as_os_str())
+                .arg("orphan"),
+        )
+        .await
+        .unwrap();
+    let descendant = read_os_pid(&file).await;
+    assert_eq!(sup.wait(root).await.unwrap().code, Some(0));
+    let replacement = sup
+        .spawn(scope, ProcessSpec::new(env!("CARGO_BIN_EXE_sleep_forever")))
+        .await
+        .unwrap();
+    assert!(sup
+        .terminate_scope(scope, short_opts())
+        .await
+        .unwrap()
+        .all_verified());
+    assert!(sup.wait(replacement).await.unwrap().outcome.is_verified());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while process_alive(descendant) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("original descendant was lost when scope was reused");
+    std::fs::remove_file(file).unwrap();
 }

@@ -1,38 +1,29 @@
-name: Stress
-
-# Heavy, repeated lifecycle loops that are inappropriate for every commit. Run on demand.
+name: Long lifecycle resource and cancellation stress
 on:
   workflow_dispatch:
     inputs:
       iterations:
-        description: "Number of times to repeat the integration suite"
+        description: "Create/capture/kill/reap cycles inside each test process"
         required: false
-        default: "25"
-
+        default: "2000"
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-
 jobs:
   stress:
-    name: repeated lifecycle stress
-    runs-on: ubuntu-latest
+    name: FD or handle accounting + owned-zombie inspection (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build tests
-        run: cargo test --workspace --no-run
-      - name: Repeat integration + contract suites to expose leaks/races
-        run: |
-          set -euo pipefail
-          for i in $(seq 1 "${{ github.event.inputs.iterations }}"); do
-            echo "=== iteration $i ==="
-            cargo test -p shepherd --test contract
-            cargo test -p shepherd-fixtures --test unix_integration
-          done
-          echo "checking for leaked fixture / zombie processes"
-          if ps -eo stat,comm | grep -E "sleep_forever|ignore_sigterm|spawn_children|<defunct>" | grep -v grep; then
-            echo "leaked processes detected"; exit 1
-          fi
-          echo "no leaks detected"
+      - name: Repeated lifecycle in one process with resource assertions
+        env:
+          SHEPHERD_STRESS_ITERATIONS: ${{ inputs.iterations }}
+        run: cargo test -p shepherd-fixtures --test leak_stress long_create_kill -- --ignored --nocapture
+      - name: Cancellation, races, and injected failures
+        run: cargo test -p shepherd --test adversarial --test scoped --test properties
