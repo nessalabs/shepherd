@@ -60,3 +60,32 @@ async fn real_scope_success_error_abort_and_partial_spawn_failure_reap() {
     );
     assert!(sup.wait(pid).await.unwrap().outcome.is_verified());
 }
+
+// Separate supervisors share the process's OS descriptor table. In particular,
+// Darwin anchor/root fork handshakes must not race across backend instances.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_independent_supervisors_make_progress() {
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        workers.spawn(async {
+            let supervisor = SupervisorBuilder::new().build();
+            for _ in 0..16 {
+                let result = supervisor
+                    .with_scope_options(vec![spec()], opts(), |_| async {
+                        tokio::task::yield_now().await;
+                    })
+                    .await;
+                assert!(result.result.is_ok());
+                assert!(result.termination.unwrap().all_verified());
+            }
+            supervisor.shutdown().await.unwrap();
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while let Some(result) = workers.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .expect("concurrent native spawns stalled");
+}

@@ -368,7 +368,7 @@ impl UnixProcessBackend {
                 Ok(())
             });
         }
-        let mut child = command.spawn().map_err(|e| SpawnError::Os(e.to_string()))?;
+        let mut child = spawn_native(&mut command).map_err(|e| SpawnError::Os(e.to_string()))?;
         let pgid = child.id() as i32;
         let input = child.stdin.take().expect("anchor stdin");
         let (exit, _) = watch::channel(None);
@@ -510,10 +510,7 @@ impl UnixProcessBackend {
 
         let changes = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
             .map_err(|e| SpawnError::Os(e.to_string()))?;
-        let child = cmd
-            .as_std_mut()
-            .spawn()
-            .map_err(|e| SpawnError::Os(e.to_string()))?;
+        let child = spawn_native(cmd.as_std_mut()).map_err(|e| SpawnError::Os(e.to_string()))?;
         Ok(NativeChild {
             child: Some(child),
             changes,
@@ -2147,4 +2144,20 @@ mod signal_identity_tests {
         assert!(signalled.is_ok());
         assert_eq!(exit.signal, Some(Signal::Kill));
     }
+}
+
+// Darwin lacks pipe2(O_CLOEXEC): std's fork/exec error pipe is created before its
+// close-on-exec flag is set. A concurrent anchor/root fork can inherit its writer,
+// keeping another Command::spawn blocked even after that command execs. Serialize
+// every Shepherd native spawn, including anchors and independent backend instances.
+// The gate is always released before callers acquire/reacquire backend state.
+// Callers that already hold state keep the ordering state -> native-spawn gate.
+fn spawn_native(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    #[cfg(target_os = "macos")]
+    static NATIVE_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(target_os = "macos")]
+    let _guard = NATIVE_SPAWN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    command.spawn()
 }

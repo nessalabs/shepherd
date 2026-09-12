@@ -57,3 +57,14 @@ Still not proven by this matrix:
 The machine labels come from GitHub's [hosted runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 Actual execution results must be recorded on the PR; declaring a matrix is not proof
 that those machines passed.
+
+## Failure found by the expanded matrix
+
+Intel macOS multi-thread stress stalled in native Command::spawn while another worker
+waited on backend state. The external watchdog captured the native stacks. Darwin's
+non-atomic pipe/CLOEXEC setup permits concurrent fork paths to inherit each other's
+exec-handshake pipe. Shepherd now serializes its native root and anchor spawns across
+backend instances on macOS, releasing the gate before reacquiring backend state.
+This gate coordinates Shepherd's own spawn paths; unrelated application fork/spawn
+implementations do not participate in it. The mixed fanout stress is the native
+regression, run on both macOS architectures with an independent watchdog.
