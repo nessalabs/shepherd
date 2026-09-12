@@ -15,7 +15,10 @@ pub use dispatch::{
     EventDispatcher, IntegrationTranslator, RegistryPruneHandler, SharedRegistry,
     WaitNotifierHandler,
 };
-pub use error::{HandlerError, ShutdownError, SpawnError, StatsError, TerminateError, WaitError};
+pub use error::{
+    HandlerError, ScopeCreationError, ShutdownError, SpawnError, StatsError, TerminateError,
+    WaitError,
+};
 pub use ports::{
     Clock, EventHandler, IntegrationEventPublisher, ProcessBackend, Spawned, TerminateOptions,
     WaitFuture, Waiters,

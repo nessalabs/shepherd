@@ -20,6 +20,12 @@ The registry entry and operation lock are published atomically under the registr
 lock. Unknown IDs never allocate operation locks; verified cleanup removes its
 lock, and cached completion lookups do not recreate it. Unverified scopes retain
 their lock so cleanup retries remain serialized.
+Creation checks shutdown admission under the same registry guard, before allocating
+an id. `try_create_scope` returns ScopeCreationError::SupervisorClosed after admission
+closes; the existing `create_scope` signature is preserved as a documented panic
+wrapper. The wrapper panics only after releasing the registry guard, so a caught
+misuse panic cannot poison cleanup state. Scopes admitted before shutdown's flag
+store finish publishing before shutdown can take its registry snapshot.
 
 Require cgroup.kill and exercise it on an empty probe. A PID sweep on older
 kernels cannot make the same atomic guarantee against concurrent forks, so those
