@@ -1,6 +1,6 @@
 //! The `ProcessSupervisor` application service.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -102,6 +102,7 @@ struct Inner {
     samples: Mutex<HashMap<ProcessId, Result<ProcessStats, StatsError>>>,
     sampler_started: AtomicBool,
     outputs: Mutex<HashMap<ProcessId, crate::output::ProcessOutput>>,
+    completed: Mutex<VecDeque<ProcessId>>,
     stats_interval: Duration,
 }
 
@@ -154,6 +155,7 @@ impl ProcessSupervisor {
                 samples: Mutex::new(HashMap::new()),
                 sampler_started: AtomicBool::new(false),
                 outputs: Mutex::new(HashMap::new()),
+                completed: Mutex::new(VecDeque::new()),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
                 shutting_down: Arc::clone(&shutting_down),
             }),
@@ -268,7 +270,8 @@ impl ProcessSupervisor {
     }
 
     /// Transfers the capture observer to the caller, at most once per process.
-    /// Call after spawn, or after wait for post-mortem output.
+    /// Call after spawn, or after wait for post-mortem output. Unclaimed observers
+    /// are retained for the most recent 256 completed processes.
     pub fn take_output(&self, pid: ProcessId) -> Option<crate::output::ProcessOutput> {
         self.inner
             .outputs
@@ -607,6 +610,15 @@ impl ProcessSupervisor {
             };
             inner.samples.lock().expect("samples mutex").remove(&pid);
             inner.dispatcher.dispatch(&events).await;
+            {
+                let mut completed = inner.completed.lock().expect("completed mutex");
+                completed.push_back(pid);
+                while completed.len() > 256 {
+                    if let Some(old) = completed.pop_front() {
+                        inner.outputs.lock().expect("outputs mutex").remove(&old);
+                    }
+                }
+            }
             inner
                 .spawn_times
                 .lock()
