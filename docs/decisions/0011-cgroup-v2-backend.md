@@ -86,9 +86,17 @@ root identities. The quarantine remains even if a later root wait recovers, beca
 reap does not establish that the old group ID is safe. Cgroup kill remains independently
 available. On targets without a safe retained root identity, this fails closed.
 
-A failed OS wait retains the actual Tokio Child, not just its last error. A later wait
+A transient OS wait failure retains the actual native child handle, not just its last error. A later wait
 requests another native observation through a one-entry coalescing channel; permanent
 errors do not retry autonomously. The waiter owns only a weak backend-state reference.
 Dropping backend state closes the channel and releases an idle failed waiter. The
 supervisor's identity-safe kill backstop runs before that disposal; Child kill-on-drop
 remains disabled because an errored raw PID is not proof of identity.
+
+ECHILD permanently ends native wait ownership. The backend owns std::process::Child
+and waits asynchronously through a SIGCHLD stream registered before the first try_wait.
+Unlike Tokio's orphan reaper, dropping this native child after ECHILD never retries a
+numeric PID. The scope remains unverified and retained identities remain available for
+safe signalling. Normal cancellation transfers a still-owned child to one blocking
+reap thread that calls wait once and stops on error; verified and ownership-lost handles
+never enter that fallback. Scope and global kills buffer a bounded reap retry request.
