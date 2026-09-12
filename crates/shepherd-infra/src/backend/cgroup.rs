@@ -124,12 +124,23 @@ impl Cgroups {
             None => Ok(()),
         }
     }
-    pub fn kill_all(&self) {
-        for group in self.groups.lock().expect("cgroup mutex").values() {
+    pub fn kill_all(&self) -> Vec<ProcessScopeId> {
+        let mut failed = Vec::new();
+        for (scope, group) in self.groups.lock().expect("cgroup mutex").iter() {
             if let Err(error) = group.kill() {
-                tracing::error!(%error, "cgroup hard kill failed");
+                tracing::error!(%scope, %error, "cgroup hard kill failed");
+                failed.push(*scope);
             }
         }
+        failed
+    }
+    #[cfg(test)]
+    pub(super) fn replace_kill_file(&self, scope: ProcessScopeId, kill: File) -> File {
+        let mut groups = self.groups.lock().expect("cgroup mutex");
+        std::mem::replace(
+            &mut groups.get_mut(&scope).expect("test cgroup exists").kill,
+            kill,
+        )
     }
     pub async fn finish(&self, scope: ProcessScopeId) -> io::Result<()> {
         for _ in 0..500 {
@@ -155,7 +166,7 @@ impl Cgroups {
 }
 impl Drop for Cgroups {
     fn drop(&mut self) {
-        self.kill_all();
+        let _ = self.kill_all();
         self.groups.get_mut().expect("cgroup mutex").clear();
         let _ = fs::remove_dir(&self.root);
     }
