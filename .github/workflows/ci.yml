@@ -220,6 +220,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Verify external watchdog
+        run: python3 -m unittest discover -s tools -p test_run_stress.py
       - name: Install pinned actionlint
         env:
           GH_TOKEN: ${{ github.token }}

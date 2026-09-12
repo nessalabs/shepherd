@@ -35,8 +35,11 @@ distinguish runtime initialization from leaks. Blocking workers remain alive dur
 the measurement (one-hour keep-alive, longer than the workflow timeout). This avoids
 counting lazy worker growth as a process-resource leak while retaining the strict
 zero-growth assertion. Windows logs include read-only native handle-type snapshots;
-all platforms emit counts every 500 cycles. Workflow inputs can select Windows and
-one runtime for focused reproduction.
+all platforms emit counts every 500 cycles. Workflow inputs can select Windows/macOS and one runtime for focused reproduction.
+An external Python watchdog enforces progress/overall deadlines independently of Tokio,
+captures macOS native thread samples on a stall, and retains diagnostics before failing.
+Its success, nonzero-exit, early-EOF and timeout paths run in CI and before long stress.
+A timeout is never treated as verified cleanup; the hosted runner cleans up after failure.
 
 Still not proven by this matrix:
 

@@ -13,7 +13,7 @@ on:
       machines:
         description: "Machine set (Windows subset helps reproduce handle failures)"
         type: choice
-        options: [all, windows]
+        options: [all, windows, macos]
         default: all
       runtime:
         description: "Runtime subset"
@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.machines == 'windows' && '["windows-2022","windows-11-arm"]' || '["ubuntu-24.04","ubuntu-24.04-arm","macos-15","macos-15-intel","windows-2022","windows-11-arm"]') }}
+        os: ${{ fromJSON(inputs.machines == 'windows' && '["windows-2022","windows-11-arm"]' || inputs.machines == 'macos' && '["macos-15","macos-15-intel"]' || '["ubuntu-24.04","ubuntu-24.04-arm","macos-15","macos-15-intel","windows-2022","windows-11-arm"]') }}
         runtime: ${{ fromJSON(inputs.runtime == 'current' && '["current"]' || inputs.runtime == 'multi' && '["multi"]' || '["current","multi"]') }}
     runs-on: ${{ matrix.os }}
     steps:
@@ -43,6 +43,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Verify watchdog failure handling
+        run: python -m unittest discover -s tools -p test_run_stress.py
       - name: Record machine and compiler
         shell: bash
         run: |
