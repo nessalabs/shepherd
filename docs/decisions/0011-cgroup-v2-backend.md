@@ -28,6 +28,10 @@ five-second timeout returns an error; a successful signal alone is insufficient.
 Empty nested cgroups are removed bottom-up before the scope directory. Traversal
 uses pinned directory descriptors and refuses symlinks; cgroup control files are
 never unlinked. Kernel directory removal still fails if a group becomes populated.
+Scopes remain registered until both root outcomes and containment cleanup are
+verified. Shutdown counts cleanup errors and retries remaining scopes on a later
+call; the latest 256 completed scope reports make repeated cleanup idempotent. Failed reap
+outcomes remain observable across retries instead of becoming an empty success.
 Root children are separately waited and reaped. Descendant zombies belong to their
 OS parent/reaper; emptiness means no live descendant, not that Shepherd can wait
 for arbitrary non-child processes. Tests use a subreaper to verify their reaping.

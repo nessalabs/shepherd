@@ -104,12 +104,14 @@ impl EventHandler for RegistryPruneHandler {
             .lock()
             .map_err(|_| HandlerError::new(self.name(), "registry mutex poisoned"))?;
         match event {
-            DomainEvent::ProcessReaped { scope, pid, .. } => {
+            DomainEvent::ProcessReaped { scope, pid, exit } if exit.outcome.is_verified() => {
                 if let Some(scope) = registry.get_mut(*scope) {
                     scope.prune(*pid);
                 }
             }
-            DomainEvent::ScopeClosed { scope } => registry.remove(*scope),
+            // Scope release requires containment verification. Keep failed reap evidence
+            // as well, so retries cannot mistake an unverified root for an empty scope.
+            DomainEvent::ScopeClosed { .. } => {}
             _ => {}
         }
         Ok(())
