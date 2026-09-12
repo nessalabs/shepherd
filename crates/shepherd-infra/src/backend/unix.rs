@@ -12,8 +12,7 @@
 //! `docs/decisions/0010-retain-slot-until-wait.md`.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, Weak};
 use std::task::Poll;
@@ -59,14 +58,14 @@ struct ChildSlot {
 }
 
 struct Anchor {
-    _input: tokio::process::ChildStdin,
+    _input: std::process::ChildStdin,
     exit: watch::Sender<Option<Result<(), String>>>,
     kill_issued: bool,
 }
 
 // Constructed before task dispatch: cancellation before its first poll still runs Drop.
 struct AnchorWait {
-    child: tokio::process::Child,
+    child: NativeChild,
     state: Weak<Mutex<State>>,
     exit: watch::Sender<Option<Result<(), String>>>,
     scope: ProcessScopeId,
@@ -76,6 +75,35 @@ struct AnchorWait {
 impl AnchorWait {
     fn disarm(&mut self) {
         self.armed = false;
+    }
+    fn poll_exit(&mut self, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        let state = self.state.upgrade();
+        // Reap and loss-of-pin publication stay atomic with group signaling.
+        let _guard = state
+            .as_ref()
+            .map(|state| state.lock().expect("unix backend mutex"));
+        let result = loop {
+            match self.child.child.as_mut().expect("owned anchor").try_wait() {
+                Ok(Some(_)) => {
+                    self.child.child.take();
+                    break Ok(());
+                }
+                Err(error) => {
+                    if error.raw_os_error() == Some(libc::ECHILD) {
+                        self.child.child.take();
+                    }
+                    break Err(error.to_string());
+                }
+                Ok(None) => match self.child.changes.poll_recv(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(())) => {}
+                    Poll::Ready(None) => break Err("anchor SIGCHLD stream closed".into()),
+                },
+            }
+        };
+        self.exit.send_replace(Some(result));
+        self.disarm();
+        Poll::Ready(())
     }
 }
 impl Drop for AnchorWait {
@@ -87,9 +115,11 @@ impl Drop for AnchorWait {
         let mut state = state
             .as_ref()
             .map(|s| s.lock().unwrap_or_else(|p| p.into_inner()));
-        // Child still owns the PID here. Kill before dropping it (Tokio's Child Drop may
-        // try_wait/reap), and publish pin loss before another caller can signal the group.
-        let _ = killpg(Pid::from_raw(self.pgid), Some(NixSignal::SIGKILL));
+        // Only an owned child pins the numeric group. ECHILD discards ownership
+        // before disarming, so neither signaling nor orphan reaping can use it.
+        if self.child.child.is_some() {
+            let _ = killpg(Pid::from_raw(self.pgid), Some(NixSignal::SIGKILL));
+        }
         if let Some(state) = state.as_mut() {
             if state
                 .scope_groups
@@ -314,13 +344,14 @@ impl UnixProcessBackend {
         }
         // A shell blocked in its builtin read creates no extra child. Its stdin is private.
         // Keeping this group leader alive pins the PGID across natural root exits.
-        let mut command = tokio::process::Command::new("/bin/sh");
+        let changes = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+            .map_err(|error| SpawnError::Os(error.to_string()))?;
+        let mut command = std::process::Command::new("/bin/sh");
         command
             .args(["-c", "trap '' HUP INT TERM; read shepherd_scope_anchor"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(false);
+            .stderr(Stdio::null());
         unsafe {
             command.pre_exec(|| {
                 let mut action: libc::sigaction = std::mem::zeroed();
@@ -338,11 +369,14 @@ impl UnixProcessBackend {
             });
         }
         let mut child = command.spawn().map_err(|e| SpawnError::Os(e.to_string()))?;
-        let pgid = child.id().expect("new anchor pid") as i32;
+        let pgid = child.id() as i32;
         let input = child.stdin.take().expect("anchor stdin");
         let (exit, _) = watch::channel(None);
         let mut worker = AnchorWait {
-            child,
+            child: NativeChild {
+                child: Some(child),
+                changes,
+            },
             state: Arc::downgrade(&self.state),
             exit: exit.clone(),
             scope,
@@ -350,27 +384,7 @@ impl UnixProcessBackend {
             armed: true,
         };
         tokio::spawn(async move {
-            let state = worker.state.clone();
-            let sender = worker.exit.clone();
-            let mut wait = Box::pin(worker.child.wait());
-            std::future::poll_fn(|cx| {
-                // Serialize the syscall that reaps (and releases the PID) with group
-                // signaling and publish the loss of the pin before unlocking.
-                let state = state.upgrade();
-                let _guard = state
-                    .as_ref()
-                    .map(|state| state.lock().expect("unix backend mutex"));
-                match wait.as_mut().poll(cx) {
-                    Poll::Ready(result) => {
-                        sender.send_replace(Some(result.map(|_| ()).map_err(|e| e.to_string())));
-                        Poll::Ready(())
-                    }
-                    Poll::Pending => Poll::Pending,
-                }
-            })
-            .await;
-            drop(wait);
-            worker.disarm();
+            std::future::poll_fn(|cx| worker.poll_exit(cx)).await;
         });
         let mut state = self.state.lock().expect("unix backend mutex");
         state.anchors.insert(
@@ -456,7 +470,7 @@ impl UnixProcessBackend {
         spec: &ProcessSpec,
         target_pgid: i32,
         #[cfg(target_os = "linux")] membership: Option<&std::fs::File>,
-    ) -> Result<tokio::process::Child, SpawnError> {
+    ) -> Result<NativeChild, SpawnError> {
         let mut cmd = tokio::process::Command::new(&spec.program);
         cmd.args(&spec.args)
             .stdin(Stdio::null())
@@ -494,7 +508,16 @@ impl UnixProcessBackend {
         // supervisor is dropped. The supervisor's CleanupGuard calls `hard_kill_all`.
         cmd.kill_on_drop(false);
 
-        cmd.spawn().map_err(|e| SpawnError::Os(e.to_string()))
+        let changes = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+            .map_err(|e| SpawnError::Os(e.to_string()))?;
+        let child = cmd
+            .as_std_mut()
+            .spawn()
+            .map_err(|e| SpawnError::Os(e.to_string()))?;
+        Ok(NativeChild {
+            child: Some(child),
+            changes,
+        })
     }
 }
 
@@ -587,7 +610,13 @@ impl ProcessBackend for UnixProcessBackend {
         let mut readers = Vec::new();
         if let Some(output) = &output {
             use shepherd_app::output::OutputStream;
-            if let Some(stdout) = child.stdout.take() {
+            if let Some(stdout) = child.child.as_mut().expect("owned child").stdout.take() {
+                let stdout = tokio::process::ChildStdout::from_std(stdout).map_err(|error| {
+                    // Pipe conversion failed before registration; this child is still
+                    // exclusively owned, and NativeChild's drop guard will reap it.
+                    let _ = child.child.as_mut().expect("owned child").kill();
+                    SpawnError::Os(error.to_string())
+                })?;
                 readers.push((
                     OutputStream::Stdout,
                     tokio::spawn(crate::output::drain(
@@ -597,7 +626,13 @@ impl ProcessBackend for UnixProcessBackend {
                     )),
                 ));
             }
-            if let Some(stderr) = child.stderr.take() {
+            if let Some(stderr) = child.child.as_mut().expect("owned child").stderr.take() {
+                let stderr = tokio::process::ChildStderr::from_std(stderr).map_err(|error| {
+                    // Pipe conversion failed before registration; this child is still
+                    // exclusively owned, and NativeChild's drop guard will reap it.
+                    let _ = child.child.as_mut().expect("owned child").kill();
+                    SpawnError::Os(error.to_string())
+                })?;
                 readers.push((
                     OutputStream::Stderr,
                     tokio::spawn(crate::output::drain(
@@ -637,6 +672,13 @@ impl ProcessBackend for UnixProcessBackend {
                     &failures,
                 )
                 .await;
+                let ownership_lost = status
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.raw_os_error() == Some(libc::ECHILD));
+                if ownership_lost {
+                    child.child.take();
+                }
                 let raw = status
                     .map(|status| RawExit {
                         code: status.code(),
@@ -646,7 +688,7 @@ impl ProcessBackend for UnixProcessBackend {
                     .map_err(|error| error.to_string());
                 let reaped = raw.is_ok();
                 publish_wait_result(&state, scope, &exit_tx, raw);
-                if reaped || retry_rx.recv().await.is_none() {
+                if reaped || ownership_lost || retry_rx.recv().await.is_none() {
                     break;
                 }
             }
@@ -1073,10 +1115,37 @@ fn publish_wait_result(
     let _ = sender.send(Some(raw));
 }
 
+struct NativeChild {
+    child: Option<std::process::Child>,
+    changes: tokio::signal::unix::Signal,
+}
+impl NativeChild {
+    fn id(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
+    }
+}
+impl Drop for NativeChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            // Never block an executor or retry a numeric wait after an error. This
+            // path owns a child whose wait ownership has not been lost to ECHILD.
+            let _ = std::thread::Builder::new()
+                .name("shepherd-orphan-reap".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
+        }
+    }
+}
+
 async fn wait_os_child(
-    child: &mut tokio::process::Child,
+    child: &mut NativeChild,
     #[cfg(test)] failures: &std::sync::atomic::AtomicUsize,
 ) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(test)]
+    if failures.load(std::sync::atomic::Ordering::SeqCst) == usize::MAX {
+        return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+    }
     #[cfg(test)]
     if failures
         .fetch_update(
@@ -1088,7 +1157,21 @@ async fn wait_os_child(
     {
         return Err(std::io::Error::other("injected OS wait failure"));
     }
-    child.wait().await
+    loop {
+        match child.child.as_mut().expect("owned child").try_wait()? {
+            Some(status) => {
+                child.child.take();
+                return Ok(status);
+            }
+            None => {
+                child
+                    .changes
+                    .recv()
+                    .await
+                    .ok_or_else(|| std::io::Error::other("SIGCHLD stream closed"))?;
+            }
+        }
+    }
 }
 
 fn child_key(os: &OsIdentity) -> ChildKey {
@@ -1388,6 +1471,59 @@ mod anchor_tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::zombie_processes)] // Reaped explicitly by libc::waitpid to exercise ECHILD.
+    async fn externally_reaped_anchor_discards_numeric_wait_and_kill_ownership() {
+        let changes =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).unwrap();
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let mut sibling = std::process::Command::new("/bin/sleep");
+        sibling.arg("30");
+        unsafe {
+            sibling.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut sibling = sibling.spawn().unwrap();
+        let (exit, receiver) = watch::channel(None);
+        let mut worker = AnchorWait {
+            child: NativeChild {
+                child: Some(child),
+                changes,
+            },
+            state: Weak::new(),
+            exit,
+            scope: ProcessScopeId::new(1),
+            // Model the old numeric PGID being reassigned to an unrelated group.
+            pgid: sibling.id() as i32,
+            armed: true,
+        };
+        kill(Pid::from_raw(pid), Some(NixSignal::SIGKILL)).unwrap();
+        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) }, pid);
+        std::future::poll_fn(|cx| worker.poll_exit(cx)).await;
+        assert!(
+            worker.child.child.is_none(),
+            "ECHILD retained an orphan numeric wait"
+        );
+        assert!(!worker.armed);
+        assert!(receiver.borrow().as_ref().unwrap().is_err());
+        drop(worker);
+        let survived = sibling.try_wait().unwrap().is_none();
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+        assert!(
+            survived,
+            "ownership-lost anchor Drop signalled unrelated group"
+        );
     }
 
     #[tokio::test]
@@ -1741,6 +1877,113 @@ mod failed_wait_tests {
         })
         .await
         .unwrap();
+        backend.wait(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn echild_stops_native_wait_ownership_permanently() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let root = backend
+            .spawn(scope, &ProcessSpec::new("/bin/sleep").arg("30"))
+            .await
+            .unwrap();
+        // Model a caller violating exclusive reap ownership before our task polls.
+        unsafe {
+            libc::kill(root.os.pid as i32, libc::SIGKILL);
+        }
+        assert_eq!(
+            unsafe { libc::waitpid(root.os.pid as i32, std::ptr::null_mut(), 0) },
+            root.os.pid as i32
+        );
+        let first = backend.wait(&root).await.unwrap_err();
+        assert!(first
+            .to_string()
+            .contains(&std::io::Error::from_raw_os_error(libc::ECHILD).to_string()));
+        assert!(backend.state.lock().unwrap().children[&child_key(&root.os)]
+            .retry
+            .is_closed());
+        let sibling = backend
+            .spawn(ProcessScopeId::new(2), &ProcessSpec::new("true"))
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            assert!(backend.wait(&root).await.is_err());
+        }
+        assert_eq!(backend.wait(&sibling).await.unwrap().code, Some(0));
+        backend.hard_kill_all();
+        assert!(backend.wait(&root).await.is_err());
+    }
+
+    #[test]
+    fn runtime_drop_reaps_still_owned_root() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let backend = UnixProcessBackend::new();
+        let root = runtime.block_on(async {
+            let root = backend
+                .spawn(
+                    ProcessScopeId::new(1),
+                    &ProcessSpec::new("/bin/sleep").arg("30"),
+                )
+                .await
+                .unwrap();
+            backend.hard_kill_all();
+            root
+        });
+        drop(runtime);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while identity_still_matches(&root.os) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !identity_still_matches(&root.os),
+            "cancelled native waiter failed to reap owned root"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_kill_requests_reap_without_fresh_wait_call() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let root = backend
+            .spawn(scope, &ProcessSpec::new("/bin/sleep").arg("30"))
+            .await
+            .unwrap();
+        let sibling = backend
+            .spawn(
+                ProcessScopeId::new(2),
+                &ProcessSpec::new("/bin/sleep").arg("30"),
+            )
+            .await
+            .unwrap();
+        let mut observation = {
+            let state = backend.state.lock().unwrap();
+            let slot = &state.children[&child_key(&root.os)];
+            slot.failures.store(1, std::sync::atomic::Ordering::SeqCst);
+            slot.sender.subscribe()
+        };
+        assert!(backend.wait(&root).await.is_err());
+        let _ = backend.cleanup_scope(scope).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(&*observation.borrow_and_update(), Some(Ok(_))) {
+                    break;
+                }
+                observation.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), backend.wait(&sibling))
+                .await
+                .is_err()
+        );
+        backend.hard_kill_all();
+        backend.wait(&sibling).await.unwrap();
         backend.wait(&root).await.unwrap();
     }
 

@@ -21,7 +21,11 @@ HUP/INT/TERM group broadcasts cannot destroy the pin. Its wait poll serializes r
 with group signaling and setpgid, publishing pin loss before releasing the lock.
 A guard owns the anchor Child before task dispatch, including cancellation before
 first poll: interruption kills its still-pinned group and publishes unverified pin
-loss before Tokio Child Drop can reap. Anchor/group/lock removal is atomic. Once a
+loss before the native child guard can hand off a final owned reap. The anchor uses
+std Child with a SIGCHLD stream registered before spawn. On ECHILD it discards
+the child immediately under the signaling lock and disarms numeric group cleanup;
+neither Drop nor a Tokio orphan queue can retry that lost PID. A successful reap
+also clears the child before publishing completion. Anchor/group/lock removal is atomic. Once a
 whole-group kill is issued, new admission is rejected before and after anchor reap.
 
 After an uncatchable signal kills the anchor, a later spawn recreates it only when
@@ -34,7 +38,9 @@ survive external anchor loss; process groups cannot solve that identity gap.
 
 Tests exercise TERM and KILL broadcasts followed by scope reuse, simulate a recycled
 PGID without exhausting the host PID namespace, and check that the lost-anchor
-backstop still kills owned roots. setsid descendants still escape on process-group
+backstop still kills owned roots. An actual external waitpid regression verifies
+ECHILD clears native ownership and prevents Drop from signaling a substituted
+unrelated group. setsid descendants still escape on process-group
 hosts; no stronger capability is advertised.
 
 Individual signaling requires a registered slot and uses pidfd on Linux. Without a
