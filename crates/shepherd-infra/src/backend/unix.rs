@@ -12,9 +12,11 @@
 //! `docs/decisions/0010-retain-slot-until-wait.md`.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::task::Poll;
 
 use async_trait::async_trait;
 use nix::sys::signal::{kill, killpg, Signal as NixSignal};
@@ -38,6 +40,7 @@ type ExitChannels = (
 );
 
 struct ChildSlot {
+    scope: ProcessScopeId,
     output: Option<shepherd_app::output::ProcessOutput>,
     sender: watch::Sender<Option<Result<RawExit, String>>>,
     // Retain a receiver so the waiter task's `send` is never lost if it fires before the
@@ -50,6 +53,50 @@ struct ChildSlot {
 struct Anchor {
     _input: tokio::process::ChildStdin,
     exit: watch::Sender<Option<Result<(), String>>>,
+    kill_issued: bool,
+}
+
+// Constructed before task dispatch: cancellation before its first poll still runs Drop.
+struct AnchorWait {
+    child: tokio::process::Child,
+    state: Weak<Mutex<State>>,
+    exit: watch::Sender<Option<Result<(), String>>>,
+    scope: ProcessScopeId,
+    pgid: i32,
+    armed: bool,
+}
+impl AnchorWait {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for AnchorWait {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = self.state.upgrade();
+        let mut state = state
+            .as_ref()
+            .map(|s| s.lock().unwrap_or_else(|p| p.into_inner()));
+        // Child still owns the PID here. Kill before dropping it (Tokio's Child Drop may
+        // try_wait/reap), and publish pin loss before another caller can signal the group.
+        let _ = killpg(Pid::from_raw(self.pgid), Some(NixSignal::SIGKILL));
+        if let Some(state) = state.as_mut() {
+            if state
+                .scope_groups
+                .get(&self.scope)
+                .is_some_and(|g| g.pgid == self.pgid)
+            {
+                if let Some(anchor) = state.anchors.get_mut(&self.scope) {
+                    anchor.kill_issued = true;
+                }
+            }
+        }
+        self.exit.send_replace(Some(Err(
+            "anchor waiter interrupted; synchronous group kill issued, reap unverified".into(),
+        )));
+    }
 }
 
 struct ScopeGroup {
@@ -127,46 +174,58 @@ impl UnixProcessBackend {
             .clone()
     }
 
-    fn existing_pgid(&self, scope: ProcessScopeId) -> Option<i32> {
-        self.state
-            .lock()
-            .expect("unix backend mutex")
-            .scope_groups
-            .get(&scope)
-            .map(|g| g.pgid)
-    }
-
-    fn joinable_pgid(&self, scope: ProcessScopeId) -> Option<i32> {
-        let state = self.state.lock().expect("unix backend mutex");
-        state
-            .scope_groups
-            .get(&scope)
-            .and_then(|g| (g.live > 0 || state.anchors.contains_key(&scope)).then_some(g.pgid))
-    }
-
-    fn has_anchor(&self, scope: ProcessScopeId) -> bool {
-        self.state
-            .lock()
-            .expect("unix backend mutex")
-            .anchors
-            .contains_key(&scope)
-    }
-
     fn ensure_anchor(&self, scope: ProcessScopeId) -> Result<(), SpawnError> {
-        if self.containment() != Containment::ProcessGroup || self.has_anchor(scope) {
+        if self.containment() != Containment::ProcessGroup {
             return Ok(());
+        }
+        {
+            let mut state = self.state.lock().expect("unix backend mutex");
+            if let Some(anchor) = state.anchors.get(&scope) {
+                if anchor.kill_issued {
+                    return Err(SpawnError::ScopeClosed(scope));
+                }
+                let exit = anchor.exit.borrow().clone();
+                match exit {
+                    None => return Ok(()),
+                    Some(Err(error)) => {
+                        return Err(SpawnError::Os(format!("anchor reap failed: {error}")))
+                    }
+                    Some(Ok(())) => {}
+                }
+                let group = state.scope_groups.get(&scope).expect("anchor group");
+                // Reaping releases the PID pin. Never join or signal a possibly recycled
+                // group. Only replace a group after proving that its number is absent.
+                if group.live != 0
+                    || killpg(Pid::from_raw(group.pgid), None) != Err(nix::errno::Errno::ESRCH)
+                {
+                    return Err(SpawnError::Os(
+                        "scope anchor exited while its group may still exist; cleanup required"
+                            .into(),
+                    ));
+                }
+                state.anchors.remove(&scope);
+                state.scope_groups.remove(&scope);
+            }
         }
         // A shell blocked in its builtin read creates no extra child. Its stdin is private.
         // Keeping this group leader alive pins the PGID across natural root exits.
         let mut command = tokio::process::Command::new("/bin/sh");
         command
-            .args(["-c", "read shepherd_scope_anchor"])
+            .args(["-c", "trap '' HUP INT TERM; read shepherd_scope_anchor"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(false);
         unsafe {
             command.pre_exec(|| {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = libc::SIG_IGN;
+                libc::sigemptyset(&mut action.sa_mask);
+                for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+                    if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 if libc::setpgid(0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -177,11 +236,36 @@ impl UnixProcessBackend {
         let pgid = child.id().expect("new anchor pid") as i32;
         let input = child.stdin.take().expect("anchor stdin");
         let (exit, _) = watch::channel(None);
-        let sender = exit.clone();
+        let mut worker = AnchorWait {
+            child,
+            state: Arc::downgrade(&self.state),
+            exit: exit.clone(),
+            scope,
+            pgid,
+            armed: true,
+        };
         tokio::spawn(async move {
-            sender.send_replace(Some(
-                child.wait().await.map(|_| ()).map_err(|e| e.to_string()),
-            ));
+            let state = worker.state.clone();
+            let sender = worker.exit.clone();
+            let mut wait = Box::pin(worker.child.wait());
+            std::future::poll_fn(|cx| {
+                // Serialize the syscall that reaps (and releases the PID) with group
+                // signaling and publish the loss of the pin before unlocking.
+                let state = state.upgrade();
+                let _guard = state
+                    .as_ref()
+                    .map(|state| state.lock().expect("unix backend mutex"));
+                match wait.as_mut().poll(cx) {
+                    Poll::Ready(result) => {
+                        sender.send_replace(Some(result.map(|_| ()).map_err(|e| e.to_string())));
+                        Poll::Ready(())
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            })
+            .await;
+            drop(wait);
+            worker.disarm();
         });
         let mut state = self.state.lock().expect("unix backend mutex");
         state.anchors.insert(
@@ -189,20 +273,13 @@ impl UnixProcessBackend {
             Anchor {
                 _input: input,
                 exit,
+                kill_issued: false,
             },
         );
         state
             .scope_groups
             .insert(scope, ScopeGroup { pgid, live: 0 });
         Ok(())
-    }
-
-    fn forget_group(&self, scope: ProcessScopeId) {
-        self.state
-            .lock()
-            .expect("unix backend mutex")
-            .scope_groups
-            .remove(&scope);
     }
 
     fn register_child(
@@ -218,6 +295,7 @@ impl UnixProcessBackend {
         state.children.insert(
             child_key(&os),
             ChildSlot {
+                scope,
                 output,
                 sender: channels.0,
                 _keep: channels.1,
@@ -253,7 +331,7 @@ impl UnixProcessBackend {
         }
     }
 
-    async fn spawn_in_group(
+    fn spawn_in_group(
         &self,
         spec: &ProcessSpec,
         target_pgid: i32,
@@ -319,34 +397,48 @@ impl ProcessBackend for UnixProcessBackend {
             .map(|c| c.membership(scope))
             .transpose()
             .map_err(|e| SpawnError::Os(e.to_string()))?;
-        self.ensure_anchor(scope)?;
-        let existing_pgid = self.joinable_pgid(scope);
-        let (mut child, new_group) = match self
-            .spawn_in_group(
+        let (mut child, new_group) = loop {
+            self.ensure_anchor(scope)?;
+            let mut state = self.state.lock().expect("unix backend mutex");
+            if state
+                .anchors
+                .get(&scope)
+                .is_some_and(|a| a.kill_issued || a.exit.borrow().is_some())
+            {
+                // The anchor reaped between ensure_anchor and this lock acquisition.
+                // Recheck recovery before choosing a numeric group to join.
+                drop(state);
+                continue;
+            }
+            let existing_pgid = state
+                .scope_groups
+                .get(&scope)
+                .and_then(|g| (g.live > 0 || state.anchors.contains_key(&scope)).then_some(g.pgid));
+            // Keep the PID pin until setpgid has executed in the new child. The
+            // anchor's wait task takes this same mutex before reaping it.
+            let spawned = self.spawn_in_group(
                 spec,
                 existing_pgid.unwrap_or(0),
                 #[cfg(target_os = "linux")]
                 membership.as_ref(),
-            )
-            .await
-        {
-            Ok(child) => (child, existing_pgid.is_none()),
-            Err(_err) if existing_pgid.is_some() && !self.has_anchor(scope) => {
-                // The recorded group is gone (last member exited; kernel recycled the pgid).
-                // Forget it and create a fresh group for this still-open scope.
-                self.forget_group(scope);
-                (
-                    self.spawn_in_group(
-                        spec,
-                        0,
-                        #[cfg(target_os = "linux")]
-                        membership.as_ref(),
+            );
+            break match spawned {
+                Ok(child) => (child, existing_pgid.is_none()),
+                Err(_) if existing_pgid.is_some() && !state.anchors.contains_key(&scope) => {
+                    // Cgroup containment also owns all descendants of the old group.
+                    state.scope_groups.remove(&scope);
+                    (
+                        self.spawn_in_group(
+                            spec,
+                            0,
+                            #[cfg(target_os = "linux")]
+                            membership.as_ref(),
+                        )?,
+                        true,
                     )
-                    .await?,
-                    true,
-                )
-            }
-            Err(err) => return Err(err),
+                }
+                Err(error) => return Err(error),
+            };
         };
 
         let pid = child
@@ -414,8 +506,8 @@ impl ProcessBackend for UnixProcessBackend {
             if let Some(output) = output {
                 crate::output::finish_readers(readers, output).await;
             }
-            let _ = exit_tx.send(Some(raw));
             this.note_os_exit(scope);
+            let _ = exit_tx.send(Some(raw));
         });
 
         Ok(Spawned { os })
@@ -473,18 +565,8 @@ impl ProcessBackend for UnixProcessBackend {
                     .map_err(|e| TerminateError::Signal(e.to_string()));
             }
         }
-        let pgid = self.existing_pgid(scope);
-        let Some(pgid) = pgid else {
-            return Ok(());
-        };
-        match killpg(Pid::from_raw(pgid), Some(to_nix(signal)?)) {
-            Ok(()) => Ok(()),
-            Err(nix::errno::Errno::ESRCH) => {
-                self.forget_group(scope);
-                Ok(())
-            }
-            Err(e) => Err(TerminateError::Signal(e.to_string())),
-        }
+        let mut state = self.state.lock().expect("unix backend mutex");
+        signal_group(&mut state, scope, to_nix(signal)?)
     }
 
     async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
@@ -554,17 +636,12 @@ impl ProcessBackend for UnixProcessBackend {
             .await
             .map_err(|_| TerminateError::Signal("anchor reap timed out".into()))??;
         }
-        self.state
-            .lock()
-            .expect("unix backend mutex")
-            .anchors
-            .remove(&scope);
-        self.forget_group(scope);
-        self.state
-            .lock()
-            .expect("unix backend mutex")
-            .scope_locks
-            .remove(&scope);
+        // Never expose a group entry without its anchor after the PID was reaped.
+        // Synchronous owner Drop may signal scopes concurrently with this cleanup.
+        let mut state = self.state.lock().expect("unix backend mutex");
+        state.anchors.remove(&scope);
+        state.scope_groups.remove(&scope);
+        state.scope_locks.remove(&scope);
         Ok(())
     }
 
@@ -687,8 +764,10 @@ impl ProcessBackend for UnixProcessBackend {
             let _ = cgroups.kill(scope);
             return;
         }
-        if let Some(pgid) = self.existing_pgid(scope) {
-            let _ = killpg(Pid::from_raw(pgid), Some(NixSignal::SIGKILL));
+        let mut state = self.state.lock().expect("unix backend mutex");
+        if let Err(error) = signal_group(&mut state, scope, NixSignal::SIGKILL) {
+            tracing::error!(%error, "cannot safely signal scope group after anchor loss");
+            kill_registered_roots(&state, scope);
         }
     }
 
@@ -698,16 +777,67 @@ impl ProcessBackend for UnixProcessBackend {
             cgroups.kill_all();
             return;
         }
-        let groups: Vec<i32> = self
-            .state
-            .lock()
-            .expect("unix backend mutex")
-            .scope_groups
-            .values()
-            .map(|g| g.pgid)
-            .collect();
-        for pgid in groups {
-            let _ = killpg(Pid::from_raw(pgid), Some(NixSignal::SIGKILL));
+        let mut state = self.state.lock().expect("unix backend mutex");
+        let scopes: Vec<_> = state.scope_groups.keys().copied().collect();
+        for scope in scopes {
+            if let Err(error) = signal_group(&mut state, scope, NixSignal::SIGKILL) {
+                tracing::error!(%error, "cannot safely signal scope group after anchor loss");
+                kill_registered_roots(&state, scope);
+            }
+        }
+    }
+}
+
+fn signal_group(
+    state: &mut State,
+    scope: ProcessScopeId,
+    signal: NixSignal,
+) -> Result<(), TerminateError> {
+    let Some(group) = state.scope_groups.get(&scope) else {
+        return Ok(());
+    };
+    let pgid = Pid::from_raw(group.pgid);
+    if let Some(anchor) = state.anchors.get(&scope) {
+        if anchor.kill_issued {
+            return Ok(());
+        }
+        if anchor.exit.borrow().is_some() {
+            if killpg(pgid, None) == Err(nix::errno::Errno::ESRCH) {
+                return Ok(());
+            }
+            return Err(TerminateError::Signal(
+                "scope anchor was reaped; refusing to signal an unpinned group".into(),
+            ));
+        }
+    }
+    match killpg(pgid, Some(signal)) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {
+            if signal == NixSignal::SIGKILL {
+                if let Some(anchor) = state.anchors.get_mut(&scope) {
+                    anchor.kill_issued = true;
+                }
+            }
+            Ok(())
+        }
+        Err(error) => Err(TerminateError::Signal(error.to_string())),
+    }
+}
+
+fn kill_registered_roots(state: &State, scope: ProcessScopeId) {
+    for ((pid, token), slot) in state
+        .children
+        .iter()
+        .filter(|(_, slot)| slot.scope == scope)
+    {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &slot.pidfd {
+            let _ = pidfd_kill(fd.as_raw_fd(), NixSignal::SIGKILL);
+            continue;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = slot;
+        if *token != 0 && read_start_time(*pid) == Some(*token) {
+            let _ = kill(Pid::from_raw(*pid as i32), Some(NixSignal::SIGKILL));
         }
     }
 }
@@ -983,6 +1113,191 @@ mod identity_tests {
         backend.signal(&child, Signal::Kill).await.unwrap();
         assert_eq!(
             backend.wait(&child).await.unwrap().signal,
+            Some(Signal::Kill)
+        );
+        backend.cleanup_scope(scope).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn anchor_reaped(backend: &UnixProcessBackend, scope: ProcessScopeId) {
+        let mut exit = backend.state.lock().unwrap().anchors[&scope]
+            .exit
+            .subscribe();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(result) = exit.borrow_and_update().clone() {
+                    result.unwrap();
+                    break;
+                }
+                exit.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_broadcast_does_not_poison_an_open_scope() {
+        for signal in ["TERM", "KILL"] {
+            let backend = UnixProcessBackend::new();
+            let scope = ProcessScopeId::new(1);
+            let child = backend
+                .spawn(
+                    scope,
+                    &ProcessSpec::new("/bin/sh").args(["-c", &format!("kill -{signal} 0")]),
+                )
+                .await
+                .unwrap();
+            let exit = backend.wait(&child).await.unwrap();
+            assert!(exit.signal.is_some());
+            if signal == "KILL" {
+                anchor_reaped(&backend, scope).await;
+            }
+            let next = backend
+                .spawn(scope, &ProcessSpec::new("true"))
+                .await
+                .expect("an empty open scope remains reusable after a group broadcast");
+            assert_eq!(backend.wait(&next).await.unwrap().code, Some(0));
+            backend.cleanup_scope(scope).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reaped_anchor_cannot_signal_a_recycled_group_number() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let other = ProcessScopeId::new(2);
+        let child = backend
+            .spawn(scope, &ProcessSpec::new("true"))
+            .await
+            .unwrap();
+        backend.wait(&child).await.unwrap();
+        let old_pgid = backend.state.lock().unwrap().scope_groups[&scope].pgid;
+        kill(Pid::from_raw(old_pgid), Some(NixSignal::SIGKILL)).unwrap();
+        anchor_reaped(&backend, scope).await;
+        let survivor = backend
+            .spawn(other, &ProcessSpec::new("/bin/sleep").arg("30"))
+            .await
+            .unwrap();
+        {
+            // Model reuse deterministically instead of exhausting the host PID namespace.
+            let mut state = backend.state.lock().unwrap();
+            state.scope_groups.get_mut(&scope).unwrap().pgid = state.scope_groups[&other].pgid;
+        }
+        assert!(backend.signal_scope(scope, Signal::Kill).await.is_err());
+        assert!(backend
+            .spawn(scope, &ProcessSpec::new("true"))
+            .await
+            .is_err());
+        backend.hard_kill_scope(scope);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), backend.wait(&survivor))
+                .await
+                .is_err()
+        );
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .scope_groups
+            .get_mut(&scope)
+            .unwrap()
+            .pgid = old_pgid;
+        backend.cleanup_scope(scope).await.unwrap();
+        backend.signal(&survivor, Signal::Kill).await.unwrap();
+        backend.wait(&survivor).await.unwrap();
+        backend.cleanup_scope(other).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_kill_rejects_new_admission_before_and_after_anchor_reap() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let root = backend
+            .spawn(scope, &ProcessSpec::new("/bin/sleep").arg("30"))
+            .await
+            .unwrap();
+        backend.hard_kill_all();
+        assert!(
+            matches!(backend.spawn(scope, &ProcessSpec::new("true")).await, Err(SpawnError::ScopeClosed(id)) if id == scope)
+        );
+        backend.wait(&root).await.unwrap();
+        anchor_reaped(&backend, scope).await;
+        assert!(
+            matches!(backend.spawn(scope, &ProcessSpec::new("true")).await, Err(SpawnError::ScopeClosed(id)) if id == scope)
+        );
+        backend.cleanup_scope(scope).await.unwrap();
+    }
+
+    #[test]
+    fn runtime_drop_marks_anchor_pin_unverified_even_before_first_poll() {
+        for poll_waiter in [false, true] {
+            let backend = UnixProcessBackend::new();
+            let scope = ProcessScopeId::new(1);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                backend.ensure_anchor(scope).unwrap();
+                if poll_waiter {
+                    tokio::task::yield_now().await;
+                }
+            });
+            let pgid = backend.state.lock().unwrap().scope_groups[&scope].pgid;
+            drop(runtime);
+            {
+                let state = backend.state.lock().unwrap();
+                let anchor = &state.anchors[&scope];
+                assert!(anchor.kill_issued);
+                assert!(anchor.exit.borrow().as_ref().unwrap().is_err());
+            }
+            // A new runtime must receive an honest error, not trust a stale PID pin or hang.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                assert!(backend.cleanup_scope(scope).await.is_err());
+                assert!(matches!(
+                    backend.spawn(scope, &ProcessSpec::new("true")).await,
+                    Err(SpawnError::ScopeClosed(_))
+                ));
+            });
+            // The interrupted runtime cannot guarantee async reap. Reap this test's own
+            // anchor explicitly if Tokio's orphan reaper has not already consumed it.
+            let waited = unsafe { libc::waitpid(pgid, std::ptr::null_mut(), 0) };
+            assert!(
+                waited == pgid
+                    || (waited == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_anchor_backstop_still_kills_registered_roots() {
+        let backend = UnixProcessBackend::new();
+        let scope = ProcessScopeId::new(1);
+        let root = backend
+            .spawn(scope, &ProcessSpec::new("/bin/sleep").arg("30"))
+            .await
+            .unwrap();
+        let pgid = backend.state.lock().unwrap().scope_groups[&scope].pgid;
+        kill(Pid::from_raw(pgid), Some(NixSignal::SIGKILL)).unwrap();
+        anchor_reaped(&backend, scope).await;
+        backend.hard_kill_all();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), backend.wait(&root))
+                .await
+                .unwrap()
+                .unwrap()
+                .signal,
             Some(Signal::Kill)
         );
         backend.cleanup_scope(scope).await.unwrap();
