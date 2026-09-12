@@ -113,10 +113,7 @@ async fn unclaimed_capture_preserves_live_unverified_and_transferred_observers()
         sup.wait(pid).await.unwrap();
         completed.push(pid);
     }
-    // Exit notification precedes eviction; let the last monitor finish its bookkeeping.
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    // Eviction precedes the exit notification, so wait completion proves the bound.
     assert_eq!(backend.retained.load(Ordering::SeqCst), 256 + 3);
     for pid in &completed[..64] {
         assert!(sup.take_output(*pid).is_none());
