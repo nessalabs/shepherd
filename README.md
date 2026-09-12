@@ -16,20 +16,18 @@ resource observation — and leaves *policy* to the caller.
 ## Example
 
 ```rust
-use shepherd::{ProcessSpec, SupervisorBuilder, TerminateOptions};
+use shepherd::{ProcessSpec, SupervisorBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let supervisor = SupervisorBuilder::new().build();
-    let scope = supervisor.create_scope();
-
-    let _pid = supervisor
-        .spawn(scope, ProcessSpec::new("sleep").arg("30"))
-        .await?;
-
-    // Verified two-phase teardown: graceful, then force if needed, then reap.
-    let report = supervisor.terminate_scope(scope, TerminateOptions::default()).await?;
-    assert!(report.all_verified());
+    let result = supervisor.with_scope(
+        vec![ProcessSpec::new("sleep").arg("30")],
+        |scope| async move { Ok::<_, std::io::Error>(scope.processes().len()) },
+    ).await;
+    let process_count = result.result??;
+    assert_eq!(process_count, 1);
+    assert!(result.termination?.all_verified());
     Ok(())
 }
 ```
@@ -97,3 +95,7 @@ tail_bytes: 4096 })`. Call `supervisor.take_output(pid)` once; its observer
 `read()` drains the bounded queue and returns the tail, dropped-byte count, and
 EOF/error status. Both pipes share the byte budget. Retaining the observer never
 keeps a process alive.
+
+`with_scope` returns the closure value and a separate termination report. On caller
+cancellation cleanup continues; retain the scope ID from the closure and await
+`wait_scope_cleanup(id)` to inspect the result. Nested blocks own independent scopes.

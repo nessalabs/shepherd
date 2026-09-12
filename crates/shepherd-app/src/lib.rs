@@ -21,6 +21,8 @@ pub use ports::{
     WaitFuture, Waiters,
 };
 pub use registry::ScopeRegistry;
-pub use supervisor::{ProcessSupervisor, ScopeTerminationReport, ShutdownReport};
+pub use supervisor::{
+    ProcessSupervisor, ScopeTerminationReport, ScopedProcesses, ShutdownReport, WithScopeResult,
+};
 
 pub mod output;

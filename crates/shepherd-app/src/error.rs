@@ -20,7 +20,7 @@ pub enum SpawnError {
 }
 
 /// Error terminating a process or scope.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum TerminateError {
     /// The referenced process is unknown.
     #[error("unknown process {0}")]

@@ -252,3 +252,9 @@ Application value carrying a stream tag and raw bytes.
 
 ### OutputSnapshot
 Application value containing drained chunks, tail, overflow count, reader errors and EOF flags.
+
+### WithScopeResult
+Application value carrying the closure result or initial spawn error alongside a separate cleanup result.
+
+### ScopedProcesses
+Application access handle for a fresh block scope; escaping it does not extend scope lifetime.

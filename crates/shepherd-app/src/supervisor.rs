@@ -56,14 +56,14 @@ pub struct ShutdownReport {
 /// that guard alive and silently orphan children.
 pub struct ProcessSupervisor {
     inner: Arc<Inner>,
-    cleanup: Arc<CleanupGuard>,
+    cleanup: Option<Arc<CleanupGuard>>,
 }
 
 impl Clone for ProcessSupervisor {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
-            cleanup: Arc::clone(&self.cleanup),
+            cleanup: self.cleanup.clone(),
         }
     }
 }
@@ -82,6 +82,7 @@ impl Drop for CleanupGuard {
                 "ProcessSupervisor dropped without shutdown; issuing unverified hard-kill"
             );
         }
+        self.shutting_down.store(true, Ordering::SeqCst);
         self.backend.hard_kill_all();
     }
 }
@@ -98,6 +99,7 @@ struct Inner {
     samples: Mutex<HashMap<ProcessId, Result<ProcessStats, StatsError>>>,
     sampler_started: AtomicBool,
     outputs: Mutex<HashMap<ProcessId, crate::output::ProcessOutput>>,
+    scope_results: Mutex<HashMap<ProcessScopeId, ScopeCleanupSender>>,
     stats_interval: Duration,
 }
 
@@ -150,13 +152,22 @@ impl ProcessSupervisor {
                 samples: Mutex::new(HashMap::new()),
                 sampler_started: AtomicBool::new(false),
                 outputs: Mutex::new(HashMap::new()),
+                scope_results: Mutex::new(HashMap::new()),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
                 shutting_down: Arc::clone(&shutting_down),
             }),
-            cleanup: Arc::new(CleanupGuard {
+            cleanup: Some(Arc::new(CleanupGuard {
                 backend,
                 shutting_down,
-            }),
+            })),
+        }
+    }
+
+    // Infrastructure tasks must never extend the last user-facing handle's lifetime.
+    fn worker(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            cleanup: None,
         }
     }
 
@@ -199,6 +210,17 @@ impl ProcessSupervisor {
         scope: ProcessScopeId,
         spec: ProcessSpec,
     ) -> Result<ProcessId, SpawnError> {
+        let worker = self.worker();
+        tokio::spawn(async move { worker.spawn_owned(scope, spec).await })
+            .await
+            .map_err(|e| SpawnError::Os(format!("spawn worker failed: {e}")))?
+    }
+
+    async fn spawn_owned(
+        &self,
+        scope: ProcessScopeId,
+        spec: ProcessSpec,
+    ) -> Result<ProcessId, SpawnError> {
         let operation = self.scope_operation(scope);
         let _serial = operation.lock().await;
         if self.inner.shutting_down.load(Ordering::SeqCst) {
@@ -213,6 +235,11 @@ impl ProcessSupervisor {
         }
 
         let spawned = self.inner.backend.spawn(scope, &spec).await?;
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            self.inner.backend.hard_kill_all();
+            self.kill_orphan(&spawned).await;
+            return Err(SpawnError::ScopeClosed(scope));
+        }
 
         // Attach under the lock, then release it *before* any await. If the scope closed
         // during the spawn (a spawn-vs-terminate race), kill the orphan outside the lock.
@@ -261,6 +288,112 @@ impl ProcessSupervisor {
         self.start_sampler();
         self.inner.dispatcher.dispatch(&events).await;
         Ok(pid)
+    }
+
+    /// Runs a closure in a fresh scope and always schedules two-phase cleanup.
+    /// Closure errors are preserved in T; partial spawn errors are the outer result.
+    /// Cancel/panic drops the closure but leaves cleanup running on the active runtime.
+    pub async fn with_scope<T, F, Fut>(
+        &self,
+        specs: Vec<ProcessSpec>,
+        body: F,
+    ) -> WithScopeResult<T>
+    where
+        F: FnOnce(ScopedProcesses) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        self.with_scope_options(specs, TerminateOptions::default(), body)
+            .await
+    }
+
+    /// Variant allowing the caller to choose the grace period and force timeout.
+    pub async fn with_scope_options<T, F, Fut>(
+        &self,
+        specs: Vec<ProcessSpec>,
+        opts: TerminateOptions,
+        body: F,
+    ) -> WithScopeResult<T>
+    where
+        F: FnOnce(ScopedProcesses) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let scope = self.create_scope();
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let guard = ScopeExit {
+            finish: Some(finish),
+        };
+        let (report_tx, mut report_rx) = tokio::sync::watch::channel(None);
+        self.inner
+            .scope_results
+            .lock()
+            .expect("scope results mutex")
+            .insert(scope, report_tx.clone());
+        let worker = self.worker();
+        tokio::spawn(async move {
+            let _ = finished.await;
+            let result = worker.terminate_scope(scope, opts).await;
+            report_tx.send_replace(Some(result));
+        });
+        let mut processes = Vec::new();
+        let mut spawn_error = None;
+        for spec in specs {
+            match self.spawn(scope, spec).await {
+                Ok(pid) => processes.push(pid),
+                Err(error) => {
+                    spawn_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let result = match spawn_error {
+            Some(error) => Err(error),
+            None => Ok(body(ScopedProcesses {
+                scope,
+                processes,
+                supervisor: self.worker(),
+            })
+            .await),
+        };
+        drop(guard); // same cleanup path for success, closure error, panic, and cancel
+        let termination = loop {
+            if let Some(report) = report_rx.borrow_and_update().clone() {
+                break report;
+            }
+            if report_rx.changed().await.is_err() {
+                break Err(TerminateError::Signal(
+                    "scope cleanup worker stopped".into(),
+                ));
+            }
+        };
+        WithScopeResult {
+            scope,
+            result,
+            termination,
+        }
+    }
+
+    /// Waits for the retained report of a with_scope block, including after cancellation.
+    pub async fn wait_scope_cleanup(
+        &self,
+        scope: ProcessScopeId,
+    ) -> Result<ScopeTerminationReport, TerminateError> {
+        let mut receiver = self
+            .inner
+            .scope_results
+            .lock()
+            .expect("scope results mutex")
+            .get(&scope)
+            .ok_or(TerminateError::UnknownScope(scope))?
+            .subscribe();
+        loop {
+            if let Some(report) = receiver.borrow_and_update().clone() {
+                return report;
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| TerminateError::Signal("scope cleanup worker stopped".into()))?;
+        }
     }
 
     /// Transfers the capture observer to the caller, at most once per process.
@@ -482,7 +615,7 @@ impl ProcessSupervisor {
 
         let mut set = tokio::task::JoinSet::new();
         for pid in live {
-            let this = self.clone();
+            let this = self.worker();
             set.spawn(async move { (pid, this.terminate(pid, opts).await) });
         }
 
@@ -606,5 +739,57 @@ impl ProcessSupervisor {
                 .expect("spawn_times mutex")
                 .remove(&pid);
         });
+    }
+}
+
+type ScopeCleanupSender =
+    tokio::sync::watch::Sender<Option<Result<ScopeTerminationReport, TerminateError>>>;
+struct ScopeExit {
+    finish: Option<tokio::sync::oneshot::Sender<()>>,
+}
+impl Drop for ScopeExit {
+    fn drop(&mut self) {
+        if let Some(finish) = self.finish.take() {
+            let _ = finish.send(());
+        }
+    }
+}
+
+/// Closure value (including a caller's Result) and an independent cleanup report.
+#[derive(Debug)]
+pub struct WithScopeResult<T> {
+    pub scope: ProcessScopeId,
+    pub result: Result<T, SpawnError>,
+    pub termination: Result<ScopeTerminationReport, TerminateError>,
+}
+/// Access to a with_scope block's fresh scope. Does not extend supervisor ownership.
+pub struct ScopedProcesses {
+    scope: ProcessScopeId,
+    processes: Vec<ProcessId>,
+    supervisor: ProcessSupervisor,
+}
+impl ScopedProcesses {
+    pub fn id(&self) -> ProcessScopeId {
+        self.scope
+    }
+    pub fn processes(&self) -> &[ProcessId] {
+        &self.processes
+    }
+    pub async fn spawn(&self, spec: ProcessSpec) -> Result<ProcessId, SpawnError> {
+        self.supervisor.spawn(self.scope, spec).await
+    }
+    pub async fn wait(&self, pid: ProcessId) -> Result<ProcessExit, WaitError> {
+        if self
+            .supervisor
+            .lock_registry()
+            .scope_of(pid)
+            .is_some_and(|s| s != self.scope)
+        {
+            return Err(WaitError::UnknownProcess(pid));
+        }
+        self.supervisor.wait(pid).await
+    }
+    pub fn take_output(&self, pid: ProcessId) -> Option<crate::output::ProcessOutput> {
+        self.supervisor.take_output(pid)
     }
 }
