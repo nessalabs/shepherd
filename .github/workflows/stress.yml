@@ -6,6 +6,10 @@ on:
         description: "Mixed cycles per OS/runtime (6..100000)"
         required: false
         default: "2000"
+      soak_rounds:
+        description: "Concurrent application rounds per OS/runtime (6..100000)"
+        required: false
+        default: "200"
       seed:
         description: "Reproducible scenario seed (unsigned integer)"
         required: false
@@ -58,6 +62,14 @@ jobs:
           SHEPHERD_STRESS_RUNTIME: ${{ matrix.runtime }}
         run: |
           python tools/run-stress.py --log stress.log -- cargo test --locked -p shepherd-fixtures --test leak_stress long_create_kill -- --ignored --nocapture
+      - name: Concurrent application soak with memory and resource bounds
+        shell: bash
+        env:
+          SHEPHERD_STRESS_SEED: ${{ inputs.seed }}
+          SHEPHERD_STRESS_RUNTIME: ${{ matrix.runtime }}
+          SHEPHERD_SOAK_ROUNDS: ${{ inputs.soak_rounds }}
+        run: |
+          python tools/run-stress.py --log application-soak.log -- cargo test --locked -p shepherd-fixtures --test application_soak long_application_soak -- --ignored --nocapture
       - name: Larger generated traces and cancellation races
         shell: bash
         env:
@@ -73,6 +85,8 @@ jobs:
           path: |
             stress.log
             stress.diagnostics.txt
+            application-soak.log
+            application-soak.diagnostics.txt
             properties.log
             **/*.proptest-regressions
             **/proptest-regressions/**

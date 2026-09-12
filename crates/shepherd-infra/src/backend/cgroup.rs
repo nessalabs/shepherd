@@ -80,12 +80,8 @@ impl Cgroups {
     }
     pub fn new(ancestor: &Path) -> io::Result<Self> {
         let probe = File::open(ancestor)?;
-        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        // SAFETY: valid open descriptor and correctly sized output buffer.
-        if unsafe { libc::fstatfs(probe.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if unsafe { stat.assume_init() }.f_type != 0x6367_7270 {
+        let stat = nix::sys::statfs::fstatfs(&probe)?;
+        if stat.filesystem_type() != nix::sys::statfs::CGROUP2_SUPER_MAGIC {
             return Err(io::Error::other("ancestor is not cgroup v2"));
         }
         let root = ancestor.join(format!(

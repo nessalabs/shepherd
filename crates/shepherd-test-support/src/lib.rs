@@ -1,10 +1,13 @@
 //! Shared test environment configuration. See docs/TEST_ENVIRONMENT.md for the inventory.
 //! Read settings at the test boundary, then pass typed values to the test runner.
+#![forbid(unsafe_code)]
 use std::{ffi::OsString, path::PathBuf};
 
 pub const STRESS_SEED: &str = "SHEPHERD_STRESS_SEED";
 pub const STRESS_RUNTIME: &str = "SHEPHERD_STRESS_RUNTIME";
 pub const STRESS_ITERATIONS: &str = "SHEPHERD_STRESS_ITERATIONS";
+pub const SOAK_ROUNDS: &str = "SHEPHERD_SOAK_ROUNDS";
+pub const SOAK_RSS_BUDGET_MIB: &str = "SHEPHERD_SOAK_RSS_BUDGET_MIB";
 pub const PROPERTY_CASES: &str = "PROPTEST_CASES";
 pub const CGROUP_ROOT: &str = "SHEPHERD_CGROUP_ROOT";
 
@@ -32,6 +35,14 @@ pub struct StressConfig {
     pub seed: u64,
     pub runtimes: &'static [RuntimeFlavor],
     pub iterations: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SoakConfig {
+    pub seed: u64,
+    pub runtimes: &'static [RuntimeFlavor],
+    pub rounds: usize,
+    pub rss_budget_bytes: u64,
 }
 
 /// Reads only the settings needed by the selected test, without mutating or caching
@@ -86,6 +97,29 @@ impl<F: Fn(&str) -> Option<OsString>> TestEnvironment<F> {
             seed: self.number(STRESS_SEED, 42),
             runtimes,
             iterations,
+        }
+    }
+
+    pub fn soak(&self, mode: StressMode) -> SoakConfig {
+        let base = self.stress(StressMode::Smoke);
+        let rounds = match mode {
+            StressMode::Smoke => 6,
+            StressMode::Long => self.number(SOAK_ROUNDS, 200usize),
+        };
+        assert!(
+            (6..=100_000).contains(&rounds),
+            "{SOAK_ROUNDS} must be 6..=100000"
+        );
+        let mib = self.number(SOAK_RSS_BUDGET_MIB, 64u64);
+        assert!(
+            (1..=1024).contains(&mib),
+            "{SOAK_RSS_BUDGET_MIB} must be 1..=1024"
+        );
+        SoakConfig {
+            seed: base.seed,
+            runtimes: base.runtimes,
+            rounds,
+            rss_budget_bytes: mib * 1024 * 1024,
         }
     }
 
@@ -173,6 +207,45 @@ mod tests {
             env(&[(CGROUP_ROOT, "/tmp/羊 space")]).cgroup_root(),
             PathBuf::from("/tmp/羊 space")
         );
+    }
+
+    #[test]
+    fn soak_defaults_boundaries_and_isolation() {
+        let defaults = env(&[]).soak(StressMode::Long);
+        assert_eq!(defaults.rounds, 200);
+        assert_eq!(defaults.rss_budget_bytes, 64 * 1024 * 1024);
+        for rounds in ["6", "100000"] {
+            let config = env(&[(SOAK_ROUNDS, rounds), (STRESS_SEED, "18446744073709551615")])
+                .soak(StressMode::Long);
+            assert_eq!(config.rounds.to_string(), rounds);
+            assert_eq!(config.seed, u64::MAX);
+        }
+        for budget in ["1", "1024"] {
+            assert_eq!(
+                env(&[(SOAK_RSS_BUDGET_MIB, budget)])
+                    .soak(StressMode::Smoke)
+                    .rss_budget_bytes,
+                budget.parse::<u64>().unwrap() * 1024 * 1024
+            );
+        }
+        assert_eq!(
+            env(&[(SOAK_ROUNDS, "invalid"), (STRESS_ITERATIONS, "invalid")])
+                .soak(StressMode::Smoke)
+                .rounds,
+            6
+        );
+        for (key, value) in [
+            (SOAK_ROUNDS, "5"),
+            (SOAK_ROUNDS, "100001"),
+            (SOAK_ROUNDS, "bad"),
+            (SOAK_RSS_BUDGET_MIB, "0"),
+            (SOAK_RSS_BUDGET_MIB, "1025"),
+            (SOAK_RSS_BUDGET_MIB, ""),
+        ] {
+            let panic = std::panic::catch_unwind(|| env(&[(key, value)]).soak(StressMode::Long))
+                .expect_err("invalid soak setting must fail");
+            assert!(panic.downcast_ref::<String>().unwrap().contains(key));
+        }
     }
 
     #[test]

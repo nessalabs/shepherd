@@ -206,7 +206,9 @@ impl UnixProcessBackend {
             let previous = state
                 .cpu_samples
                 .insert(child_key(&target.os), (now, ticks));
-            let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+            let hz = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
+                .map_err(|e| StatsError::Backend(e.to_string()))?
+                .ok_or_else(|| StatsError::Backend("clock frequency unavailable".into()))?;
             if hz <= 0 {
                 return Err(StatsError::Backend("invalid clock tick rate".into()));
             }
@@ -226,6 +228,7 @@ impl UnixProcessBackend {
                     .map_err(StatsError::Backend)?;
             let mut timebase = mach2::mach_time::mach_timebase_info_data_t { numer: 0, denom: 0 };
             // TaskInfo reports Mach absolute time units, not nanoseconds on ARM.
+            // SAFETY: timebase is a valid writable record; the call retains no pointer.
             if unsafe { mach2::mach_time::mach_timebase_info(&mut timebase) } != 0
                 || timebase.denom == 0
             {
@@ -352,6 +355,8 @@ impl UnixProcessBackend {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // SAFETY: the post-fork closure uses only initialized stack data and
+        // async-signal-safe sigemptyset/sigaction/setpgid calls; it acquires no locks.
         unsafe {
             command.pre_exec(|| {
                 let mut action: libc::sigaction = std::mem::zeroed();
@@ -488,6 +493,8 @@ impl UnixProcessBackend {
         // `target_pgid` copy, so it is sound to run between fork and exec.
         #[cfg(target_os = "linux")]
         let membership_fd = membership.map(AsRawFd::as_raw_fd);
+        // SAFETY: only async-signal-safe setpgid/write run after fork. The copied
+        // descriptor stays open in the parent until spawn finishes; no allocation.
         unsafe {
             cmd.pre_exec(move || {
                 if libc::setpgid(0, target_pgid) != 0 {
@@ -1300,6 +1307,8 @@ fn signal_from_raw(raw: i32) -> Signal {
 
 #[cfg(target_os = "linux")]
 fn open_pidfd(pid: u32) -> Option<OwnedFd> {
+    // SAFETY: pidfd_open takes integer arguments only and returns a new descriptor
+    // on success; errors are checked before transferring it to OwnedFd.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0i32) };
     if fd < 0 {
         None
@@ -1311,6 +1320,8 @@ fn open_pidfd(pid: u32) -> Option<OwnedFd> {
 
 #[cfg(target_os = "linux")]
 fn pidfd_kill(fd: i32, signal: NixSignal) -> Result<(), TerminateError> {
+    // SAFETY: the caller holds the live pidfd; null siginfo is permitted, flags
+    // are zero, and no userspace output pointers are passed.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
@@ -1547,14 +1558,7 @@ mod anchor_tests {
         let pid = child.id() as i32;
         let mut sibling = std::process::Command::new("/bin/sleep");
         sibling.arg("30");
-        unsafe {
-            sibling.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        sibling.process_group(0);
         let mut sibling = sibling.spawn().unwrap();
         let (exit, receiver) = watch::channel(None);
         let mut worker = AnchorWait {
@@ -1570,7 +1574,12 @@ mod anchor_tests {
             armed: true,
         };
         kill(Pid::from_raw(pid), Some(NixSignal::SIGKILL)).unwrap();
-        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) }, pid);
+        assert_eq!(
+            nix::sys::wait::waitpid(Pid::from_raw(pid), None)
+                .unwrap()
+                .pid(),
+            Some(Pid::from_raw(pid))
+        );
         std::future::poll_fn(|cx| worker.poll_exit(cx)).await;
         assert!(
             worker.child.child.is_none(),
@@ -1718,11 +1727,12 @@ mod anchor_tests {
             });
             // The interrupted runtime cannot guarantee async reap. Reap this test's own
             // anchor explicitly if Tokio's orphan reaper has not already consumed it.
-            let waited = unsafe { libc::waitpid(pgid, std::ptr::null_mut(), 0) };
+            let waited = nix::sys::wait::waitpid(Pid::from_raw(pgid), None);
             assert!(
-                waited == pgid
-                    || (waited == -1
-                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+                waited
+                    .as_ref()
+                    .is_ok_and(|status| status.pid() == Some(Pid::from_raw(pgid)))
+                    || waited == Err(nix::errno::Errno::ECHILD)
             );
         }
     }
@@ -1951,12 +1961,12 @@ mod failed_wait_tests {
             .await
             .unwrap();
         // Model a caller violating exclusive reap ownership before our task polls.
-        unsafe {
-            libc::kill(root.os.pid as i32, libc::SIGKILL);
-        }
+        kill(Pid::from_raw(root.os.pid as i32), Some(NixSignal::SIGKILL)).unwrap();
         assert_eq!(
-            unsafe { libc::waitpid(root.os.pid as i32, std::ptr::null_mut(), 0) },
-            root.os.pid as i32
+            nix::sys::wait::waitpid(Pid::from_raw(root.os.pid as i32), None)
+                .unwrap()
+                .pid(),
+            Some(Pid::from_raw(root.os.pid as i32))
         );
         let first = backend.wait(&root).await.unwrap_err();
         assert!(first

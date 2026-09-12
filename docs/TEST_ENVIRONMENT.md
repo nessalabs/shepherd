@@ -9,6 +9,8 @@ The crate is unpublished and is only a development dependency of library crates.
 | `SHEPHERD_STRESS_RUNTIME` | `both` | `current`, `multi`, or `both`; selects Tokio runtime flavors |
 | `SHEPHERD_STRESS_SEED` | `42` | Unsigned 64-bit integer, including zero; reproducible scenario ordering |
 | `SHEPHERD_STRESS_ITERATIONS` | `2000` | `6..=100000`; cycles per runtime in the ignored long test |
+| `SHEPHERD_SOAK_ROUNDS` | `200` | `6..=100000`; concurrent application rounds per runtime in the ignored long soak |
+| `SHEPHERD_SOAK_RSS_BUDGET_MIB` | `64` | `1..=1024`; maximum process RSS growth in MiB above the warmed baseline |
 | `PROPTEST_CASES` | `64` in `properties.rs` | Positive 32-bit integer; generated cases per property |
 | `SHEPHERD_CGROUP_ROOT` | Required for privileged tests | Nonempty native path to a writable delegated cgroup v2 ancestor |
 
@@ -16,7 +18,9 @@ Missing optional settings use their defaults. Empty, malformed, non-Unicode
 numeric/enum values, and out-of-range values fail with the variable name. Paths
 retain the OS representation. Settings unrelated to the selected test are not read.
 The smoke stress test always runs 36 cycles per selected runtime, ignoring the long
-test's iteration override. Seeds and runtime selection apply to both modes.
+test's iteration override. Seeds and runtime selection apply to both modes. The application soak always runs
+six measured rounds in smoke mode and ignores the long round override. Its memory
+budget applies to both modes; allocator caching is allowed within that bound.
 
 `PROPTEST_CASES` is also recognized by proptest itself; other proptest-based test
 binaries retain their existing framework defaults. The table's 64-case default
@@ -34,7 +38,7 @@ SHEPHERD_STRESS_RUNTIME=multi SHEPHERD_STRESS_SEED=42 SHEPHERD_STRESS_ITERATIONS
   cargo test --locked -p shepherd-fixtures --test leak_stress long_create_kill -- --ignored --nocapture
 ```
 
-The manual stress workflow exposes iterations, seed, and runtime as inputs and
+The manual stress workflow exposes iterations, soak rounds, seed, and runtime as inputs and
 maps them to these same variables. Its Python watchdog has separate command-line
 options (`python tools/run-stress.py --help`), not environment settings.
 
@@ -53,3 +57,11 @@ The child intentionally reads these directly to verify the actual inherited
 environment. Add new test tuning settings to `TestEnvironment`, its parser tests,
 and this table together. Parser tests inject a lookup function and never change
 the shared process environment.
+
+Run the combined application soak (multiple scopes, changing descendants, output,
+observation cancellation, and shutdown):
+
+```sh
+SHEPHERD_STRESS_RUNTIME=both SHEPHERD_STRESS_SEED=42 SHEPHERD_SOAK_ROUNDS=200 \
+  python3 tools/run-stress.py --log application-soak.log -- cargo test --locked -p shepherd-fixtures --test application_soak long_application_soak -- --ignored --nocapture
+```

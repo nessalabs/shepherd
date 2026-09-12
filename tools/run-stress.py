@@ -21,7 +21,7 @@ def diagnose(process, log):
                 rows = [line.split(None, 3) for line in result.stdout.splitlines()]
                 # Only inspect a direct test child of the cargo command we launched.
                 for row in rows:
-                    if len(row) == 4 and row[1] == str(process.pid) and "leak_stress" in row[3]:
+                    if len(row) == 4 and row[1] == str(process.pid) and any(name in row[3] for name in ("leak_stress", "application_soak")):
                         sample = subprocess.run(["sample", row[0], "3"], capture_output=True, text=True, timeout=15)
                         lines.extend([sample.stdout, sample.stderr])
         except (OSError, subprocess.TimeoutExpired) as error:

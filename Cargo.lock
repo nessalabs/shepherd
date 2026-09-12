@@ -523,6 +523,7 @@ name = "shepherd-fixtures"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "nix",
  "ntapi",
  "shepherd",
  "shepherd-test-support",

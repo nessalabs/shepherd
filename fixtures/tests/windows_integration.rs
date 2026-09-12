@@ -46,8 +46,10 @@ async fn tree(orphan: bool, drop_owner: bool) {
     })
     .await
     .unwrap();
+    // SAFETY: integer PID and valid query rights; failure is checked before ownership transfer.
     let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, child) };
     assert!(!handle.is_null());
+    // SAFETY: OpenProcess returned a non-null owned handle, transferred exactly once.
     let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
     if orphan {
         assert_eq!(sup.wait(pid).await.unwrap().code, Some(0));
@@ -64,6 +66,7 @@ async fn tree(orphan: bool, drop_owner: bool) {
         assert!(sup.terminate_scope(b, opts()).await.unwrap().all_verified());
     }
     tokio::time::timeout(Duration::from_secs(5), async {
+        // SAFETY: the owned process handle remains alive throughout this nonblocking wait.
         while unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } != WAIT_OBJECT_0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

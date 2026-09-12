@@ -14,10 +14,7 @@ fn opts() -> TerminateOptions {
 async fn detached(orphan: bool, drop_owner: bool) {
     // Adopt orphan descendants in this test process so the test can verify reap as well
     // as absence of live cgroup members. Never reap unrelated children with waitpid(-1).
-    assert_eq!(
-        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
-        0
-    );
+    nix::sys::prctl::set_child_subreaper(true).unwrap();
     let root = shepherd_test_support::TestEnvironment::from_env().cgroup_root();
     let backend = UnixProcessBackend::with_cgroup_root(&root)
         .expect("real cgroup v2 with cgroup.kill required");
@@ -70,26 +67,28 @@ async fn detached(orphan: bool, drop_owner: bool) {
     }
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let mut status = 0;
-            let result = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
-            if result == child {
-                assert!(libc::WIFSIGNALED(status));
-                break;
-            }
-            // Drop signals synchronously, but adoption follows the root's actual exit.
-            // ECHILD before reparenting is transient; success still requires waitpid(child).
-            if result < 0 {
-                assert_eq!(
-                    std::io::Error::last_os_error().raw_os_error(),
-                    Some(libc::ECHILD)
-                );
+            use nix::{
+                errno::Errno,
+                sys::wait::{waitpid, WaitPidFlag, WaitStatus},
+                unistd::Pid,
+            };
+            match waitpid(Pid::from_raw(child), Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::Signaled(pid, _, _)) => {
+                    assert_eq!(pid.as_raw(), child);
+                    break;
+                }
+                Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => {}
+                other => panic!("unexpected descendant wait result: {other:?}"),
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("detached descendant survived cleanup");
-    assert_eq!(unsafe { libc::kill(child, 0) }, -1);
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(child), None),
+        Err(nix::errno::Errno::ESRCH)
+    );
     std::fs::remove_file(file).unwrap();
 }
 #[tokio::test]

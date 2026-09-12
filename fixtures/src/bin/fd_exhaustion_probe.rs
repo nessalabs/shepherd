@@ -1,12 +1,11 @@
 //! Run separately so RLIMIT_NOFILE cannot contaminate concurrent test processes.
 #[cfg(unix)]
 fn main() {
-    struct Limit(libc::rlimit);
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    struct Limit((libc::rlim_t, libc::rlim_t));
     impl Drop for Limit {
         fn drop(&mut self) {
-            unsafe {
-                libc::setrlimit(libc::RLIMIT_NOFILE, &self.0);
-            }
+            let _ = setrlimit(Resource::RLIMIT_NOFILE, self.0 .0, self.0 .1);
         }
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -18,20 +17,9 @@ fn main() {
             .backend(std::sync::Arc::new(shepherd::UnixProcessBackend::new()))
             .build();
         let scope = sup.create_scope();
-        let mut original = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
-            0
-        );
+        let original = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
         let restore = Limit(original);
-        let reduced = libc::rlimit {
-            rlim_cur: original.rlim_cur.min(64),
-            rlim_max: original.rlim_max,
-        };
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &reduced) }, 0);
+        setrlimit(Resource::RLIMIT_NOFILE, original.0.min(64), original.1).unwrap();
         let mut files = Vec::new();
         loop {
             match std::fs::File::open("/dev/null") {
