@@ -825,7 +825,8 @@ impl ProcessSupervisor {
                 events
             };
             inner.samples.lock().expect("samples mutex").remove(&pid);
-            inner.dispatcher.dispatch(&events).await;
+            // Evict before external publication: a stalled publisher must not bypass
+            // the retention bound after waiters have observed the terminal exit.
             // A failed reap may leave a live producer behind this observer. Only
             // verified completions are eligible for bounded post-mortem eviction.
             if verified_reap {
@@ -837,6 +838,7 @@ impl ProcessSupervisor {
                     }
                 }
             }
+            inner.dispatcher.dispatch(&events).await;
             inner
                 .spawn_times
                 .lock()
