@@ -27,6 +27,10 @@ two-phase cleanup and reap, and publishes a report. `wait_scope_cleanup(scope)`
 retrieves it after cancellation while the supervisor/runtime remain available.
 Normal return waits for that same report. Cancellation cannot return a value to a
 caller that discarded its future; the retained report is the observation path.
+Lookup history retains the most recent 256 verified completed scope reports. Pending
+and failed/unverified cleanup reports are not evicted. A receiver registered before
+completion retains its result even after the lookup history expires that scope ID;
+new lookups of expired verified scopes return UnknownScope.
 
 Spawns run in owned application workers so cancellation cannot interrupt the
 backend-spawn-to-monitor ownership handoff. Scope operations serialize cleanup

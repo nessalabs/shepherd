@@ -1,6 +1,6 @@
 //! The `ProcessSupervisor` application service.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -107,6 +107,7 @@ struct Inner {
     sampler_started: AtomicBool,
     outputs: Mutex<HashMap<ProcessId, crate::output::ProcessOutput>>,
     scope_results: Mutex<HashMap<ProcessScopeId, ScopeCleanupSender>>,
+    completed_scope_results: Mutex<VecDeque<ProcessScopeId>>,
     stats_interval: Duration,
 }
 
@@ -161,6 +162,7 @@ impl ProcessSupervisor {
                 sampler_started: AtomicBool::new(false),
                 outputs: Mutex::new(HashMap::new()),
                 scope_results: Mutex::new(HashMap::new()),
+                completed_scope_results: Mutex::new(VecDeque::new()),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
                 shutting_down: Arc::clone(&shutting_down),
                 owners_dropped: Arc::clone(&owners_dropped),
@@ -344,7 +346,27 @@ impl ProcessSupervisor {
         tokio::spawn(async move {
             let _ = finished.await;
             let result = worker.terminate_scope(scope, opts).await;
+            let verified = result.as_ref().is_ok_and(|report| report.all_verified());
             report_tx.send_replace(Some(result));
+            if verified {
+                // Evict only completed, verified reports. Existing watch receivers
+                // retain their published result independently of this lookup history.
+                let mut completed = worker
+                    .inner
+                    .completed_scope_results
+                    .lock()
+                    .expect("completed scope results mutex");
+                completed.push_back(scope);
+                while completed.len() > 256 {
+                    let old = completed.pop_front().expect("completed scope result");
+                    worker
+                        .inner
+                        .scope_results
+                        .lock()
+                        .expect("scope results mutex")
+                        .remove(&old);
+                }
+            }
         });
         let mut processes = Vec::new();
         let mut spawn_error = None;
