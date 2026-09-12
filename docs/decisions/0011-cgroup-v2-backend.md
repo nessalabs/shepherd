@@ -74,3 +74,8 @@ If a write fails, it also kills that scope's registered roots using retained pid
 matching start-time identities. This root fallback does not verify descendant cleanup;
 explicit cleanup still reports the cgroup failure. Privileged CI injects a failed retained
 descriptor and checks real root kill/reap alongside another healthy scope.
+
+A failed root wait retains its backend identity and pidfd for the kill backstop.
+Only a successful reap observation retires that slot; an empty cgroup proves containment,
+not root reap. Unresolved wait failures remain quarantined until backend disposal or a
+successful subsequent wait, without creating additional slots for repeated failures.
