@@ -136,3 +136,14 @@ fn default_backend() -> Arc<dyn ProcessBackend> {
 
 #[cfg(windows)]
 pub use shepherd_infra::WindowsJobBackend;
+
+// Read-only OS observation is separate from process supervision and logical ProcessId.
+pub use shepherd_app::{ObservationError, ProcessObservationBackend, ProcessObserver};
+pub use shepherd_domain::{ObservedProcess, ObservedProcessIdentity, ProcessSnapshot, ProcessTree};
+
+/// Create a read-only observer for any OS PID, whether Shepherd started it or not.
+/// Discovery is best-effort; observing a process never acquires cleanup responsibility.
+#[must_use]
+pub fn process_observer() -> ProcessObserver {
+    ProcessObserver::new(Arc::new(shepherd_infra::SystemProcessObserver::default()))
+}

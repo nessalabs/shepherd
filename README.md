@@ -112,3 +112,39 @@ Process-group scopes keep a small private anchor process until scope cleanup.
 Windows has no generic graceful signal; force follows the configured grace interval.
 Use a running runtime for verified shutdown. See [ownership review](docs/OWNERSHIP.md)
 and [validation evidence](docs/VALIDATION.md).
+
+## Observe a process tree
+
+Use one read-only API for any **OS PID**, including a program Shepherd did not launch:
+
+```rust,no_run
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let observer = shepherd::process_observer();
+let tree = observer.tree(12345).await?;
+for process in &tree.processes {
+    println!("{} parent={:?} {}", process.identity.os_pid,
+        process.parent_os_pid, process.name);
+}
+let updated = observer.refresh_tree(tree.root).await?;
+# Ok(())
+# }
+```
+
+For a managed root, obtain the OS PID with `supervisor.os_pid(process_id)` and
+pass it to the same `observer.tree(os_pid)` method. Shepherd's logical `ProcessId`
+is not an OS PID. `observer.snapshot()` enumerates all visible processes. Results
+are owned snapshots; call again at your desired interval. No background polling
+runs between requests. Nodes are returned in parent-before-child order with parent
+PIDs for rendering a hierarchy. Linux user threads are excluded.
+
+Observation never registers, signals, waits for, or takes ownership of a process.
+Dropping an observer leaves the processes running. This works on Linux, macOS and
+Windows, subject to OS permissions. Enumeration is **always best-effort and
+non-atomic**: invisible/short-lived processes may be missing, and reparented children
+cannot be reconstructed as historical descendants. `NotVisible` is not proof of
+exit. Start times have second resolution (or are unavailable); `refresh_tree`
+rejects a changed reported identity but cannot rule out every instance of PID reuse.
+Observation identities must never be used as authority to signal or reap.
+
+This API exposes topology and names, not aggregate resource usage. Existing managed
+root statistics remain available through `supervisor.stats(process_id)`.

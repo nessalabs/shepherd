@@ -29,3 +29,5 @@ they do not replace that document.
 | [0018](./0018-ownership-quarantine-and-bounded-history.md) | Quarantine, cleanup serialization, bounded history and isolated observers |
 | [0019](./0019-stable-process-group-anchor.md) | Private anchor pins one process group across root exits |
 | [0020](./0020-adversarial-validation-boundaries.md) | Generated invariants, targeted loom models and resource accounting |
+
+- [0021 — Read-only process-tree observation](0021-read-only-process-tree-observation.md)
