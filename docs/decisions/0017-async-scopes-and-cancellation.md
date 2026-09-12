@@ -47,7 +47,13 @@ output access accept only process IDs returned in that block's initial process l
 or by its scoped spawn method. The handle retains these IDs through process reap,
 so completed local output remains accessible and completed sibling IDs cannot
 bypass the scope boundary after registry pruning. The initial process list remains
-a snapshot; dynamic spawns are tracked separately for observation access.
+a snapshot; dynamic spawns are tracked separately for observation access. Scoped
+spawn, wait and output access lazily discard membership IDs once registry ownership,
+retained waiter results and retained output have all expired. This prevents an
+active block's sequential spawn/wait cycles from accumulating permanent dynamic
+history, while preserving live/quarantined processes and every retained observation.
+An idle handle may retain its last active peak until its next scoped operation; the
+caller-owned initial process snapshot is unchanged.
 
 Verified cancellation requires a running runtime and cooperative backend ports.
 Abrupt runtime/process shutdown cannot await or return verified cleanup; OS limits

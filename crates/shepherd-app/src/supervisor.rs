@@ -984,35 +984,42 @@ impl ScopedProcesses {
     pub fn processes(&self) -> &[ProcessId] {
         &self.processes
     }
+    // Retain authorization while any owned process or bounded observation remains.
+    // The lock order extends the supervisor's registry -> outputs/waiters order; no
+    // supervisor operation takes the per-handle owned lock in the other direction.
+    fn observable_owned(&self) -> std::sync::MutexGuard<'_, HashSet<ProcessId>> {
+        let mut owned = self.owned.lock().expect("scoped processes mutex");
+        let registry = self.supervisor.lock_registry();
+        let scope = registry.get(self.scope);
+        let outputs = self.supervisor.inner.outputs.lock().expect("outputs mutex");
+        owned.retain(|pid| {
+            scope.is_some_and(|s| s.contains(*pid))
+                || outputs.contains_key(pid)
+                || self.supervisor.inner.waiters.try_get(*pid).is_some()
+        });
+        owned
+    }
+
     pub async fn spawn(&self, spec: ProcessSpec) -> Result<ProcessId, SpawnError> {
         let pid = self.supervisor.spawn(self.scope, spec).await?;
-        self.owned
-            .lock()
-            .expect("scoped processes mutex")
-            .insert(pid);
+        self.observable_owned().insert(pid);
         Ok(pid)
     }
     pub async fn wait(&self, pid: ProcessId) -> Result<ProcessExit, WaitError> {
-        if !self
-            .owned
-            .lock()
-            .expect("scoped processes mutex")
-            .contains(&pid)
-        {
+        if !self.observable_owned().contains(&pid) {
             return Err(WaitError::UnknownProcess(pid));
         }
-        self.supervisor.wait(pid).await
+        let result = self.supervisor.wait(pid).await;
+        drop(self.observable_owned());
+        result
     }
     pub fn take_output(&self, pid: ProcessId) -> Option<crate::output::ProcessOutput> {
-        if !self
-            .owned
-            .lock()
-            .expect("scoped processes mutex")
-            .contains(&pid)
-        {
+        if !self.observable_owned().contains(&pid) {
             return None;
         }
-        self.supervisor.take_output(pid)
+        let output = self.supervisor.take_output(pid);
+        drop(self.observable_owned());
+        output
     }
 }
 
@@ -1108,5 +1115,167 @@ mod spawn_cleanup_tests {
         assert!(cleanup.await.unwrap().all_verified());
         assert!(sup.processes(scope).is_none());
         assert!(matches!(spawn.await, Err(SpawnError::ScopeClosed(id)) if id == scope));
+    }
+}
+
+#[cfg(test)]
+mod scoped_history_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::AtomicU32;
+    use tokio::sync::watch;
+
+    #[derive(Default)]
+    struct ExitHistory {
+        exits: HashMap<ProcessId, watch::Sender<Option<ProcessExit>>>,
+        completed: VecDeque<ProcessId>,
+    }
+    // Immediate roots and a bounded waiter adapter exercise the real supervisor's
+    // monitor, output eviction and scoped APIs without an infrastructure dependency.
+    #[derive(Default)]
+    struct HistoryPorts {
+        next: AtomicU32,
+        history: Mutex<ExitHistory>,
+    }
+    #[async_trait]
+    impl ProcessBackend for HistoryPorts {
+        async fn spawn(&self, _: ProcessScopeId, _: &ProcessSpec) -> Result<Spawned, SpawnError> {
+            let pid = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(Spawned {
+                os: shepherd_domain::OsIdentity::new(
+                    pid,
+                    shepherd_domain::ReuseToken::StartTime(u64::from(pid)),
+                ),
+            })
+        }
+        async fn signal(&self, _: &Spawned, _: Signal) -> Result<(), TerminateError> {
+            Ok(())
+        }
+        async fn signal_scope(&self, _: ProcessScopeId, _: Signal) -> Result<(), TerminateError> {
+            Ok(())
+        }
+        async fn wait(&self, target: &Spawned) -> Result<shepherd_domain::RawExit, WaitError> {
+            if target.os.pid == 1 {
+                return Err(WaitError::Backend("quarantined root".into()));
+            }
+            Ok(shepherd_domain::RawExit {
+                code: Some(0),
+                signal: None,
+                core_dumped: false,
+            })
+        }
+        async fn sample(&self, _: &Spawned) -> Result<shepherd_domain::RawStats, StatsError> {
+            Err(StatsError::Backend("unused sampler".into()))
+        }
+        fn output(&self, _: &Spawned) -> Option<crate::output::ProcessOutput> {
+            Some(crate::output::ProcessOutput(Arc::new(EmptyOutput)))
+        }
+        fn capabilities(&self) -> shepherd_domain::Capabilities {
+            unreachable!("this regression does not query backend capabilities")
+        }
+        fn hard_kill_all(&self) {}
+        fn hard_kill_scope(&self, _: ProcessScopeId) {}
+    }
+    #[async_trait]
+    impl Clock for HistoryPorts {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+        async fn sleep(&self, duration: Duration) {
+            tokio::time::sleep(duration).await;
+        }
+    }
+    impl Waiters for HistoryPorts {
+        fn signal_exit(&self, pid: ProcessId, exit: ProcessExit) {
+            let mut history = self.history.lock().unwrap();
+            history
+                .exits
+                .entry(pid)
+                .or_insert_with(|| watch::channel(None).0)
+                .send_replace(Some(exit));
+            history.completed.push_back(pid);
+            while history.completed.len() > 128 {
+                let old = history.completed.pop_front().unwrap();
+                history.exits.remove(&old);
+            }
+        }
+        fn try_get(&self, pid: ProcessId) -> Option<ProcessExit> {
+            self.history
+                .lock()
+                .unwrap()
+                .exits
+                .get(&pid)
+                .and_then(|exit| *exit.borrow())
+        }
+        fn wait(&self, pid: ProcessId) -> crate::ports::WaitFuture {
+            let mut receiver = self
+                .history
+                .lock()
+                .unwrap()
+                .exits
+                .entry(pid)
+                .or_insert_with(|| watch::channel(None).0)
+                .subscribe();
+            Box::pin(async move {
+                loop {
+                    if let Some(exit) = *receiver.borrow_and_update() {
+                        return exit;
+                    }
+                    receiver.changed().await.unwrap();
+                }
+            })
+        }
+    }
+    #[async_trait]
+    impl IntegrationEventPublisher for HistoryPorts {
+        async fn publish(&self, _: shepherd_domain::IntegrationEvent) {}
+    }
+    struct EmptyOutput;
+    impl crate::output::OutputSink for EmptyOutput {
+        fn push(&self, _: crate::output::OutputStream, _: &[u8]) {}
+        fn close(&self, _: crate::output::OutputStream, _: Option<String>) {}
+        fn read(&self) -> crate::output::OutputSnapshot {
+            unreachable!("the regression transfers output handles without reading bytes")
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_dynamic_membership_expires_history_but_keeps_quarantine_and_observations() {
+        let ports = Arc::new(HistoryPorts::default());
+        let supervisor = ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports);
+        let result = supervisor
+            .with_scope(vec![], |scope| async move {
+                let quarantined = scope.spawn(ProcessSpec::new("unverified")).await.unwrap();
+                assert!(!scope.wait(quarantined).await.unwrap().outcome.is_verified());
+                let mut first_completed = None;
+                let mut latest = quarantined;
+                let mut output_only = None;
+                for index in 0..650 {
+                    latest = scope.spawn(ProcessSpec::new("immediate")).await.unwrap();
+                    first_completed.get_or_insert(latest);
+                    if index == 450 {
+                        output_only = Some(latest);
+                    }
+                    assert!(scope.wait(latest).await.unwrap().outcome.is_verified());
+                    assert!(
+                        scope.owned.lock().unwrap().len() <= 257,
+                        "dynamic membership retained expired completed IDs"
+                    );
+                }
+                let expired = first_completed.unwrap();
+                assert!(matches!(scope.wait(expired).await, Err(WaitError::UnknownProcess(id)) if id == expired));
+                assert!(scope.take_output(expired).is_none());
+                let output_only = output_only.unwrap();
+                assert!(scope.supervisor.inner.waiters.try_get(output_only).is_none());
+                assert!(scope.take_output(output_only).is_some());
+                assert!(scope.take_output(latest).is_some());
+                assert!(scope.wait(latest).await.unwrap().outcome.is_verified());
+                // Both completed caches have evicted this root; registry quarantine
+                // must still authorize observing its unverified outcome.
+                assert!(!scope.wait(quarantined).await.unwrap().outcome.is_verified());
+            })
+            .await;
+        assert!(result.result.is_ok());
+        assert!(!result.termination.unwrap().all_verified());
     }
 }
