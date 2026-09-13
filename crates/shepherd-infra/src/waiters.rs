@@ -95,6 +95,27 @@ mod tests {
     use super::*;
     use shepherd_domain::TerminationOutcome;
     #[tokio::test]
+    async fn cancelled_wait_does_not_retain_waiter_registry() {
+        let waiters = InMemoryWaiters::new();
+        let slots = Arc::downgrade(&waiters.slots);
+        let mut pending = waiters.wait(ProcessId::new(91));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut pending)
+                .await
+                .is_err()
+        );
+        drop(pending);
+        let clone = waiters.clone();
+        drop(waiters);
+        assert!(slots.upgrade().is_some());
+        drop(clone);
+        assert!(
+            slots.upgrade().is_none(),
+            "cancelled waiter retained the registry"
+        );
+    }
+
+    #[tokio::test]
     async fn verified_correction_survives_delayed_unverified_publication() {
         let waiters = InMemoryWaiters::new();
         let pid = ProcessId::new(1);

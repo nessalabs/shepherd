@@ -19,6 +19,9 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time
 [lints]
 workspace = true
 
+[dev-dependencies]
+dhat = "=0.3.3"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 

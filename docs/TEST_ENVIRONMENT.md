@@ -11,6 +11,8 @@ The crate is unpublished and is only a development dependency of library crates.
 | `SHEPHERD_STRESS_ITERATIONS` | `2000` | `6..=100000`; cycles per runtime in the ignored long test |
 | `SHEPHERD_SOAK_ROUNDS` | `200` | `6..=100000`; concurrent application rounds per runtime in the ignored long soak |
 | `SHEPHERD_SOAK_RSS_BUDGET_MIB` | `64` | `1..=1024`; maximum process RSS growth in MiB above the warmed baseline |
+| `SHEPHERD_HEAP_BATCHES` | `4` | `4..=64`; measured batches of 256 lifecycles in the isolated heap test |
+| `SHEPHERD_HEAP_TIMEOUT_SECS` | `600` | `30..=3600`; deadline per selected runtime for the isolated heap test |
 | `PROPTEST_CASES` | `64` in `properties.rs` | Positive 32-bit integer; generated cases per property |
 | `SHEPHERD_CGROUP_ROOT` | Required for privileged tests | Nonempty native path to a writable delegated cgroup v2 ancestor |
 
@@ -65,3 +67,7 @@ observation cancellation, and shutdown):
 SHEPHERD_STRESS_RUNTIME=both SHEPHERD_STRESS_SEED=42 SHEPHERD_SOAK_ROUNDS=200 \
   python3 tools/run-stress.py --log application-soak.log -- cargo test --locked -p shepherd-fixtures --test application_soak long_application_soak -- --ignored --nocapture
 ```
+
+`TestEnvironment::heap()` shares runtime selection but ignores mixed-stress seed and
+iteration settings. Its 512-cycle warm-up and 256-cycle batch size are fixed to
+exercise history eviction. Allocation limits remain fixed detector invariants.

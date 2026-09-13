@@ -8,6 +8,8 @@ pub const STRESS_RUNTIME: &str = "SHEPHERD_STRESS_RUNTIME";
 pub const STRESS_ITERATIONS: &str = "SHEPHERD_STRESS_ITERATIONS";
 pub const SOAK_ROUNDS: &str = "SHEPHERD_SOAK_ROUNDS";
 pub const SOAK_RSS_BUDGET_MIB: &str = "SHEPHERD_SOAK_RSS_BUDGET_MIB";
+pub const HEAP_BATCHES: &str = "SHEPHERD_HEAP_BATCHES";
+pub const HEAP_TIMEOUT_SECS: &str = "SHEPHERD_HEAP_TIMEOUT_SECS";
 pub const PROPERTY_CASES: &str = "PROPTEST_CASES";
 pub const CGROUP_ROOT: &str = "SHEPHERD_CGROUP_ROOT";
 
@@ -45,6 +47,17 @@ pub struct SoakConfig {
     pub rss_budget_bytes: u64,
 }
 
+/// Workload settings for the isolated live-allocation test. Warm-up and batch
+/// sizes cover the fixed 256-entry histories and are detector invariants.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HeapConfig {
+    pub runtimes: &'static [RuntimeFlavor],
+    pub warmup_cycles: usize,
+    pub cycles_per_batch: usize,
+    pub batches: usize,
+    pub timeout: std::time::Duration,
+}
+
 /// Reads only the settings needed by the selected test, without mutating or caching
 /// the process environment. Invalid settings panic with the variable's name.
 pub struct TestEnvironment<F = fn(&str) -> Option<OsString>> {
@@ -60,6 +73,27 @@ impl TestEnvironment {
 }
 
 impl<F: Fn(&str) -> Option<OsString>> TestEnvironment<F> {
+    pub fn heap(&self) -> HeapConfig {
+        let batches = self.number(HEAP_BATCHES, 4usize);
+        assert!(
+            (4..=64).contains(&batches),
+            "{HEAP_BATCHES} must be in 4..=64"
+        );
+        let seconds = self.number(HEAP_TIMEOUT_SECS, 600u64);
+        assert!(
+            (30..=3600).contains(&seconds),
+            "{HEAP_TIMEOUT_SECS} must be in 30..=3600"
+        );
+        // Heap checks do not use the mixed workload's seed or iteration settings.
+        HeapConfig {
+            runtimes: self.runtimes(),
+            warmup_cycles: 512,
+            cycles_per_batch: 256,
+            batches,
+            timeout: std::time::Duration::from_secs(seconds),
+        }
+    }
+
     fn text(&self, name: &str) -> Option<String> {
         (self.lookup)(name).map(|value| {
             value
@@ -76,15 +110,19 @@ impl<F: Fn(&str) -> Option<OsString>> TestEnvironment<F> {
         })
     }
 
-    pub fn stress(&self, mode: StressMode) -> StressConfig {
-        let runtimes: &'static [RuntimeFlavor] = match self.text(STRESS_RUNTIME).as_deref() {
+    fn runtimes(&self) -> &'static [RuntimeFlavor] {
+        match self.text(STRESS_RUNTIME).as_deref() {
             None | Some("both") => &[RuntimeFlavor::Current, RuntimeFlavor::Multi],
             Some("current") => &[RuntimeFlavor::Current],
             Some("multi") => &[RuntimeFlavor::Multi],
             Some(value) => {
                 panic!("{STRESS_RUNTIME} must be current, multi, or both; got {value:?}")
             }
-        };
+        }
+    }
+
+    pub fn stress(&self, mode: StressMode) -> StressConfig {
+        let runtimes = self.runtimes();
         let iterations = match mode {
             StressMode::Smoke => 36,
             StressMode::Long => self.number(STRESS_ITERATIONS, 2_000_usize),
@@ -207,6 +245,45 @@ mod tests {
             env(&[(CGROUP_ROOT, "/tmp/羊 space")]).cgroup_root(),
             PathBuf::from("/tmp/羊 space")
         );
+    }
+
+    #[test]
+    fn heap_settings_are_validated_and_isolated() {
+        let config = env(&[(STRESS_SEED, "invalid"), (STRESS_ITERATIONS, "invalid")]).heap();
+        assert_eq!(config.batches, 4);
+        assert_eq!(config.warmup_cycles, 512);
+        assert_eq!(config.cycles_per_batch, 256);
+        assert_eq!(config.timeout.as_secs(), 600);
+        assert_eq!(
+            config.runtimes,
+            &[RuntimeFlavor::Current, RuntimeFlavor::Multi]
+        );
+        for (runtime, expected) in [
+            ("current", RuntimeFlavor::Current),
+            ("multi", RuntimeFlavor::Multi),
+        ] {
+            assert_eq!(
+                env(&[(STRESS_RUNTIME, runtime)]).heap().runtimes,
+                &[expected]
+            );
+        }
+        for (batches, timeout) in [("4", "30"), ("64", "3600")] {
+            let config = env(&[(HEAP_BATCHES, batches), (HEAP_TIMEOUT_SECS, timeout)]).heap();
+            assert_eq!(config.batches.to_string(), batches);
+            assert_eq!(config.timeout.as_secs().to_string(), timeout);
+        }
+        for (key, value) in [
+            (HEAP_BATCHES, "3"),
+            (HEAP_BATCHES, "65"),
+            (HEAP_BATCHES, "bad"),
+            (HEAP_TIMEOUT_SECS, "29"),
+            (HEAP_TIMEOUT_SECS, "3601"),
+            (HEAP_TIMEOUT_SECS, ""),
+        ] {
+            let panic = std::panic::catch_unwind(|| env(&[(key, value)]).heap())
+                .expect_err("invalid heap setting");
+            assert!(panic.downcast_ref::<String>().unwrap().contains(key));
+        }
     }
 
     #[test]

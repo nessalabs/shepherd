@@ -2506,6 +2506,44 @@ mod sampler_shutdown_tests {
         assert!(sup.shutdown().await.unwrap().scopes.is_empty());
     }
 
+    #[tokio::test]
+    async fn shutdown_releases_supervisor_sampler_and_backend_owners() {
+        let ports = Arc::new(Ports {
+            fail_cleanup: AtomicBool::new(false),
+        });
+        let backend = Arc::downgrade(&ports);
+        let sup = ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports);
+        let inner = Arc::downgrade(&sup.inner);
+        sup.start_sampler();
+        let sampler = sup
+            .inner
+            .sampler_task
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        tokio::task::yield_now().await;
+        let clone = sup.clone();
+        sup.shutdown().await.unwrap();
+        assert!(sampler.is_finished());
+        drop(sampler);
+        drop(sup);
+        assert!(
+            inner.upgrade().is_some(),
+            "positive control must retain the owner"
+        );
+        drop(clone);
+        assert!(
+            inner.upgrade().is_none(),
+            "sampler retained supervisor state"
+        );
+        assert!(
+            backend.upgrade().is_none(),
+            "shutdown retained backend ownership"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cancelled_shutdown_preserves_sampler_join_for_retry() {
         use std::future::Future;
