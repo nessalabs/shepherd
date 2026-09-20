@@ -251,7 +251,9 @@ fn with_scope_runs_real_process_and_nested_block() {
             );
             assert_eq!(inner.result.unwrap(), Some(0));
             assert!(inner.termination.unwrap().all_verified());
-            outer.wait(pid).ok();
+            // Inner cleanup must not reap the outer sleeper; the block's
+            // terminate_scope does that after the body returns.
+            assert_eq!(sup.processes(outer.id()).as_deref(), Some(&[pid][..]));
             outer.id()
         },
     );
