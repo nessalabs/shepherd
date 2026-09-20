@@ -375,6 +375,66 @@ fn repeated_runs_on_one_supervisor_stay_verified() {
 }
 
 #[test]
+fn chaos_mixed_real_process_outcomes() {
+    let sup = std::sync::Arc::new(supervisor());
+    let started = Instant::now();
+    std::thread::scope(|threads| {
+        let timeout_sup = std::sync::Arc::clone(&sup);
+        threads.spawn(move || {
+            let run = timeout_sup
+                .run_with_options(
+                    captured(ProcessSpec::new(env!("CARGO_BIN_EXE_sleep_forever"))),
+                    run_opts(Duration::from_millis(350)),
+                )
+                .unwrap();
+            assert!(run.timed_out(), "{run:?}");
+            assert!(run.all_verified(), "{:?}", run.termination());
+        });
+        let missing_sup = std::sync::Arc::clone(&sup);
+        threads.spawn(move || {
+            let spec = ProcessSpec::new(if cfg!(windows) {
+                r"C:\shepherd-definitely-missing-bin.exe"
+            } else {
+                "/tmp/shepherd-definitely-missing-bin"
+            });
+            let err = missing_sup
+                .run_with_options(spec, run_opts(Duration::from_secs(5)))
+                .expect_err("missing program");
+            assert!(
+                matches!(err, shepherd::blocking::BlockingRunError::Spawn(_)),
+                "{err:?}"
+            );
+        });
+        let natural_sup = std::sync::Arc::clone(&sup);
+        threads.spawn(move || {
+            let run = natural_sup
+                .run_with_options(
+                    ProcessSpec::new(env!("CARGO_BIN_EXE_exit_code")).arg("0"),
+                    run_opts(Duration::from_secs(10)),
+                )
+                .unwrap();
+            assert!(!run.timed_out(), "{run:?}");
+            assert!(run.all_verified(), "{:?}", run.termination());
+        });
+        let scoped_sup = std::sync::Arc::clone(&sup);
+        threads.spawn(move || {
+            let result = scoped_sup.with_scope_options(
+                vec![ProcessSpec::new(env!("CARGO_BIN_EXE_exit_code")).arg("2")],
+                short_opts(),
+                |scope| scope.wait(scope.processes()[0]).unwrap().code,
+            );
+            assert_eq!(result.result.unwrap(), Some(2));
+            assert!(result.termination.unwrap().all_verified());
+        });
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(12),
+        "mixed real-process chaos hung: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn concurrent_runs_are_isolated() {
     let sup = std::sync::Arc::new(supervisor());
     std::thread::scope(|threads| {

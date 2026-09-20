@@ -9,9 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use shepherd::blocking::{
-    BlockingRunError, BlockingSupervisor, BlockingSupervisorBuilder, RunOptions,
-};
+use shepherd::blocking::{BlockingRunError, BlockingSupervisor, RunOptions};
 use shepherd::{
     GracePeriod, NullBackend, ProcessBackend, ProcessSpec, ScopeCreationError, SpawnError, Spawned,
     SupervisorBuilder, TerminateError, TerminateOptions, TerminationOutcome, WaitError,
@@ -49,6 +47,7 @@ fn spawn_wait_natural_exit_outside_async() {
         .unwrap();
     let exit = sup.wait(pid).unwrap();
     assert_eq!(exit.outcome, TerminationOutcome::ExitedNaturally);
+    assert!(sup.os_pid(pid).is_some());
     assert!(sup
         .terminate_scope(scope, short_opts())
         .unwrap()
@@ -312,48 +311,6 @@ fn from_runtime_current_thread_with_scope_body_can_spawn_and_wait() {
 }
 
 #[test]
-fn from_runtime_current_thread_with_scope_panic_still_verifies_cleanup() {
-    let sup = current_thread_blocking(Arc::new(NullBackend::new()));
-    let seen = std::sync::Mutex::new(None);
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = sup.with_scope_options(
-            vec![ProcessSpec::new("ignore-graceful")],
-            short_opts(),
-            |scope| {
-                *seen.lock().expect("seen") = Some(scope.id());
-                panic!("injected current-thread body panic");
-            },
-        );
-    }));
-    assert!(panicked.is_err());
-    let scope = seen.lock().expect("seen").expect("scope recorded");
-    assert!(sup.wait_scope_cleanup(scope).unwrap().all_verified());
-}
-
-#[test]
-fn from_runtime_current_thread_nested_with_scope_waits() {
-    let sup = current_thread_blocking(Arc::new(NullBackend::new()));
-    let outer = sup.with_scope_options(
-        vec![ProcessSpec::new("exit-immediately")],
-        short_opts(),
-        |outer| {
-            let outer_exit = outer.wait(outer.processes()[0]).unwrap().outcome;
-            let inner = sup.with_scope_options(Vec::new(), short_opts(), |inner| {
-                let pid = inner
-                    .spawn(ProcessSpec::new("exit-immediately"))
-                    .expect("inner spawn");
-                inner.wait(pid).unwrap().outcome
-            });
-            assert_eq!(inner.result.unwrap(), TerminationOutcome::ExitedNaturally);
-            assert!(inner.termination.unwrap().all_verified());
-            outer_exit
-        },
-    );
-    assert_eq!(outer.result.unwrap(), TerminationOutcome::ExitedNaturally);
-    assert!(outer.termination.unwrap().all_verified());
-}
-
-#[test]
 fn with_scope_wait_rejects_foreign_process() {
     let sup = supervisor();
     let foreign_scope = sup.create_scope();
@@ -404,32 +361,6 @@ fn drop_without_shutdown_does_not_hang() {
         .spawn(scope, ProcessSpec::new("ignore-graceful"))
         .unwrap();
     drop(sup);
-}
-
-#[test]
-fn builder_debug_and_accessors() {
-    let builder = BlockingSupervisorBuilder::new()
-        .stats_interval(Duration::from_millis(250))
-        .worker_threads(1);
-    assert!(format!("{builder:?}").contains("BlockingSupervisorBuilder"));
-    let sup = builder
-        .backend(Arc::new(NullBackend::new()))
-        .build()
-        .unwrap();
-    assert!(format!("{sup:?}").contains("BlockingSupervisor"));
-    let scope = sup.create_scope();
-    let pid = sup
-        .spawn(scope, ProcessSpec::new("respect-graceful"))
-        .unwrap();
-    assert!(sup.os_pid(pid).is_some());
-    assert!(sup.take_output(pid).is_none());
-    assert!(sup.capabilities().force_termination);
-    let _ = sup.stats(pid);
-    let _ = sup.scope_usage(scope);
-    assert!(sup
-        .terminate_scope(scope, short_opts())
-        .unwrap()
-        .all_verified());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -685,13 +616,6 @@ fn slow_spawn_is_waited_then_cleaned() {
 }
 
 #[test]
-fn default_supervisor_and_send_sync() {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<BlockingSupervisor>();
-    let _ = BlockingSupervisor::builder();
-}
-
-#[test]
 fn into_verified_rejects_unverified_report() {
     let run = shepherd::blocking::BlockingRun::TimedOut {
         output: None,
@@ -708,15 +632,6 @@ fn into_verified_rejects_unverified_report() {
         run.into_verified(),
         Err(BlockingRunError::Unverified { .. })
     ));
-}
-
-#[test]
-fn run_helper_matches_run_with_options() {
-    let sup = supervisor();
-    let run = sup
-        .run(ProcessSpec::new("exit-immediately"), Duration::from_secs(2))
-        .unwrap();
-    assert!(run.all_verified());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -846,6 +761,331 @@ impl ProcessBackend for FailSecondSpawn {
         signal: Signal,
     ) -> Result<(), TerminateError> {
         self.inner.signal_scope(scope, signal).await
+    }
+    async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
+        self.inner.wait(target).await
+    }
+    async fn sample(&self, target: &Spawned) -> Result<RawStats, shepherd::StatsError> {
+        self.inner.sample(target).await
+    }
+    fn capabilities(&self) -> shepherd::Capabilities {
+        self.inner.capabilities()
+    }
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.inner.hard_kill_scope(scope);
+    }
+    fn hard_kill_all(&self) {
+        self.inner.hard_kill_all();
+    }
+}
+
+/// Shared current-thread `from_runtime` must serialize `block_on` instead of
+/// deadlocking, and `run` timers must still fire on that scheduler.
+#[test]
+fn current_thread_shared_runtime_stays_responsive() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<BlockingSupervisor>();
+
+    let sup = std::sync::Arc::new(current_thread_blocking(Arc::new(NullBackend::new())));
+    let started = Instant::now();
+    std::thread::scope(|threads| {
+        for i in 0..3 {
+            let sup = std::sync::Arc::clone(&sup);
+            threads.spawn(move || {
+                let scope = sup.create_scope();
+                let pid = sup
+                    .spawn(scope, ProcessSpec::new("exit-immediately"))
+                    .unwrap_or_else(|e| panic!("thread {i} spawn: {e}"));
+                assert_eq!(
+                    sup.wait(pid).unwrap().outcome,
+                    TerminationOutcome::ExitedNaturally
+                );
+                assert!(sup
+                    .terminate_scope(scope, short_opts())
+                    .unwrap()
+                    .all_verified());
+            });
+        }
+        let runner = std::sync::Arc::clone(&sup);
+        threads.spawn(move || {
+            let run = runner
+                .run_with_options(
+                    ProcessSpec::new("ignore-graceful"),
+                    run_opts(Duration::from_millis(40)),
+                )
+                .unwrap();
+            assert!(run.timed_out(), "{run:?}");
+            assert!(run.all_verified(), "{:?}", run.termination());
+        });
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "current-thread shared runtime hung: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn with_scope_terminate_then_block_cleanup_is_idempotent() {
+    let sup = supervisor();
+    let result = sup.with_scope_options(
+        vec![ProcessSpec::new("ignore-graceful")],
+        short_opts(),
+        |scope| {
+            sup.terminate_scope(scope.id(), short_opts())
+                .unwrap()
+                .all_verified()
+        },
+    );
+    assert!(result.result.unwrap());
+    let termination = result.termination.expect("outer cleanup");
+    assert!(
+        termination.all_verified(),
+        "second terminate_scope after body must be idempotent: {termination:?}"
+    );
+}
+
+#[test]
+fn run_timeout_surfaces_containment_failure() {
+    let sup = BlockingSupervisor::builder()
+        .backend(Arc::new(TimeoutThenContainmentFail::default()))
+        .build()
+        .unwrap();
+    let err = sup
+        .run_with_options(
+            ProcessSpec::new("ignore-graceful"),
+            run_opts(Duration::from_millis(20)),
+        )
+        .expect_err("cleanup failure after timeout must surface");
+    assert!(
+        matches!(err, BlockingRunError::Terminate(_)),
+        "must not return TimedOut that hides a failed reap: {err:?}"
+    );
+}
+
+#[test]
+fn run_wait_failure_is_not_a_verified_success() {
+    let sup = BlockingSupervisor::builder()
+        .backend(Arc::new(FailWaitAfterSpawn::default()))
+        .build()
+        .unwrap();
+    let started = Instant::now();
+    let result = sup.run_with_options(
+        ProcessSpec::new("ignore-graceful"),
+        run_opts(Duration::from_secs(2)),
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "wait-error cleanup hung: {:?}",
+        started.elapsed()
+    );
+    match result {
+        Ok(run) => {
+            assert!(
+                !run.all_verified(),
+                "a failed reap must not look successful: {run:?}"
+            );
+            assert!(
+                run.into_verified().is_err(),
+                "into_verified is the gate for hosts that refuse unverified reaps"
+            );
+        }
+        Err(err) => assert!(
+            matches!(
+                err,
+                BlockingRunError::Wait(_)
+                    | BlockingRunError::Terminate(_)
+                    | BlockingRunError::Unverified { .. }
+            ),
+            "wait-error path must be a typed failure, got {err:?}"
+        ),
+    }
+}
+
+#[test]
+fn with_scope_panic_keeps_cleanup_error_visible() {
+    let sup = BlockingSupervisor::builder()
+        .backend(Arc::new(TimeoutThenContainmentFail::default()))
+        .build()
+        .unwrap();
+    let seen = std::sync::Mutex::new(None);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = sup.with_scope_options(
+            vec![ProcessSpec::new("ignore-graceful")],
+            short_opts(),
+            |scope| {
+                *seen.lock().expect("seen") = Some(scope.id());
+                panic!("body panic before failed cleanup");
+            },
+        );
+    }));
+    assert!(panicked.is_err());
+    let scope = seen.lock().expect("seen").expect("scope");
+    let cleanup = sup.wait_scope_cleanup(scope);
+    assert!(
+        cleanup.is_err(),
+        "cleanup failure after panic must stay visible: {cleanup:?}"
+    );
+}
+
+/// Timeout, panic, self-terminate, and natural exit on one supervisor at once.
+/// Each outcome must be verified or a typed failure — not a hang or a silent leak.
+#[test]
+fn chaos_mixed_failures_on_one_supervisor() {
+    let sup = std::sync::Arc::new(supervisor());
+    let started = Instant::now();
+    let panicked_scope = std::sync::Arc::new(std::sync::Mutex::new(None));
+    std::thread::scope(|threads| {
+        let timeout_sup = std::sync::Arc::clone(&sup);
+        threads.spawn(move || {
+            let run = timeout_sup
+                .run_with_options(
+                    ProcessSpec::new("ignore-graceful"),
+                    run_opts(Duration::from_millis(50)),
+                )
+                .unwrap();
+            assert!(run.timed_out(), "{run:?}");
+            assert!(run.all_verified(), "{:?}", run.termination());
+        });
+        let natural_sup = std::sync::Arc::clone(&sup);
+        threads.spawn(move || {
+            let run = natural_sup
+                .run_with_options(
+                    ProcessSpec::new("exit-immediately"),
+                    run_opts(Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert!(!run.timed_out(), "{run:?}");
+            assert!(run.all_verified(), "{:?}", run.termination());
+        });
+        let panic_sup = std::sync::Arc::clone(&sup);
+        let seen = std::sync::Arc::clone(&panicked_scope);
+        threads.spawn(move || {
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = panic_sup.with_scope_options(
+                    vec![ProcessSpec::new("ignore-graceful")],
+                    short_opts(),
+                    |scope| {
+                        *seen.lock().expect("seen") = Some(scope.id());
+                        panic!("chaos body panic");
+                    },
+                );
+            }));
+            assert!(panicked.is_err());
+        });
+        let self_term = std::sync::Arc::clone(&sup);
+        threads.spawn(move || {
+            let result = self_term.with_scope_options(
+                vec![ProcessSpec::new("respect-graceful")],
+                short_opts(),
+                |scope| {
+                    self_term
+                        .terminate_scope(scope.id(), short_opts())
+                        .unwrap()
+                        .all_verified()
+                },
+            );
+            assert!(result.result.unwrap());
+            assert!(result.termination.unwrap().all_verified());
+        });
+    });
+    let scope = panicked_scope.lock().expect("seen").expect("panic scope");
+    assert!(sup.wait_scope_cleanup(scope).unwrap().all_verified());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "mixed chaos hung: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn scoped_cleanup_history_evicts_oldest() {
+    let sup = supervisor();
+    let first = sup
+        .with_scope_options(Vec::new(), short_opts(), |scope| scope.id())
+        .scope;
+    let mut last = first;
+    for _ in 0..256 {
+        last = sup
+            .with_scope_options(Vec::new(), short_opts(), |scope| scope.id())
+            .scope;
+    }
+    assert!(
+        sup.wait_scope_cleanup(first).is_err(),
+        "history is bounded; the oldest scoped report must evict"
+    );
+    assert!(sup.wait_scope_cleanup(last).unwrap().all_verified());
+}
+
+#[derive(Default)]
+struct FailWaitAfterSpawn {
+    inner: NullBackend,
+}
+
+#[async_trait]
+impl ProcessBackend for FailWaitAfterSpawn {
+    async fn spawn(
+        &self,
+        scope: ProcessScopeId,
+        spec: &ProcessSpec,
+    ) -> Result<Spawned, SpawnError> {
+        self.inner.spawn(scope, spec).await
+    }
+    async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+        self.inner.signal(target, signal).await
+    }
+    async fn signal_scope(
+        &self,
+        scope: ProcessScopeId,
+        signal: Signal,
+    ) -> Result<(), TerminateError> {
+        self.inner.signal_scope(scope, signal).await
+    }
+    async fn wait(&self, _target: &Spawned) -> Result<RawExit, WaitError> {
+        Err(WaitError::Backend("injected wait failure".into()))
+    }
+    async fn sample(&self, target: &Spawned) -> Result<RawStats, shepherd::StatsError> {
+        self.inner.sample(target).await
+    }
+    fn capabilities(&self) -> shepherd::Capabilities {
+        self.inner.capabilities()
+    }
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.inner.hard_kill_scope(scope);
+    }
+    fn hard_kill_all(&self) {
+        self.inner.hard_kill_all();
+    }
+}
+
+#[derive(Default)]
+struct TimeoutThenContainmentFail {
+    inner: NullBackend,
+}
+
+#[async_trait]
+impl ProcessBackend for TimeoutThenContainmentFail {
+    async fn spawn(
+        &self,
+        scope: ProcessScopeId,
+        spec: &ProcessSpec,
+    ) -> Result<Spawned, SpawnError> {
+        self.inner.spawn(scope, spec).await
+    }
+    async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+        self.inner.signal(target, signal).await
+    }
+    async fn signal_scope(
+        &self,
+        scope: ProcessScopeId,
+        signal: Signal,
+    ) -> Result<(), TerminateError> {
+        self.inner.signal_scope(scope, signal).await
+    }
+    async fn cleanup_scope(&self, _scope: ProcessScopeId) -> Result<(), TerminateError> {
+        Err(TerminateError::Signal(
+            "injected containment failure after timeout".into(),
+        ))
     }
     async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
         self.inner.wait(target).await

@@ -811,10 +811,19 @@ impl BlockingRun {
         matches!(self, Self::TimedOut { .. })
     }
 
-    /// Whether every process in the cleanup report reached a verified outcome.
+    /// Whether every recorded outcome is a verified reap.
+    ///
+    /// For [`Self::Completed`] this includes the wait `ProcessExit`. A wait that
+    /// returned `CleanupUnverified` is not treated as success just because a
+    /// later `terminate_scope` report happened to be empty or also unverified.
     #[must_use]
     pub fn all_verified(&self) -> bool {
-        self.termination().all_verified()
+        match self {
+            Self::Completed {
+                exit, termination, ..
+            } => exit.outcome.is_verified() && termination.all_verified(),
+            Self::TimedOut { termination, .. } => termination.all_verified(),
+        }
     }
 
     /// The scope cleanup report.
