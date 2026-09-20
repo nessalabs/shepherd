@@ -40,8 +40,14 @@ current-thread path from ordinary synchronous code. Same-runtime current-thread
 calls panic with that explanation instead of hanging.
 
 `with_scope` / `with_scope_options` accept a synchronous closure. The body
-runs through the same async scope guard (ADR 0017). A panic is caught so
-cleanup can finish, then resumed. Nested blocks remain independent scopes.
+runs on the calling thread **outside** any driven future: each `spawn` /
+`wait` / `terminate` is its own `block_on`. That is required so a
+current-thread runtime taken via `from_runtime` can still spawn and wait
+from the body — putting the body *inside* `Runtime::block_on` made those
+nested calls see `Handle::try_current` and panic (nested `block_on`
+deadlocks on current-thread). A panic is caught so cleanup can finish
+(`terminate_scope` + bounded `wait_scope_cleanup` history), then resumed.
+Nested blocks remain independent scopes.
 
 `run` / `run_with_options` bound the *whole* attempt — spawn and wait, not
 only reading output. Cleanup always uses the caller's `TerminateOptions`,

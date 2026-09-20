@@ -237,6 +237,22 @@ fn deadline_kills_process_group_descendants() {
 }
 
 #[test]
+fn from_runtime_current_thread_with_scope_waits_real_process() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sup = BlockingSupervisor::from_runtime(runtime);
+    let result = sup.with_scope_options(
+        vec![ProcessSpec::new(env!("CARGO_BIN_EXE_exit_code")).arg("4")],
+        short_opts(),
+        |scope| scope.wait(scope.processes()[0]).unwrap().code,
+    );
+    assert_eq!(result.result.unwrap(), Some(4));
+    assert!(result.termination.unwrap().all_verified());
+}
+
+#[test]
 fn with_scope_runs_real_process_and_nested_block() {
     let sup = supervisor();
     let outer = sup.with_scope_options(

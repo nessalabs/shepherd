@@ -285,6 +285,97 @@ fn from_runtime_current_thread_from_sync_code() {
         .all_verified());
 }
 
+fn current_thread_blocking(backend: Arc<dyn ProcessBackend>) -> BlockingSupervisor {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    BlockingSupervisor::from_runtime_and_builder(runtime, SupervisorBuilder::new().backend(backend))
+}
+
+#[test]
+fn from_runtime_current_thread_with_scope_body_can_spawn_and_wait() {
+    // from_runtime is the documented current-thread path. The body must be able
+    // to spawn/wait; those calls cannot nest block_on on that same runtime.
+    let sup = current_thread_blocking(Arc::new(NullBackend::new()));
+    let result = sup.with_scope_options(Vec::new(), short_opts(), |scope| {
+        let pid = scope
+            .spawn(ProcessSpec::new("exit-immediately"))
+            .expect("scoped spawn on current-thread owned runtime");
+        scope
+            .wait(pid)
+            .expect("scoped wait on current-thread")
+            .outcome
+    });
+    assert_eq!(result.result.unwrap(), TerminationOutcome::ExitedNaturally);
+    assert!(result.termination.unwrap().all_verified());
+}
+
+#[test]
+fn from_runtime_current_thread_with_scope_panic_still_verifies_cleanup() {
+    let sup = current_thread_blocking(Arc::new(NullBackend::new()));
+    let seen = std::sync::Mutex::new(None);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = sup.with_scope_options(
+            vec![ProcessSpec::new("ignore-graceful")],
+            short_opts(),
+            |scope| {
+                *seen.lock().expect("seen") = Some(scope.id());
+                panic!("injected current-thread body panic");
+            },
+        );
+    }));
+    assert!(panicked.is_err());
+    let scope = seen.lock().expect("seen").expect("scope recorded");
+    assert!(sup.wait_scope_cleanup(scope).unwrap().all_verified());
+}
+
+#[test]
+fn from_runtime_current_thread_nested_with_scope_waits() {
+    let sup = current_thread_blocking(Arc::new(NullBackend::new()));
+    let outer = sup.with_scope_options(
+        vec![ProcessSpec::new("exit-immediately")],
+        short_opts(),
+        |outer| {
+            let outer_exit = outer.wait(outer.processes()[0]).unwrap().outcome;
+            let inner = sup.with_scope_options(Vec::new(), short_opts(), |inner| {
+                let pid = inner
+                    .spawn(ProcessSpec::new("exit-immediately"))
+                    .expect("inner spawn");
+                inner.wait(pid).unwrap().outcome
+            });
+            assert_eq!(inner.result.unwrap(), TerminationOutcome::ExitedNaturally);
+            assert!(inner.termination.unwrap().all_verified());
+            outer_exit
+        },
+    );
+    assert_eq!(outer.result.unwrap(), TerminationOutcome::ExitedNaturally);
+    assert!(outer.termination.unwrap().all_verified());
+}
+
+#[test]
+fn with_scope_wait_rejects_foreign_process() {
+    let sup = supervisor();
+    let foreign_scope = sup.create_scope();
+    let foreign = sup
+        .spawn(foreign_scope, ProcessSpec::new("exit-immediately"))
+        .unwrap();
+    let result = sup.with_scope_options(Vec::new(), short_opts(), |scope| {
+        scope
+            .wait(foreign)
+            .expect_err("must not wait a foreign pid")
+    });
+    assert!(matches!(
+        result.result.unwrap(),
+        WaitError::UnknownProcess(_)
+    ));
+    assert!(result.termination.unwrap().all_verified());
+    assert!(sup
+        .terminate_scope(foreign_scope, short_opts())
+        .unwrap()
+        .all_verified());
+}
+
 #[test]
 fn from_handle_multi_thread_from_sync_code() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
