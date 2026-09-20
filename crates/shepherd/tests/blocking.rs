@@ -4,8 +4,9 @@
 
 #![cfg(feature = "blocking")]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use shepherd::blocking::{
@@ -479,6 +480,154 @@ async fn byo_current_thread_same_runtime_panics_instead_of_deadlocking() {
     );
 }
 
+#[test]
+fn run_after_shutdown_is_supervisor_closed() {
+    let sup = supervisor();
+    sup.shutdown().unwrap();
+    let err = sup
+        .run_with_options(
+            ProcessSpec::new("exit-immediately"),
+            run_opts(Duration::from_secs(1)),
+        )
+        .expect_err("closed supervisor");
+    assert!(matches!(err, BlockingRunError::Scope(_)), "{err:?}");
+}
+
+#[test]
+fn with_scope_partial_spawn_still_cleans() {
+    let backend = FailSecondSpawn::default();
+    let sup = BlockingSupervisor::builder()
+        .backend(Arc::new(backend))
+        .build()
+        .unwrap();
+    let result = sup.with_scope_options(
+        vec![
+            ProcessSpec::new("exit-immediately"),
+            ProcessSpec::new("fail-this-one"),
+        ],
+        short_opts(),
+        |_| panic!("body must not run after partial spawn failure"),
+    );
+    assert!(result.result.is_err(), "{:?}", result.result.err());
+    assert!(result.termination.unwrap().all_verified());
+}
+
+#[test]
+fn empty_with_scope_still_reports_cleanup() {
+    let sup = supervisor();
+    let result = sup.with_scope_options(Vec::new(), short_opts(), |scope| {
+        assert!(scope.processes().is_empty());
+        7
+    });
+    assert_eq!(result.result.unwrap(), 7);
+    assert!(result.termination.unwrap().all_verified());
+}
+
+#[test]
+fn clone_shares_runtime_and_survives_sibling_drop() {
+    let a = supervisor();
+    let b = a.clone();
+    drop(a);
+    let scope = b.create_scope();
+    let pid = b
+        .spawn(scope, ProcessSpec::new("exit-immediately"))
+        .unwrap();
+    assert_eq!(
+        b.wait(pid).unwrap().outcome,
+        TerminationOutcome::ExitedNaturally
+    );
+    assert!(b
+        .terminate_scope(scope, short_opts())
+        .unwrap()
+        .all_verified());
+}
+
+#[test]
+fn repeated_run_cycles_stay_verified() {
+    let sup = supervisor();
+    for i in 0..32 {
+        let spec = if i % 2 == 0 {
+            ProcessSpec::new("exit-immediately")
+        } else {
+            ProcessSpec::new("ignore-graceful")
+        };
+        let run = sup
+            .run_with_options(spec, run_opts(Duration::from_millis(80)))
+            .unwrap();
+        assert!(
+            run.all_verified(),
+            "cycle {i} unverified: {:?}",
+            run.termination()
+        );
+    }
+    sup.shutdown().unwrap();
+}
+
+#[test]
+fn slow_spawn_is_waited_then_cleaned() {
+    let sup = BlockingSupervisor::builder()
+        .backend(Arc::new(SlowSpawnBackend {
+            inner: NullBackend::new(),
+            delay: Duration::from_millis(80),
+        }))
+        .build()
+        .unwrap();
+    let started = Instant::now();
+    let run = sup
+        .run_with_options(
+            ProcessSpec::new("ignore-graceful"),
+            run_opts(Duration::from_millis(20)),
+        )
+        .unwrap();
+    // Deadline fires during spawn; cleanup must still wait for admission and reap.
+    assert!(run.timed_out() || run.all_verified(), "{run:?}");
+    assert!(
+        run.all_verified(),
+        "in-flight spawn must not be abandoned: {:?}",
+        run.termination()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "slow spawn cleanup hung: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn default_supervisor_and_send_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<BlockingSupervisor>();
+    let _ = BlockingSupervisor::builder();
+}
+
+#[test]
+fn into_verified_rejects_unverified_report() {
+    let run = shepherd::blocking::BlockingRun::TimedOut {
+        output: None,
+        termination: shepherd::ScopeTerminationReport {
+            scope: shepherd::ProcessScopeId::new(1),
+            outcomes: vec![(
+                shepherd::ProcessId::new(1),
+                TerminationOutcome::CleanupUnverified(shepherd::UnverifiedReason::ReapFailed),
+            )],
+        },
+    };
+    assert!(!run.all_verified());
+    assert!(matches!(
+        run.into_verified(),
+        Err(BlockingRunError::Unverified { .. })
+    ));
+}
+
+#[test]
+fn run_helper_matches_run_with_options() {
+    let sup = supervisor();
+    let run = sup
+        .run(ProcessSpec::new("exit-immediately"), Duration::from_secs(2))
+        .unwrap();
+    assert!(run.all_verified());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owned_runtime_from_inside_foreign_multi_thread_runtime() {
     let sup = supervisor();
@@ -550,6 +699,94 @@ impl ProcessBackend for FailSpawnOnly {
         _spec: &ProcessSpec,
     ) -> Result<Spawned, SpawnError> {
         Err(SpawnError::Os("injected spawn failure".into()))
+    }
+    async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+        self.inner.signal(target, signal).await
+    }
+    async fn signal_scope(
+        &self,
+        scope: ProcessScopeId,
+        signal: Signal,
+    ) -> Result<(), TerminateError> {
+        self.inner.signal_scope(scope, signal).await
+    }
+    async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
+        self.inner.wait(target).await
+    }
+    async fn sample(&self, target: &Spawned) -> Result<RawStats, shepherd::StatsError> {
+        self.inner.sample(target).await
+    }
+    fn capabilities(&self) -> shepherd::Capabilities {
+        self.inner.capabilities()
+    }
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.inner.hard_kill_scope(scope);
+    }
+    fn hard_kill_all(&self) {
+        self.inner.hard_kill_all();
+    }
+}
+
+#[derive(Default)]
+struct FailSecondSpawn {
+    inner: NullBackend,
+    count: AtomicUsize,
+}
+
+#[async_trait]
+impl ProcessBackend for FailSecondSpawn {
+    async fn spawn(
+        &self,
+        scope: ProcessScopeId,
+        spec: &ProcessSpec,
+    ) -> Result<Spawned, SpawnError> {
+        let n = self.count.fetch_add(1, Ordering::SeqCst);
+        if n >= 1 {
+            return Err(SpawnError::Os("injected second spawn failure".into()));
+        }
+        self.inner.spawn(scope, spec).await
+    }
+    async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+        self.inner.signal(target, signal).await
+    }
+    async fn signal_scope(
+        &self,
+        scope: ProcessScopeId,
+        signal: Signal,
+    ) -> Result<(), TerminateError> {
+        self.inner.signal_scope(scope, signal).await
+    }
+    async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
+        self.inner.wait(target).await
+    }
+    async fn sample(&self, target: &Spawned) -> Result<RawStats, shepherd::StatsError> {
+        self.inner.sample(target).await
+    }
+    fn capabilities(&self) -> shepherd::Capabilities {
+        self.inner.capabilities()
+    }
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.inner.hard_kill_scope(scope);
+    }
+    fn hard_kill_all(&self) {
+        self.inner.hard_kill_all();
+    }
+}
+
+struct SlowSpawnBackend {
+    inner: NullBackend,
+    delay: Duration,
+}
+
+#[async_trait]
+impl ProcessBackend for SlowSpawnBackend {
+    async fn spawn(
+        &self,
+        scope: ProcessScopeId,
+        spec: &ProcessSpec,
+    ) -> Result<Spawned, SpawnError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.spawn(scope, spec).await
     }
     async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
         self.inner.signal(target, signal).await

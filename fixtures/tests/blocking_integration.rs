@@ -304,25 +304,76 @@ async fn blocking_run_from_inside_application_runtime() {
     }
 }
 
-#[cfg(windows)]
 #[test]
-fn run_deadline_kills_hanging_cmd() {
+fn run_deadline_kills_cleared_env_sleeper() {
+    // Absolute fixture path: EnvPolicy::Clear must not depend on PATH (Windows
+    // CI failed when cmd.exe could start but ping.exe could not).
     let sup = supervisor();
     let spec = captured(
-        ProcessSpec::new("cmd.exe")
-            .args(["/C", "echo closed-ready& ping -n 40 127.0.0.1 >NUL"])
-            .env(EnvPolicy::Clear(Vec::new())),
+        ProcessSpec::new(env!("CARGO_BIN_EXE_sleep_forever")).env(EnvPolicy::Clear(Vec::new())),
     );
     let started = Instant::now();
     let run = sup
-        .run_with_options(spec, run_opts(Duration::from_millis(600)))
+        .run_with_options(spec, run_opts(Duration::from_millis(400)))
         .unwrap();
     assert!(
         started.elapsed() < Duration::from_secs(8),
-        "hanging cmd must not escape the deadline"
+        "cleared-env sleeper must not escape the deadline, got {:?}",
+        started.elapsed()
     );
-    assert!(run.timed_out());
+    assert!(run.timed_out(), "{run:?}");
     assert!(run.all_verified(), "{:?}", run.termination());
+}
+
+#[test]
+fn run_missing_program_fails_spawn_and_leaves_no_live_process() {
+    let sup = supervisor();
+    let spec = ProcessSpec::new(if cfg!(windows) {
+        r"C:\shepherd-definitely-missing-bin.exe"
+    } else {
+        "/tmp/shepherd-definitely-missing-bin"
+    });
+    let err = sup
+        .run_with_options(spec, run_opts(Duration::from_secs(5)))
+        .expect_err("missing program must fail spawn");
+    assert!(
+        matches!(err, shepherd::blocking::BlockingRunError::Spawn(_)),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn repeated_runs_on_one_supervisor_stay_verified() {
+    let sup = supervisor();
+    for code in ["0", "1", "3"] {
+        let run = sup
+            .run_with_options(
+                ProcessSpec::new(env!("CARGO_BIN_EXE_exit_code")).arg(code),
+                run_opts(Duration::from_secs(10)),
+            )
+            .unwrap();
+        assert!(run.all_verified(), "{run:?}");
+        assert!(!run.timed_out());
+    }
+    sup.shutdown().unwrap();
+}
+
+#[test]
+fn concurrent_runs_are_isolated() {
+    let sup = std::sync::Arc::new(supervisor());
+    std::thread::scope(|threads| {
+        for _ in 0..4 {
+            let sup = std::sync::Arc::clone(&sup);
+            threads.spawn(move || {
+                let sleeper = captured(ProcessSpec::new(env!("CARGO_BIN_EXE_sleep_forever")));
+                let run = sup
+                    .run_with_options(sleeper, run_opts(Duration::from_millis(350)))
+                    .unwrap();
+                assert!(run.timed_out(), "{run:?}");
+                assert!(run.all_verified(), "{:?}", run.termination());
+            });
+        }
+    });
 }
 
 #[test]
