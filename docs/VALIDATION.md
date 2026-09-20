@@ -10,7 +10,9 @@ ADRs 0001–0020 and DIAGRAMS.md describe the implemented decisions.
 
 Public operations: create_scope/try_create_scope, spawn, processes, capabilities, cached stats, wait,
 terminate, terminate_scope, shutdown, take_output, with_scope/with_scope_options and
-wait_scope_cleanup. Raw Child ownership is never exposed. WithScopeResult preserves
+wait_scope_cleanup. The optional `shepherd::blocking` module (ADR 0022) mirrors those
+operations for callers outside Tokio and adds `run`, whose deadline covers spawn and
+wait, not only output reads. Raw Child ownership is never exposed. WithScopeResult preserves
 the closure value or initial spawn error alongside an independent cleanup result.
 Nested blocks create independent scopes. OWNERSHIP.md reviews every public operation.
 
