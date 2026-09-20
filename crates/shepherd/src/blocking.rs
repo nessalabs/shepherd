@@ -8,11 +8,9 @@
 //! * same runtime (multi-thread): `block_in_place` + `Handle::block_on`
 //! * a different runtime: a scoped helper thread calls `block_on` outside Tokio
 //!
-//! A current-thread handle used *from that same runtime* cannot block safely
-//! and will panic inside Tokio. Use [`BlockingSupervisor::new`] (owned
-//! multi-thread runtime) or call from a thread that is not driving that
-//! current-thread runtime. [`BlockingSupervisor::from_runtime`] is the supported
-//! way to wrap a current-thread runtime from ordinary synchronous code.
+//! A current-thread `Handle` is rejected: `Handle::block_on` does not drive
+//! that scheduler's I/O, and using it from the driver thread deadlocks. Use
+//! [`BlockingSupervisor::new`] or [`BlockingSupervisor::from_runtime`].
 //!
 //! Dropping an owned runtime from inside another Tokio context calls
 //! `shutdown_background` so Tokio does not panic. Call `shutdown()` first when
@@ -26,7 +24,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 
 use crate::{
     ObservationError, OutputSnapshot, ProcessExit, ProcessId, ProcessOutput, ProcessScopeId,
@@ -91,10 +89,25 @@ impl Driver {
         }
     }
 
-    fn block_on<F: Future>(&self, future: F) -> F::Output {
+    /// Drive `future` from a thread that is **not** inside a Tokio context.
+    ///
+    /// A borrowed current-thread `Handle` cannot run I/O or timers (`Handle::block_on`
+    /// does not drive that scheduler). Callers must use [`BlockingSupervisor::from_runtime`]
+    /// or an owned multi-thread supervisor.
+    fn block_on_from_sync_thread<F: Future>(&self, future: F) -> F::Output {
         match self {
             Self::Owned(runtime) => runtime.get().block_on(future),
-            Self::Handle(handle) => handle.block_on(future),
+            Self::Handle(handle) => {
+                if handle.runtime_flavor() == RuntimeFlavor::CurrentThread {
+                    panic!(
+                        "shepherd::blocking::from_handle cannot drive a current-thread runtime: \
+                         Handle::block_on does not run I/O or timers on current-thread. \
+                         Use BlockingSupervisor::from_runtime(runtime) from synchronous code, \
+                         or BlockingSupervisor::new()."
+                    );
+                }
+                handle.block_on(future)
+            }
         }
     }
 }
@@ -133,10 +146,10 @@ impl BlockingSupervisor {
 
     /// Wraps an existing runtime handle and default adapters.
     ///
-    /// The handle's runtime must outlive this supervisor. Prefer a multi-thread
-    /// runtime. A current-thread handle only works when this thread is not
-    /// already driving that runtime; otherwise Tokio panics. See the module
-    /// docs.
+    /// The handle's runtime must outlive this supervisor and must be
+    /// multi-thread. A current-thread handle cannot be driven by `Handle::block_on`
+    /// (no I/O or timers) and deadlocks if used from its own driver thread.
+    /// Use [`Self::from_runtime`] or [`Self::new`] for current-thread callers.
     #[must_use]
     pub fn from_handle(handle: Handle) -> Self {
         Self::from_handle_and_builder(handle, SupervisorBuilder::new())
@@ -400,7 +413,6 @@ impl BlockingSupervisor {
         spec: ProcessSpec,
         options: RunOptions,
     ) -> Result<BlockingRun, BlockingRunError> {
-        let started = Instant::now();
         let scope = self.inner.try_create_scope()?;
         let mut admitted = None;
         let attempt = async {
@@ -410,36 +422,29 @@ impl BlockingSupervisor {
             Ok::<_, BlockingRunError>((pid, exit))
         };
         let outcome = tokio::time::timeout(options.deadline, attempt).await;
-        let leftover = options.deadline.saturating_sub(started.elapsed());
         match outcome {
             Ok(Ok((pid, exit))) => {
+                // Cleanup uses the caller's terminate budget, not leftover
+                // deadline crumbs: a process that exits at T-1ms must still
+                // get a verified group reap. Drain pipes after reap.
+                let termination = self.finish_scope(scope, options.terminate).await?;
                 let output = drain_output(self.inner.take_output(pid), options.output_drain).await;
-                let termination = self
-                    .inner
-                    .terminate_scope(scope, bound_terminate(options.terminate, leftover))
-                    .await?;
                 Ok(BlockingRun::Completed {
                     exit,
                     output,
                     termination,
                 })
             }
-            Ok(Err(error)) => {
-                let _ = self
-                    .inner
-                    .terminate_scope(scope, bound_terminate(options.terminate, leftover))
-                    .await;
-                Err(error)
-            }
+            Ok(Err(error)) => Err(self
+                .finish_scope_after_error(scope, options.terminate, error)
+                .await),
             Err(_) => {
                 let pid = admitted.or_else(|| {
                     self.inner
                         .processes(scope)
                         .and_then(|ids| ids.into_iter().next())
                 });
-                // Cleanup is not starved by a fully consumed deadline: the host
-                // still needs a confirmed group kill and reap.
-                let termination = self.inner.terminate_scope(scope, options.terminate).await?;
+                let termination = self.finish_scope(scope, options.terminate).await?;
                 let output = match pid {
                     Some(pid) => {
                         drain_output(self.inner.take_output(pid), options.output_drain).await
@@ -453,6 +458,30 @@ impl BlockingSupervisor {
             }
         }
     }
+
+    async fn finish_scope(
+        &self,
+        scope: ProcessScopeId,
+        opts: TerminateOptions,
+    ) -> Result<ScopeTerminationReport, BlockingRunError> {
+        Ok(self.inner.terminate_scope(scope, opts).await?)
+    }
+
+    async fn finish_scope_after_error(
+        &self,
+        scope: ProcessScopeId,
+        opts: TerminateOptions,
+        error: BlockingRunError,
+    ) -> BlockingRunError {
+        match self.finish_scope(scope, opts).await {
+            Ok(termination) if termination.all_verified() => error,
+            Ok(termination) => BlockingRunError::Unverified {
+                run: Some(Box::new(error)),
+                termination,
+            },
+            Err(cleanup) => cleanup,
+        }
+    }
 }
 
 fn drive_with<F>(driver: &Driver, future: F) -> F::Output
@@ -461,26 +490,25 @@ where
     F::Output: Send,
 {
     match Handle::try_current() {
-        Err(_) => driver.block_on(future),
+        Err(_) => driver.block_on_from_sync_thread(future),
         Ok(current) if current.id() == driver.handle().id() => {
+            if current.runtime_flavor() == RuntimeFlavor::CurrentThread {
+                panic!(
+                    "shepherd::blocking cannot drive a current-thread runtime from the thread \
+                     that is already running it (nested block_on deadlocks). \
+                     Use BlockingSupervisor::new() or call from a thread that is not that \
+                     runtime's driver."
+                );
+            }
             tokio::task::block_in_place(|| driver.handle().block_on(future))
         }
         Ok(_) => std::thread::scope(|scope| {
             scope
-                .spawn(|| driver.block_on(future))
+                .spawn(|| driver.block_on_from_sync_thread(future))
                 .join()
                 .unwrap_or_else(|payload| resume_unwind(payload))
         }),
     }
-}
-
-fn bound_terminate(mut opts: TerminateOptions, leftover: Duration) -> TerminateOptions {
-    if leftover.is_zero() {
-        return opts;
-    }
-    opts.grace = crate::GracePeriod::new(opts.grace.as_duration().min(leftover));
-    opts.force_timeout = Some(opts.force_timeout.unwrap_or(leftover).min(leftover));
-    opts
 }
 
 async fn drain_output(output: Option<ProcessOutput>, budget: Duration) -> Option<OutputSnapshot> {
@@ -695,6 +723,22 @@ impl BlockingRun {
             Self::Completed { output, .. } | Self::TimedOut { output, .. } => output.as_ref(),
         }
     }
+
+    /// Converts an unverified cleanup report into an error. `run` itself still
+    /// returns `TimedOut`/`Completed` so the host can inspect the report; this
+    /// helper is for callers that treat anything short of confirmed reap as
+    /// failure.
+    #[allow(clippy::result_large_err)]
+    pub fn into_verified(self) -> Result<Self, BlockingRunError> {
+        if self.all_verified() {
+            Ok(self)
+        } else {
+            Err(BlockingRunError::Unverified {
+                run: None,
+                termination: self.termination().clone(),
+            })
+        }
+    }
 }
 
 /// Failure of a deadline-bounded run other than timeout.
@@ -703,13 +747,22 @@ pub enum BlockingRunError {
     /// Supervisor no longer admits scopes.
     #[error(transparent)]
     Scope(#[from] ScopeCreationError),
-    /// Spawn failed; the scope is still cleaned up before this is returned.
+    /// Spawn failed after the scope was admitted. Cleanup was still attempted.
     #[error(transparent)]
     Spawn(#[from] SpawnError),
-    /// Waiting for the process failed.
+    /// Waiting for the process failed. Cleanup was still attempted.
     #[error(transparent)]
     Wait(#[from] WaitError),
-    /// Scope cleanup could not be completed.
+    /// Scope cleanup itself failed (preferred over a swallowed spawn/wait error).
     #[error(transparent)]
     Terminate(#[from] TerminateError),
+    /// Spawn or wait failed, or the caller asked for a verified report, and
+    /// scope cleanup returned without confirming reap.
+    #[error("scope cleanup was not verified")]
+    Unverified {
+        /// The original spawn/wait error, when cleanup ran because that failed.
+        run: Option<Box<BlockingRunError>>,
+        /// The cleanup report. Inspect outcomes before assuming children are gone.
+        termination: ScopeTerminationReport,
+    },
 }

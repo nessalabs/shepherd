@@ -304,6 +304,27 @@ async fn blocking_run_from_inside_application_runtime() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn run_deadline_kills_hanging_cmd() {
+    let sup = supervisor();
+    let spec = captured(
+        ProcessSpec::new("cmd.exe")
+            .args(["/C", "echo closed-ready& ping -n 40 127.0.0.1 >NUL"])
+            .env(EnvPolicy::Clear(Vec::new())),
+    );
+    let started = Instant::now();
+    let run = sup
+        .run_with_options(spec, run_opts(Duration::from_millis(600)))
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "hanging cmd must not escape the deadline"
+    );
+    assert!(run.timed_out());
+    assert!(run.all_verified(), "{:?}", run.termination());
+}
+
 #[test]
 fn launch_probe_cleared_environment() {
     let dir = std::env::temp_dir().join(format!("shepherd-blocking-launch-{}", std::process::id()));

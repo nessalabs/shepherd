@@ -33,19 +33,24 @@ Driving a future never calls `block_on` from inside the same Tokio context:
 | Same multi-thread runtime | `tokio::task::block_in_place` + `Handle::block_on` |
 | A different runtime | a scoped helper thread calls `block_on` outside Tokio |
 
-A current-thread handle used from the thread that is already driving that
-runtime cannot block safely; Tokio panics. That combination is unsupported.
-Use an owned multi-thread supervisor, or call from a thread that is not the
-current-thread driver.
+A current-thread `Handle` is refused at drive time: `Handle::block_on` does
+not run that scheduler's I/O or timers, and using it from the driver thread
+deadlocks. `from_runtime` (owned `Runtime::block_on`) is the supported
+current-thread path from ordinary synchronous code. Same-runtime current-thread
+calls panic with that explanation instead of hanging.
 
 `with_scope` / `with_scope_options` accept a synchronous closure. The body
 runs through the same async scope guard (ADR 0017). A panic is caught so
 cleanup can finish, then resumed. Nested blocks remain independent scopes.
 
 `run` / `run_with_options` bound the *whole* attempt — spawn and wait, not
-only reading output. On expiry they `terminate_scope` and require the usual
-verified group/job reap. Callers express a cleared environment and a byte-capped
-capture through `ProcessSpec` (`EnvPolicy::Clear`, `OutputMode::Capture`).
+only reading output. Cleanup always uses the caller's `TerminateOptions`,
+never leftover deadline crumbs, so a process that exits at T−1ms still gets
+a verified group reap. Spawn or wait errors do not hide a later
+`terminate_scope` failure. On expiry they `terminate_scope` and the host
+checks `all_verified()` / `into_verified()`. Callers express a cleared
+environment and a byte-capped capture through `ProcessSpec`
+(`EnvPolicy::Clear`, `OutputMode::Capture`).
 
 ## Consequences
 

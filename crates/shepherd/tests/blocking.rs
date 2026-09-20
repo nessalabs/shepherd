@@ -7,11 +7,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use shepherd::blocking::{BlockingSupervisor, BlockingSupervisorBuilder, RunOptions};
-use shepherd::{
-    GracePeriod, NullBackend, ProcessSpec, ScopeCreationError, SpawnError, SupervisorBuilder,
-    TerminateOptions, TerminationOutcome,
+use async_trait::async_trait;
+use shepherd::blocking::{
+    BlockingRunError, BlockingSupervisor, BlockingSupervisorBuilder, RunOptions,
 };
+use shepherd::{
+    GracePeriod, NullBackend, ProcessBackend, ProcessSpec, ScopeCreationError, SpawnError, Spawned,
+    SupervisorBuilder, TerminateError, TerminateOptions, TerminationOutcome, WaitError,
+};
+use shepherd_domain::{ProcessScopeId, RawExit, RawStats, Signal};
 
 fn supervisor() -> BlockingSupervisor {
     BlockingSupervisor::builder()
@@ -369,6 +373,112 @@ async fn byo_handle_from_inside_same_multi_thread_runtime() {
     assert!(!run.timed_out());
 }
 
+#[test]
+fn run_zero_deadline_still_confirms_cleanup() {
+    let sup = supervisor();
+    let run = sup
+        .run_with_options(
+            ProcessSpec::new("ignore-graceful"),
+            run_opts(Duration::ZERO),
+        )
+        .unwrap();
+    assert!(run.timed_out());
+    assert!(
+        run.all_verified(),
+        "deadline 0 must still terminate and reap: {:?}",
+        run.termination()
+    );
+}
+
+#[test]
+fn run_near_deadline_success_does_not_starve_cleanup() {
+    let sup = supervisor();
+    let run = sup
+        .run_with_options(
+            ProcessSpec::new("exit-immediately"),
+            run_opts(Duration::from_millis(1)),
+        )
+        .unwrap();
+    // Either the wait won the race or the deadline did; both must verify reap.
+    assert!(
+        run.all_verified(),
+        "a 1ms leftover must not clamp terminate to a failed reap: {:?}",
+        run.termination()
+    );
+    run.into_verified().expect("verified");
+}
+
+#[test]
+fn run_spawn_failure_still_terminates_the_admitted_scope() {
+    let backend = FailSpawnThenCleanup::default();
+    let sup = BlockingSupervisor::builder()
+        .backend(Arc::new(backend))
+        .build()
+        .unwrap();
+    let err = sup
+        .run_with_options(
+            ProcessSpec::new("anything"),
+            run_opts(Duration::from_secs(2)),
+        )
+        .expect_err("spawn and cleanup both fail");
+    assert!(
+        matches!(err, BlockingRunError::Terminate(_)),
+        "cleanup failure must not be hidden behind spawn: {err:?}"
+    );
+}
+
+#[test]
+fn run_spawn_failure_with_verified_cleanup_returns_spawn() {
+    let backend = FailSpawnOnly::default();
+    let sup = BlockingSupervisor::builder()
+        .backend(Arc::new(backend))
+        .build()
+        .unwrap();
+    let err = sup
+        .run_with_options(
+            ProcessSpec::new("anything"),
+            run_opts(Duration::from_secs(2)),
+        )
+        .expect_err("spawn fails");
+    assert!(
+        matches!(err, BlockingRunError::Spawn(_)),
+        "verified cleanup should preserve the spawn error: {err:?}"
+    );
+}
+
+#[test]
+fn from_handle_current_thread_from_sync_panics_instead_of_hanging() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sup = BlockingSupervisor::from_handle_and_builder(
+        runtime.handle().clone(),
+        SupervisorBuilder::new().backend(Arc::new(NullBackend::new())),
+    );
+    let scope = sup.create_scope();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = sup.spawn(scope, ProcessSpec::new("exit-immediately"));
+    }));
+    assert!(panicked.is_err(), "must refuse current-thread from_handle");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn byo_current_thread_same_runtime_panics_instead_of_deadlocking() {
+    let sup = BlockingSupervisor::from_handle_and_builder(
+        tokio::runtime::Handle::current(),
+        SupervisorBuilder::new().backend(Arc::new(NullBackend::new())),
+    );
+    let scope = sup.create_scope();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = sup.spawn(scope, ProcessSpec::new("exit-immediately"));
+    }));
+    assert!(
+        panicked.is_err(),
+        "same current-thread from_handle must panic, not deadlock"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owned_runtime_from_inside_foreign_multi_thread_runtime() {
     let sup = supervisor();
@@ -379,4 +489,91 @@ async fn owned_runtime_from_inside_foreign_multi_thread_runtime() {
     );
     assert_eq!(result.result.unwrap(), TerminationOutcome::ExitedNaturally);
     assert!(result.termination.unwrap().all_verified());
+}
+
+#[derive(Default)]
+struct FailSpawnThenCleanup {
+    inner: NullBackend,
+}
+
+#[async_trait]
+impl ProcessBackend for FailSpawnThenCleanup {
+    async fn spawn(
+        &self,
+        _scope: ProcessScopeId,
+        _spec: &ProcessSpec,
+    ) -> Result<Spawned, SpawnError> {
+        Err(SpawnError::Os("injected spawn failure".into()))
+    }
+    async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+        self.inner.signal(target, signal).await
+    }
+    async fn signal_scope(
+        &self,
+        scope: ProcessScopeId,
+        signal: Signal,
+    ) -> Result<(), TerminateError> {
+        self.inner.signal_scope(scope, signal).await
+    }
+    async fn cleanup_scope(&self, _scope: ProcessScopeId) -> Result<(), TerminateError> {
+        Err(TerminateError::Signal(
+            "injected containment failure".into(),
+        ))
+    }
+    async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
+        self.inner.wait(target).await
+    }
+    async fn sample(&self, target: &Spawned) -> Result<RawStats, shepherd::StatsError> {
+        self.inner.sample(target).await
+    }
+    fn capabilities(&self) -> shepherd::Capabilities {
+        self.inner.capabilities()
+    }
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.inner.hard_kill_scope(scope);
+    }
+    fn hard_kill_all(&self) {
+        self.inner.hard_kill_all();
+    }
+}
+
+#[derive(Default)]
+struct FailSpawnOnly {
+    inner: NullBackend,
+}
+
+#[async_trait]
+impl ProcessBackend for FailSpawnOnly {
+    async fn spawn(
+        &self,
+        _scope: ProcessScopeId,
+        _spec: &ProcessSpec,
+    ) -> Result<Spawned, SpawnError> {
+        Err(SpawnError::Os("injected spawn failure".into()))
+    }
+    async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+        self.inner.signal(target, signal).await
+    }
+    async fn signal_scope(
+        &self,
+        scope: ProcessScopeId,
+        signal: Signal,
+    ) -> Result<(), TerminateError> {
+        self.inner.signal_scope(scope, signal).await
+    }
+    async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
+        self.inner.wait(target).await
+    }
+    async fn sample(&self, target: &Spawned) -> Result<RawStats, shepherd::StatsError> {
+        self.inner.sample(target).await
+    }
+    fn capabilities(&self) -> shepherd::Capabilities {
+        self.inner.capabilities()
+    }
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.inner.hard_kill_scope(scope);
+    }
+    fn hard_kill_all(&self) {
+        self.inner.hard_kill_all();
+    }
 }
