@@ -59,8 +59,12 @@ async fn natural_exit_is_reported() {
         .spawn(scope, ProcessSpec::new("exit-immediately"))
         .await
         .unwrap();
+    let os = sup
+        .os_pid(pid)
+        .expect("OS pid remains after an immediate natural exit");
     let exit = sup.wait(pid).await.unwrap();
     assert_eq!(exit.outcome, TerminationOutcome::ExitedNaturally);
+    assert_eq!(sup.os_pid(pid), Some(os));
 }
 
 #[tokio::test(start_paused = true)]

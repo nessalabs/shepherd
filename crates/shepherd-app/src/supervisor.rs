@@ -119,6 +119,36 @@ struct Inner {
     pending_outcomes: Mutex<HashMap<ProcessScopeId, HashMap<ProcessId, TerminationOutcome>>>,
     completed_scopes: Mutex<VecDeque<ProcessScopeId>>,
     shutdown_serial: tokio::sync::Mutex<()>,
+    os_pids: Mutex<OsPidHistory>,
+}
+
+/// `os_pid` must survive an immediate natural exit: spawn attaches, the monitor
+/// reaps, and prune can run before the caller looks up the OS identity.
+#[derive(Default)]
+struct OsPidHistory {
+    by_pid: HashMap<ProcessId, u32>,
+    completed: VecDeque<ProcessId>,
+}
+
+impl OsPidHistory {
+    fn remember(&mut self, pid: ProcessId, os_pid: u32) {
+        self.by_pid.insert(pid, os_pid);
+    }
+
+    fn retain_after_reap(&mut self, pid: ProcessId) {
+        if self.by_pid.contains_key(&pid) && !self.completed.contains(&pid) {
+            self.completed.push_back(pid);
+            while self.completed.len() > 256 {
+                if let Some(old) = self.completed.pop_front() {
+                    self.by_pid.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn get(&self, pid: ProcessId) -> Option<u32> {
+        self.by_pid.get(&pid).copied()
+    }
 }
 
 // Claims and completion share this lock order; only retained captures consume history.
@@ -197,6 +227,7 @@ impl ProcessSupervisor {
                 pending_outcomes: Mutex::new(HashMap::new()),
                 completed_scopes: Mutex::new(VecDeque::new()),
                 shutdown_serial: tokio::sync::Mutex::new(()),
+                os_pids: Mutex::new(OsPidHistory::default()),
                 shutting_down: Arc::clone(&shutting_down),
                 owners_dropped: Arc::clone(&owners_dropped),
             }),
@@ -298,14 +329,24 @@ impl ProcessSupervisor {
         self.inner.backend.scope_usage(scope).await
     }
 
-    /// Returns the OS PID of a retained managed process, for read-only observation.
+    /// Returns the OS PID of a managed process, for read-only observation.
     /// Shepherd's ProcessId is a logical ID and must not be passed as an OS PID.
     /// This lookup is not proof the process is still alive; it may exit immediately.
+    /// The identity stays available after a verified reap until the same 256-entry
+    /// post-mortem bound as waiter history.
     #[must_use]
     pub fn os_pid(&self, pid: ProcessId) -> Option<u32> {
         let registry = self.lock_registry();
-        let scope = registry.scope_of(pid)?;
-        Some(registry.get(scope)?.get(pid)?.os_identity().pid)
+        if let Some(os) = registry
+            .scope_of(pid)
+            .and_then(|scope| registry.get(scope))
+            .and_then(|scope| scope.get(pid))
+            .map(|process| process.os_identity().pid)
+        {
+            return Some(os);
+        }
+        drop(registry);
+        self.inner.os_pids.lock().expect("os_pids mutex").get(pid)
     }
 
     /// Spawns a process into `scope`.
@@ -413,6 +454,11 @@ impl ProcessSupervisor {
             .lock()
             .expect("spawn_times mutex")
             .insert(pid, self.inner.clock.now());
+        self.inner
+            .os_pids
+            .lock()
+            .expect("os_pids mutex")
+            .remember(pid, spawned.os.pid);
         if let Some(output) = self.inner.backend.output(&spawned) {
             self.inner
                 .outputs
@@ -1357,6 +1403,11 @@ impl ProcessSupervisor {
             // verified completions are eligible for bounded post-mortem eviction.
             if verified_reap {
                 retain_completed_output(&inner, pid);
+                inner
+                    .os_pids
+                    .lock()
+                    .expect("os_pids mutex")
+                    .retain_after_reap(pid);
             }
             inner.dispatcher.dispatch(&events).await;
             inner

@@ -265,7 +265,8 @@ impl BlockingSupervisor {
         self.inner.processes(scope)
     }
 
-    /// OS PID of a retained managed process, for read-only observation.
+    /// OS PID of a managed process, for read-only observation.
+    /// Available after an immediate natural exit; not proof the child is alive.
     #[must_use]
     pub fn os_pid(&self, pid: ProcessId) -> Option<u32> {
         self.inner.os_pid(pid)
