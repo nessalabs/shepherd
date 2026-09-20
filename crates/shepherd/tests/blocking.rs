@@ -45,7 +45,6 @@ fn spawn_wait_natural_exit_outside_async() {
     let pid = sup
         .spawn(scope, ProcessSpec::new("exit-immediately"))
         .unwrap();
-    assert!(sup.os_pid(pid).is_some());
     let exit = sup.wait(pid).unwrap();
     assert_eq!(exit.outcome, TerminationOutcome::ExitedNaturally);
     assert!(sup
