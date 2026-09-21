@@ -122,32 +122,69 @@ struct Inner {
     os_pids: Mutex<OsPidHistory>,
 }
 
+/// Last 256 attached OS identities. Bound is enforced at `remember`, not on
+/// verified reap: the monitor often returns after `terminate_scope` has already
+/// dropped the registry entry, and a failed wait never reached the old evictor.
+const OS_PID_HISTORY_BOUND: usize = 256;
+
 /// `os_pid` must survive an immediate natural exit: spawn attaches, the monitor
 /// reaps, and prune can run before the caller looks up the OS identity.
-#[derive(Default)]
 struct OsPidHistory {
     by_pid: HashMap<ProcessId, u32>,
-    completed: VecDeque<ProcessId>,
+    order: VecDeque<ProcessId>,
+}
+
+impl Default for OsPidHistory {
+    fn default() -> Self {
+        Self {
+            // Headroom so a full 256-entry table does not rehash after warmup.
+            by_pid: HashMap::with_capacity(OS_PID_HISTORY_BOUND * 2),
+            order: VecDeque::with_capacity(OS_PID_HISTORY_BOUND),
+        }
+    }
 }
 
 impl OsPidHistory {
     fn remember(&mut self, pid: ProcessId, os_pid: u32) {
-        self.by_pid.insert(pid, os_pid);
-    }
-
-    fn retain_after_reap(&mut self, pid: ProcessId) {
-        if self.by_pid.contains_key(&pid) && !self.completed.contains(&pid) {
-            self.completed.push_back(pid);
-            while self.completed.len() > 256 {
-                if let Some(old) = self.completed.pop_front() {
-                    self.by_pid.remove(&old);
-                }
+        if self.by_pid.insert(pid, os_pid).is_some() {
+            return;
+        }
+        self.order.push_back(pid);
+        while self.order.len() > OS_PID_HISTORY_BOUND {
+            if let Some(old) = self.order.pop_front() {
+                self.by_pid.remove(&old);
             }
         }
     }
 
     fn get(&self, pid: ProcessId) -> Option<u32> {
         self.by_pid.get(&pid).copied()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        debug_assert_eq!(self.by_pid.len(), self.order.len());
+        self.by_pid.len()
+    }
+}
+
+#[cfg(test)]
+mod os_pid_history_tests {
+    use super::*;
+
+    #[test]
+    fn remember_evicts_oldest_without_a_verified_reap() {
+        let mut history = OsPidHistory::default();
+        let ids: Vec<_> = (0..300).map(ProcessId::new).collect();
+        for (index, pid) in ids.iter().copied().enumerate() {
+            history.remember(pid, u32::try_from(index).expect("os pid"));
+            assert!(history.len() <= OS_PID_HISTORY_BOUND);
+        }
+        assert_eq!(history.len(), OS_PID_HISTORY_BOUND);
+        assert_eq!(history.get(ids[0]), None);
+        assert_eq!(history.get(ids[43]), None);
+        assert_eq!(history.get(ids[44]), Some(44));
+        assert_eq!(history.get(ids[299]), Some(299));
     }
 }
 
@@ -332,8 +369,10 @@ impl ProcessSupervisor {
     /// Returns the OS PID of a managed process, for read-only observation.
     /// Shepherd's ProcessId is a logical ID and must not be passed as an OS PID.
     /// This lookup is not proof the process is still alive; it may exit immediately.
-    /// The identity stays available after a verified reap until the same 256-entry
-    /// post-mortem bound as waiter history.
+    /// The identity stays available after an immediate natural exit until the
+    /// same 256-entry post-mortem bound as waiter history. The bound is the last
+    /// 256 attachments, including cases where the monitor never records a
+    /// verified reap because the registry was already pruned.
     #[must_use]
     pub fn os_pid(&self, pid: ProcessId) -> Option<u32> {
         let registry = self.lock_registry();
@@ -1401,13 +1440,10 @@ impl ProcessSupervisor {
             // the retention bound after waiters have observed the terminal exit.
             // A failed reap may leave a live producer behind this observer. Only
             // verified completions are eligible for bounded post-mortem eviction.
+            // `os_pid` history is bounded at attach: this path often runs after
+            // terminate_scope has already dropped the registry entry.
             if verified_reap {
                 retain_completed_output(&inner, pid);
-                inner
-                    .os_pids
-                    .lock()
-                    .expect("os_pids mutex")
-                    .retain_after_reap(pid);
             }
             inner.dispatcher.dispatch(&events).await;
             inner
@@ -1880,10 +1916,59 @@ mod scoped_history_tests {
                 // Both completed caches have evicted this root; registry quarantine
                 // must still authorize observing its unverified outcome.
                 assert!(!scope.wait(quarantined).await.unwrap().outcome.is_verified());
+                latest
             })
             .await;
-        assert!(result.result.is_ok());
+        let latest = result.result.expect("scoped body returned the latest pid");
         assert!(!result.termination.unwrap().all_verified());
+        assert!(
+            supervisor.inner.os_pids.lock().unwrap().len() <= OS_PID_HISTORY_BOUND,
+            "os_pid history must stay bounded across 650 immediate roots"
+        );
+        assert!(supervisor.os_pid(latest).is_some());
+    }
+
+    #[tokio::test]
+    async fn os_pid_history_stays_bounded_when_monitor_loses_the_registry() {
+        let ports = Arc::new(HistoryPorts::default());
+        let supervisor = ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports);
+        // HistoryPorts treats OS pid 1 as a quarantined wait failure.
+        let discarded = supervisor.create_scope();
+        let _ = supervisor
+            .spawn(discarded, ProcessSpec::new("unverified"))
+            .await
+            .unwrap();
+        let _ = supervisor
+            .terminate_scope(discarded, TerminateOptions::default())
+            .await;
+        let mut first = None;
+        let mut latest = None;
+        for _ in 0..300 {
+            let scope = supervisor.create_scope();
+            let pid = supervisor
+                .spawn(scope, ProcessSpec::new("immediate"))
+                .await
+                .unwrap();
+            first.get_or_insert(pid);
+            latest = Some(pid);
+            assert!(supervisor.os_pid(pid).is_some());
+            assert!(supervisor.wait(pid).await.unwrap().outcome.is_verified());
+            assert!(supervisor
+                .terminate_scope(scope, TerminateOptions::default())
+                .await
+                .unwrap()
+                .all_verified());
+            assert!(
+                supervisor.inner.os_pids.lock().unwrap().len() <= OS_PID_HISTORY_BOUND,
+                "os_pid history grew past the attach bound"
+            );
+        }
+        assert!(supervisor.os_pid(latest.unwrap()).is_some());
+        assert_eq!(supervisor.os_pid(first.unwrap()), None);
+        assert_eq!(
+            supervisor.inner.os_pids.lock().unwrap().len(),
+            OS_PID_HISTORY_BOUND
+        );
     }
 }
 
