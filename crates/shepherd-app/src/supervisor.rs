@@ -302,6 +302,70 @@ impl ProcessSupervisor {
         self.try_create_scope_before_publish(|_| {})
     }
 
+    /// Admits a scope and registers it for [`Self::wait_scope_cleanup`].
+    ///
+    /// `with_scope` and the blocking facade share this so a waiter can subscribe
+    /// before cleanup runs, and a later verified `terminate_scope` can replace
+    /// an earlier failure on the same channel.
+    ///
+    /// # Panics
+    /// Panics if shutdown has started. Use [`Self::try_create_observed_scope`]
+    /// when rejection must be handled.
+    #[must_use]
+    pub fn create_observed_scope(&self) -> ProcessScopeId {
+        self.admit_observed_scope().0
+    }
+
+    /// Fallible form of [`Self::create_observed_scope`].
+    ///
+    /// # Errors
+    /// Returns [`ScopeCreationError::SupervisorClosed`] once shutdown starts.
+    pub fn try_create_observed_scope(&self) -> Result<ProcessScopeId, ScopeCreationError> {
+        Ok(self.try_admit_observed_scope()?.0)
+    }
+
+    fn admit_observed_scope(&self) -> (ProcessScopeId, ScopeCleanupSender) {
+        self.try_admit_observed_scope()
+            .expect("cannot create a scope after supervisor shutdown starts")
+    }
+
+    fn try_admit_observed_scope(
+        &self,
+    ) -> Result<(ProcessScopeId, ScopeCleanupSender), ScopeCreationError> {
+        let (report_tx, _) = tokio::sync::watch::channel(None);
+        let sender = report_tx.clone();
+        let scope = self.try_create_scope_before_publish(|scope| {
+            self.inner
+                .scope_results
+                .lock()
+                .expect("scope results mutex")
+                .insert(scope, sender);
+        })?;
+        Ok((scope, report_tx))
+    }
+
+    /// Publishes a `with_scope` cleanup result onto the shared observation channel.
+    ///
+    /// A verified success is not overwritten. An earlier failure is replaced when
+    /// a later `terminate_scope` recovers. No-ops if `scope` was not admitted
+    /// through [`Self::create_observed_scope`].
+    pub fn record_scoped_cleanup(
+        &self,
+        scope: ProcessScopeId,
+        result: Result<ScopeTerminationReport, TerminateError>,
+    ) {
+        let sender = self
+            .inner
+            .scope_results
+            .lock()
+            .expect("scope results mutex")
+            .get(&scope)
+            .cloned();
+        if let Some(sender) = sender {
+            publish_scope_cleanup_result(&sender, result);
+        }
+    }
+
     // The callback lets the concurrency regression pause at the publication boundary.
     fn create_scope_before_publish(
         &self,
@@ -547,15 +611,9 @@ impl ProcessSupervisor {
         let guard = ScopeExit {
             finish: Some(finish),
         };
-        let (report_tx, mut report_rx) = tokio::sync::watch::channel(None);
         // Register observation before shutdown can discover this scope.
-        let scope = self.create_scope_before_publish(|scope| {
-            self.inner
-                .scope_results
-                .lock()
-                .expect("scope results mutex")
-                .insert(scope, report_tx.clone());
-        });
+        let (scope, report_tx) = self.admit_observed_scope();
+        let mut report_rx = report_tx.subscribe();
         let worker = self.worker();
         let backstop = ScopeCleanupBackstop {
             backend: self.inner.backend.clone(),
@@ -601,13 +659,7 @@ impl ProcessSupervisor {
         }
         let result = match spawn_error {
             Some(error) => Err(error),
-            None => Ok(body(ScopedProcesses {
-                scope,
-                owned: Mutex::new(processes.iter().copied().collect()),
-                processes,
-                supervisor: self.worker(),
-            })
-            .await),
+            None => Ok(body(ScopedProcesses::new(self.worker(), scope, processes)).await),
         };
         drop(guard); // same cleanup path for success, closure error, panic, and cancel
         let termination = loop {
@@ -1499,11 +1551,33 @@ pub struct ScopedProcesses {
     supervisor: ProcessSupervisor,
 }
 impl ScopedProcesses {
+    /// Builds a scoped handle that prunes authorization with the supervisor's
+    /// live registry and bounded observation history.
+    #[must_use]
+    pub fn new(
+        supervisor: ProcessSupervisor,
+        scope: ProcessScopeId,
+        processes: Vec<ProcessId>,
+    ) -> Self {
+        Self {
+            scope,
+            owned: Mutex::new(processes.iter().copied().collect()),
+            processes,
+            supervisor: supervisor.worker(),
+        }
+    }
+
     pub fn id(&self) -> ProcessScopeId {
         self.scope
     }
     pub fn processes(&self) -> &[ProcessId] {
         &self.processes
+    }
+
+    /// Process ids this handle still authorizes after pruning expired history.
+    #[must_use]
+    pub fn authorized_len(&self) -> usize {
+        self.observable_owned().len()
     }
     // Retain authorization while any owned process or bounded observation remains.
     // The lock order extends the supervisor's registry -> outputs/waiters order; no

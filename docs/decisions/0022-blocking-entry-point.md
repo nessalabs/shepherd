@@ -30,7 +30,7 @@ Driving a future never calls `block_on` from inside the same Tokio context:
 | Caller context | Action |
 | --- | --- |
 | No current handle | `Runtime::block_on` or `Handle::block_on` |
-| Same multi-thread runtime | `tokio::task::block_in_place` + `Handle::block_on` |
+| Same multi-thread runtime | a scoped helper thread calls `Handle::block_on` (also the `LocalSet` path; `block_in_place` is forbidden there) |
 | A different runtime | a scoped helper thread calls `block_on` outside Tokio |
 
 A current-thread `Handle` is refused at drive time: `Handle::block_on` does
@@ -45,12 +45,19 @@ runs on the calling thread **outside** any driven future: each `spawn` /
 current-thread runtime taken via `from_runtime` can still spawn and wait
 from the body — putting the body *inside* `Runtime::block_on` made those
 nested calls see `Handle::try_current` and panic (nested `block_on`
-deadlocks on current-thread). A panic is caught so cleanup can finish
-(`terminate_scope` + bounded `wait_scope_cleanup` history), then resumed.
+deadlocks on current-thread). Admission uses the supervisor's observed-scope
+channel so `wait_scope_cleanup` can register before the body returns and a
+later verified `terminate_scope` can replace a failed first cleanup. The
+body handle is the async `ScopedProcesses` type, so authorization prunes
+with live membership and the 256-entry observation histories instead of
+retaining every id. A panic is caught so cleanup can finish
+(`terminate_scope` + shared `wait_scope_cleanup` channel), then resumed.
 Nested blocks remain independent scopes.
 
 `run` / `run_with_options` bound the *whole* attempt — spawn and wait, not
-only reading output. Cleanup always uses the caller's `TerminateOptions`,
+only reading output. The capture observer is claimed at admission so a
+delayed scope sweep cannot lose it to the supervisor-wide 256-entry
+unclaimed-output history. Cleanup always uses the caller's `TerminateOptions`,
 never leftover deadline crumbs, so a process that exits at T−1ms still gets
 a verified group reap. Spawn or wait errors do not hide a later
 `terminate_scope` failure. On expiry they `terminate_scope` and the host

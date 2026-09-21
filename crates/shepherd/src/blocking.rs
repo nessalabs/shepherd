@@ -5,7 +5,9 @@
 //! caller-supplied handle, drives every future. When the caller is already
 //! inside Tokio:
 //!
-//! * same runtime (multi-thread): `block_in_place` + `Handle::block_on`
+//! * same runtime (multi-thread): a scoped helper thread calls `Handle::block_on`
+//!   (`block_in_place` is forbidden inside a `LocalSet`, including on a
+//!   multi-thread runtime)
 //! * a different runtime: a scoped helper thread calls `block_on` outside Tokio
 //!
 //! A current-thread `Handle` is rejected: `Handle::block_on` does not drive
@@ -20,13 +22,12 @@
 //! `shutdown_background` so Tokio does not panic. Call `shutdown()` first when
 //! you need verified cleanup.
 //!
-//! The async `ProcessSupervisor` surface is unchanged. Domain code is not
-//! involved.
+//! The async lifecycle API is unchanged aside from shared observation helpers
+//! used by this facade. Domain code is not involved.
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
@@ -34,8 +35,8 @@ use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 use crate::{
     ObservationError, OutputSnapshot, ProcessExit, ProcessId, ProcessOutput, ProcessScopeId,
     ProcessSpec, ProcessStats, ProcessSupervisor, ScopeCreationError, ScopeTerminationReport,
-    ScopeUsage, ShutdownError, ShutdownReport, SpawnError, StatsError, SupervisorBuilder,
-    TerminateError, TerminateOptions, WaitError, WithScopeResult,
+    ScopeUsage, ScopedProcesses, ShutdownError, ShutdownReport, SpawnError, StatsError,
+    SupervisorBuilder, TerminateError, TerminateOptions, WaitError, WithScopeResult,
 };
 
 /// Owns or borrows a Tokio runtime and exposes the supervisor synchronously.
@@ -46,36 +47,6 @@ use crate::{
 pub struct BlockingSupervisor {
     inner: ProcessSupervisor,
     driver: Driver,
-    scoped_cleanups: Arc<Mutex<ScopedCleanupHistory>>,
-}
-
-const SCOPED_CLEANUP_HISTORY: usize = 256;
-
-#[derive(Default)]
-struct ScopedCleanupHistory {
-    reports: HashMap<ProcessScopeId, Result<ScopeTerminationReport, TerminateError>>,
-    order: VecDeque<ProcessScopeId>,
-}
-
-impl ScopedCleanupHistory {
-    fn insert(
-        &mut self,
-        scope: ProcessScopeId,
-        result: Result<ScopeTerminationReport, TerminateError>,
-    ) {
-        if self.reports.insert(scope, result).is_none() {
-            self.order.push_back(scope);
-        }
-        while self.order.len() > SCOPED_CLEANUP_HISTORY {
-            if let Some(old) = self.order.pop_front() {
-                self.reports.remove(&old);
-            }
-        }
-    }
-
-    fn get(&self, scope: ProcessScopeId) -> Option<Result<ScopeTerminationReport, TerminateError>> {
-        self.reports.get(&scope).cloned()
-    }
 }
 
 #[derive(Clone)]
@@ -213,11 +184,7 @@ impl BlockingSupervisor {
     }
 
     fn compose(inner: ProcessSupervisor, driver: Driver) -> Self {
-        Self {
-            inner,
-            driver,
-            scoped_cleanups: Arc::new(Mutex::new(ScopedCleanupHistory::default())),
-        }
+        Self { inner, driver }
     }
 
     /// The underlying async supervisor. Do not detach a clone past this wrapper's
@@ -326,14 +293,6 @@ impl BlockingSupervisor {
         &self,
         scope: ProcessScopeId,
     ) -> Result<ScopeTerminationReport, TerminateError> {
-        if let Some(result) = self
-            .scoped_cleanups
-            .lock()
-            .expect("scoped cleanup history")
-            .get(scope)
-        {
-            return result;
-        }
         self.drive(self.inner.wait_scope_cleanup(scope))
     }
 
@@ -371,7 +330,9 @@ impl BlockingSupervisor {
     /// and panic (or deadlock) on current-thread.
     ///
     /// A panic in the body still completes verified cleanup, then the panic is
-    /// resumed. Observe that report with [`Self::wait_scope_cleanup`].
+    /// resumed. Observe that report with [`Self::wait_scope_cleanup`] — the
+    /// scope is registered on the shared supervisor channel at admission, so a
+    /// waiter can subscribe before the body returns.
     ///
     /// # Panics
     /// Panics if shutdown has started before the scope is admitted, or if `body`
@@ -402,7 +363,9 @@ impl BlockingSupervisor {
         // Do not drive the body as part of an async `with_scope` future.
         // `drive` enters the runtime; a nested spawn/wait then hits the
         // same-runtime current-thread refusal (or a nested `block_on`).
-        let scope = self.create_scope();
+        // Register the shared cleanup channel before the body so another
+        // thread can `wait_scope_cleanup` without seeing UnknownScope.
+        let scope = self.inner.create_observed_scope();
         let mut processes = Vec::new();
         let mut spawn_error = None;
         for spec in specs {
@@ -419,24 +382,20 @@ impl BlockingSupervisor {
             Some(error) => Err(error),
             None => {
                 let handle = BlockingScopedProcesses {
-                    supervisor: self.inner.clone(),
-                    scope,
-                    processes: processes.clone(),
-                    owned: Mutex::new(processes.iter().copied().collect()),
+                    inner: ScopedProcesses::new(self.inner.clone(), scope, processes),
                     driver: self.driver.clone(),
                 };
                 match catch_unwind(AssertUnwindSafe(|| body(handle))) {
                     Ok(value) => Ok(value),
                     Err(panic) => {
-                        self.finish_blocking_scope(scope, opts);
+                        let _ = self.finish_observed_scope(scope, opts);
                         resume_unwind(panic);
                     }
                 }
             }
         };
 
-        let termination = self.terminate_scope(scope, opts);
-        self.remember_scoped_cleanup(scope, termination.clone());
+        let termination = self.finish_observed_scope(scope, opts);
         WithScopeResult {
             scope,
             result,
@@ -444,20 +403,16 @@ impl BlockingSupervisor {
         }
     }
 
-    fn finish_blocking_scope(&self, scope: ProcessScopeId, opts: TerminateOptions) {
-        let termination = self.terminate_scope(scope, opts);
-        self.remember_scoped_cleanup(scope, termination);
-    }
-
-    fn remember_scoped_cleanup(
+    fn finish_observed_scope(
         &self,
         scope: ProcessScopeId,
-        termination: Result<ScopeTerminationReport, TerminateError>,
-    ) {
-        self.scoped_cleanups
-            .lock()
-            .expect("scoped cleanup history")
-            .insert(scope, termination);
+        opts: TerminateOptions,
+    ) -> Result<ScopeTerminationReport, TerminateError> {
+        let termination = self.terminate_scope(scope, opts);
+        // terminate_scope publishes verified success. Failures and unverified
+        // reports must still wake waiters, and a later retry overwrites them.
+        self.inner.record_scoped_cleanup(scope, termination.clone());
+        termination
     }
 
     /// Runs one process with a deadline that covers spawn, wait, and cleanup.
@@ -495,20 +450,25 @@ impl BlockingSupervisor {
     ) -> Result<BlockingRun, BlockingRunError> {
         let scope = self.inner.try_create_scope()?;
         let mut admitted = None;
+        let mut capture = None;
         let attempt = async {
             let pid = self.inner.spawn(scope, spec).await?;
+            // Own the observer at admission. Unclaimed completed captures live
+            // in a supervisor-wide 256-entry history; a delayed cleanup must
+            // not let other processes evict this run's output.
+            capture = self.inner.take_output(pid);
             admitted = Some(pid);
             let exit = self.inner.wait(pid).await?;
             Ok::<_, BlockingRunError>((pid, exit))
         };
         let outcome = tokio::time::timeout(options.deadline, attempt).await;
         match outcome {
-            Ok(Ok((pid, exit))) => {
+            Ok(Ok((_pid, exit))) => {
                 // Cleanup uses the caller's terminate budget, not leftover
                 // deadline crumbs: a process that exits at T-1ms must still
-                // get a verified group reap. Drain pipes after reap.
+                // get a verified group reap. Drain the observer we already own.
                 let termination = self.finish_scope(scope, options.terminate).await?;
-                let output = drain_output(self.inner.take_output(pid), options.output_drain).await;
+                let output = drain_output(capture, options.output_drain).await;
                 Ok(BlockingRun::Completed {
                     exit,
                     output,
@@ -521,22 +481,27 @@ impl BlockingSupervisor {
             Err(_) => {
                 // `admitted` is only set after `spawn` returns. If the deadline
                 // cancelled the JoinHandle await, spawn_owned may still be
-                // holding the scope lock; terminate_scope waits for it. Look
-                // the pid up again from the cleanup report so capture is not
-                // lost when admission raced the timeout.
+                // holding the scope lock; terminate_scope waits for it. Claim
+                // capture before that sweep so a delayed cleanup cannot lose it.
                 let pid = admitted.or_else(|| {
                     self.inner
                         .processes(scope)
                         .and_then(|ids| ids.into_iter().next())
                 });
-                let termination = self.finish_scope(scope, options.terminate).await?;
-                let pid = pid.or_else(|| termination.outcomes.first().map(|(id, _)| *id));
-                let output = match pid {
-                    Some(pid) => {
-                        drain_output(self.inner.take_output(pid), options.output_drain).await
+                if capture.is_none() {
+                    if let Some(pid) = pid {
+                        capture = self.inner.take_output(pid);
                     }
-                    None => None,
-                };
+                }
+                let termination = self.finish_scope(scope, options.terminate).await?;
+                if capture.is_none() {
+                    if let Some(pid) =
+                        pid.or_else(|| termination.outcomes.first().map(|(id, _)| *id))
+                    {
+                        capture = self.inner.take_output(pid);
+                    }
+                }
+                let output = drain_output(capture, options.output_drain).await;
                 Ok(BlockingRun::TimedOut {
                     output,
                     termination,
@@ -570,6 +535,19 @@ impl BlockingSupervisor {
     }
 }
 
+fn drive_on_helper_thread<F>(driver: &Driver, future: F) -> F::Output
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| driver.block_on_from_sync_thread(future))
+            .join()
+            .unwrap_or_else(|payload| resume_unwind(payload))
+    })
+}
+
 fn drive_with<F>(driver: &Driver, future: F) -> F::Output
 where
     F: Future + Send,
@@ -586,14 +564,12 @@ where
                      runtime's driver."
                 );
             }
-            tokio::task::block_in_place(|| driver.handle().block_on(future))
+            // `block_in_place` is forbidden inside a LocalSet even when the
+            // underlying runtime is multi-thread. A helper thread can always
+            // call Handle::block_on from outside Tokio.
+            drive_on_helper_thread(driver, future)
         }
-        Ok(_) => std::thread::scope(|scope| {
-            scope
-                .spawn(|| driver.block_on_from_sync_thread(future))
-                .join()
-                .unwrap_or_else(|payload| resume_unwind(payload))
-        }),
+        Ok(_) => drive_on_helper_thread(driver, future),
     }
 }
 
@@ -666,8 +642,8 @@ impl BlockingSupervisorBuilder {
         self
     }
 
-    /// Sets the owned multi-thread worker count. Values below 2 become 2 so a
-    /// `with_scope` body can `block_in_place` while monitors still run.
+    /// Sets the owned multi-thread worker count. Values below 2 become 2 so
+    /// monitors keep running while a helper thread drives a nested call.
     #[must_use]
     pub fn worker_threads(mut self, threads: usize) -> Self {
         self.worker_threads = threads.max(2);
@@ -693,10 +669,7 @@ impl BlockingSupervisorBuilder {
 
 /// Access to a blocking `with_scope` block. Valid only for the duration of the body.
 pub struct BlockingScopedProcesses {
-    supervisor: ProcessSupervisor,
-    scope: ProcessScopeId,
-    processes: Vec<ProcessId>,
-    owned: Mutex<HashSet<ProcessId>>,
+    inner: ScopedProcesses,
     driver: Driver,
 }
 
@@ -704,14 +677,20 @@ impl BlockingScopedProcesses {
     /// The scope id for this block.
     #[must_use]
     pub fn id(&self) -> ProcessScopeId {
-        self.scope
+        self.inner.id()
     }
 
     /// Snapshot of process ids admitted with the block. Later scoped spawns
     /// are tracked separately for wait/output authorization.
     #[must_use]
     pub fn processes(&self) -> &[ProcessId] {
-        &self.processes
+        self.inner.processes()
+    }
+
+    /// Process ids this handle still authorizes after pruning expired history.
+    #[must_use]
+    pub fn authorized_len(&self) -> usize {
+        self.inner.authorized_len()
     }
 
     /// Spawns into this block's scope.
@@ -719,12 +698,7 @@ impl BlockingScopedProcesses {
     /// # Errors
     /// Returns [`SpawnError`] if the scope is closed or the OS spawn fails.
     pub fn spawn(&self, spec: ProcessSpec) -> Result<ProcessId, SpawnError> {
-        let pid = drive_with(&self.driver, self.supervisor.spawn(self.scope, spec))?;
-        self.owned
-            .lock()
-            .expect("scoped processes mutex")
-            .insert(pid);
-        Ok(pid)
+        drive_with(&self.driver, self.inner.spawn(spec))
     }
 
     /// Waits for a process owned by this block.
@@ -732,29 +706,13 @@ impl BlockingScopedProcesses {
     /// # Errors
     /// Returns [`WaitError::UnknownProcess`] if `pid` is not authorized here.
     pub fn wait(&self, pid: ProcessId) -> Result<ProcessExit, WaitError> {
-        if !self
-            .owned
-            .lock()
-            .expect("scoped processes mutex")
-            .contains(&pid)
-        {
-            return Err(WaitError::UnknownProcess(pid));
-        }
-        drive_with(&self.driver, self.supervisor.wait(pid))
+        drive_with(&self.driver, self.inner.wait(pid))
     }
 
     /// Transfers the capture observer for a process owned by this block.
     #[must_use]
     pub fn take_output(&self, pid: ProcessId) -> Option<ProcessOutput> {
-        if !self
-            .owned
-            .lock()
-            .expect("scoped processes mutex")
-            .contains(&pid)
-        {
-            return None;
-        }
-        self.supervisor.take_output(pid)
+        self.inner.take_output(pid)
     }
 }
 

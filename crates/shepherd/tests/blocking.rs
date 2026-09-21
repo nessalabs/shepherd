@@ -4,16 +4,18 @@
 
 #![cfg(feature = "blocking")]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use shepherd::blocking::{BlockingRunError, BlockingSupervisor, RunOptions};
 use shepherd::{
-    GracePeriod, NullBackend, ProcessBackend, ProcessSpec, ScopeCreationError, SpawnError, Spawned,
+    GracePeriod, NullBackend, OutputChunk, OutputMode, OutputSnapshot, OutputStream,
+    ProcessBackend, ProcessOutput, ProcessSpec, ScopeCreationError, SpawnError, Spawned,
     SupervisorBuilder, TerminateError, TerminateOptions, TerminationOutcome, WaitError,
 };
+use shepherd_app::output::OutputSink;
 use shepherd_domain::{ProcessScopeId, RawExit, RawStats, Signal};
 
 fn supervisor() -> BlockingSupervisor {
@@ -1020,6 +1022,188 @@ fn scoped_cleanup_history_evicts_oldest() {
     assert!(sup.wait_scope_cleanup(last).unwrap().all_verified());
 }
 
+#[test]
+fn with_scope_prunes_authorization_after_observation_history_bound() {
+    let sup = supervisor();
+    let result = sup.with_scope_options(Vec::new(), short_opts(), |scope| {
+        let mut first = None;
+        let mut latest = None;
+        for _ in 0..300 {
+            let pid = scope
+                .spawn(ProcessSpec::new("exit-immediately"))
+                .expect("scoped spawn");
+            first.get_or_insert(pid);
+            latest = Some(pid);
+            assert!(scope.wait(pid).unwrap().outcome.is_verified());
+            assert!(
+                scope.authorized_len() <= 257,
+                "blocking scope retained every completed id: {}",
+                scope.authorized_len()
+            );
+        }
+        let first = first.expect("first pid");
+        let latest = latest.expect("latest pid");
+        assert!(
+            matches!(scope.wait(first), Err(WaitError::UnknownProcess(id)) if id == first),
+            "expired observation history must drop authorization"
+        );
+        assert!(scope.wait(latest).unwrap().outcome.is_verified());
+        scope.authorized_len()
+    });
+    assert!(result.result.unwrap() <= 257);
+    assert!(result.termination.unwrap().all_verified());
+}
+
+#[test]
+fn wait_scope_cleanup_can_register_before_the_body_returns() {
+    let sup = supervisor();
+    let (scope_tx, scope_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let body = {
+        let sup = sup.clone();
+        std::thread::spawn(move || {
+            sup.with_scope_options(Vec::new(), short_opts(), move |scope| {
+                scope_tx.send(scope.id()).expect("scope");
+                release_rx.recv().expect("release");
+                7
+            })
+        })
+    };
+    let scope = scope_rx.recv().expect("admitted");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let waiter = {
+        let sup = sup.clone();
+        std::thread::spawn(move || {
+            let result = sup.wait_scope_cleanup(scope);
+            done_tx.send(result).expect("done");
+        })
+    };
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(80)).is_err(),
+        "waiter must block until cleanup, not return UnknownScope"
+    );
+    release_tx.send(()).expect("release body");
+    let report = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("cleanup observed");
+    assert!(report.unwrap().all_verified());
+    assert_eq!(body.join().expect("body").result.unwrap(), 7);
+    waiter.join().expect("waiter");
+}
+
+#[test]
+fn wait_scope_cleanup_sees_recovered_terminate_after_initial_failure() {
+    let sup = BlockingSupervisor::builder()
+        .backend(Arc::new(FailFirstCleanup::default()))
+        .build()
+        .unwrap();
+    let result = sup.with_scope_options(Vec::new(), short_opts(), |_| ());
+    assert!(
+        result.termination.is_err(),
+        "first cleanup must fail: {:?}",
+        result.termination
+    );
+    assert!(sup
+        .terminate_scope(result.scope, short_opts())
+        .unwrap()
+        .all_verified());
+    assert!(
+        sup.wait_scope_cleanup(result.scope).unwrap().all_verified(),
+        "shared channel must publish the recovered success"
+    );
+}
+
+#[test]
+fn run_keeps_capture_while_cleanup_is_gated() {
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let backend = Arc::new(GatedCaptureCleanup {
+        inner: NullBackend::new(),
+        hold: hold.clone(),
+        started: Mutex::new(Some(started_tx)),
+        labels: Mutex::new(std::collections::HashMap::new()),
+    });
+    let sup = BlockingSupervisor::builder()
+        .backend(backend)
+        .build()
+        .unwrap();
+    let runner = {
+        let sup = sup.clone();
+        std::thread::spawn(move || {
+            sup.run_with_options(capture_spec("run-a"), run_opts(Duration::from_secs(2)))
+        })
+    };
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("cleanup gated");
+    for _ in 0..257 {
+        let scope = sup.create_scope();
+        let pid = sup
+            .spawn(scope, capture_spec("other"))
+            .expect("flood spawn");
+        assert!(sup.wait(pid).unwrap().outcome.is_verified());
+        assert!(sup
+            .terminate_scope(scope, short_opts())
+            .unwrap()
+            .all_verified());
+    }
+    hold.notify_waiters();
+    let run = runner.join().expect("run").expect("completed");
+    assert!(!run.timed_out(), "{run:?}");
+    assert!(run.all_verified(), "{:?}", run.termination());
+    let snapshot = run.output().expect("run kept its capture");
+    let bytes: Vec<u8> = snapshot
+        .chunks
+        .iter()
+        .flat_map(|chunk| chunk.bytes.iter().copied())
+        .collect();
+    assert!(
+        bytes
+            .windows(RUN_A_BYTES.len())
+            .any(|window| window == RUN_A_BYTES),
+        "delayed cleanup must not lose the run's capture: {snapshot:?}"
+    );
+}
+
+#[test]
+fn from_handle_inside_localset_on_multi_thread() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let sup = BlockingSupervisor::from_handle_and_builder(
+            tokio::runtime::Handle::current(),
+            SupervisorBuilder::new().backend(Arc::new(NullBackend::new())),
+        );
+        tokio::task::spawn_local(async move {
+            let scope = sup.create_scope();
+            let pid = sup
+                .spawn(scope, ProcessSpec::new("exit-immediately"))
+                .expect("localset spawn");
+            assert_eq!(
+                sup.wait(pid).unwrap().outcome,
+                TerminationOutcome::ExitedNaturally
+            );
+            let run = sup
+                .run_with_options(
+                    ProcessSpec::new("exit-immediately"),
+                    run_opts(Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert!(run.all_verified(), "{:?}", run.termination());
+            assert!(sup
+                .terminate_scope(scope, short_opts())
+                .unwrap()
+                .all_verified());
+        })
+        .await
+        .expect("spawn_local");
+    });
+}
+
 #[derive(Default)]
 struct FailWaitAfterSpawn {
     inner: NullBackend,
@@ -1095,6 +1279,155 @@ impl ProcessBackend for TimeoutThenContainmentFail {
     }
     async fn sample(&self, target: &Spawned) -> Result<RawStats, shepherd::StatsError> {
         self.inner.sample(target).await
+    }
+    fn capabilities(&self) -> shepherd::Capabilities {
+        self.inner.capabilities()
+    }
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.inner.hard_kill_scope(scope);
+    }
+    fn hard_kill_all(&self) {
+        self.inner.hard_kill_all();
+    }
+}
+
+const RUN_A_BYTES: &[u8] = b"run-a-bytes";
+
+fn capture_spec(program: &str) -> ProcessSpec {
+    ProcessSpec::new(program).output(OutputMode::Capture {
+        buffer_bytes: 64,
+        tail_bytes: 16,
+    })
+}
+
+struct FixedOutput(&'static [u8]);
+impl OutputSink for FixedOutput {
+    fn push(&self, _: OutputStream, _: &[u8]) {}
+    fn close(&self, _: OutputStream, _: Option<String>) {}
+    fn read(&self) -> OutputSnapshot {
+        OutputSnapshot {
+            chunks: vec![OutputChunk {
+                stream: OutputStream::Stdout,
+                bytes: self.0.to_vec(),
+            }],
+            tail: vec![],
+            dropped_bytes: 0,
+            stdout_closed: true,
+            stderr_closed: true,
+            errors: vec![],
+        }
+    }
+}
+
+#[derive(Default)]
+struct FailFirstCleanup {
+    inner: NullBackend,
+    failed: AtomicBool,
+}
+
+#[async_trait]
+impl ProcessBackend for FailFirstCleanup {
+    async fn spawn(
+        &self,
+        scope: ProcessScopeId,
+        spec: &ProcessSpec,
+    ) -> Result<Spawned, SpawnError> {
+        self.inner.spawn(scope, spec).await
+    }
+    async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+        self.inner.signal(target, signal).await
+    }
+    async fn signal_scope(
+        &self,
+        scope: ProcessScopeId,
+        signal: Signal,
+    ) -> Result<(), TerminateError> {
+        self.inner.signal_scope(scope, signal).await
+    }
+    async fn cleanup_scope(&self, scope: ProcessScopeId) -> Result<(), TerminateError> {
+        if !self.failed.swap(true, Ordering::SeqCst) {
+            return Err(TerminateError::Signal(
+                "injected first cleanup failure".into(),
+            ));
+        }
+        self.inner.cleanup_scope(scope).await
+    }
+    async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
+        self.inner.wait(target).await
+    }
+    async fn sample(&self, target: &Spawned) -> Result<RawStats, shepherd::StatsError> {
+        self.inner.sample(target).await
+    }
+    fn capabilities(&self) -> shepherd::Capabilities {
+        self.inner.capabilities()
+    }
+    fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.inner.hard_kill_scope(scope);
+    }
+    fn hard_kill_all(&self) {
+        self.inner.hard_kill_all();
+    }
+}
+
+struct GatedCaptureCleanup {
+    inner: NullBackend,
+    hold: Arc<tokio::sync::Notify>,
+    started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    labels: Mutex<std::collections::HashMap<u32, &'static [u8]>>,
+}
+
+#[async_trait]
+impl ProcessBackend for GatedCaptureCleanup {
+    async fn spawn(
+        &self,
+        scope: ProcessScopeId,
+        spec: &ProcessSpec,
+    ) -> Result<Spawned, SpawnError> {
+        let spawned = self.inner.spawn(scope, spec).await?;
+        let label = if spec.program == "run-a" {
+            RUN_A_BYTES
+        } else {
+            b"other"
+        };
+        self.labels
+            .lock()
+            .expect("labels")
+            .insert(spawned.os.pid, label);
+        Ok(spawned)
+    }
+    async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
+        self.inner.signal(target, signal).await
+    }
+    async fn signal_scope(
+        &self,
+        scope: ProcessScopeId,
+        signal: Signal,
+    ) -> Result<(), TerminateError> {
+        self.inner.signal_scope(scope, signal).await
+    }
+    async fn cleanup_scope(&self, scope: ProcessScopeId) -> Result<(), TerminateError> {
+        let started = self.started.lock().expect("started").take();
+        if let Some(started) = started {
+            let _ = started.send(());
+            self.hold.notified().await;
+        }
+        self.inner.cleanup_scope(scope).await
+    }
+    async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
+        self.inner.wait(target).await
+    }
+    async fn sample(&self, target: &Spawned) -> Result<RawStats, shepherd::StatsError> {
+        self.inner.sample(target).await
+    }
+    fn output(&self, target: &Spawned) -> Option<ProcessOutput> {
+        let label = self
+            .labels
+            .lock()
+            .expect("labels")
+            .get(&target.os.pid)
+            .copied()
+            .unwrap_or(b"other");
+        Some(ProcessOutput(Arc::new(FixedOutput(label))))
     }
     fn capabilities(&self) -> shepherd::Capabilities {
         self.inner.capabilities()
