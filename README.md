@@ -32,6 +32,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Callers that are not inside Tokio use `shepherd::blocking` (on by default).
+It owns a small multi-thread runtime — or borrows a handle you already have —
+and never calls `block_on` from a thread that is already driving a runtime.
+
+```rust
+use std::time::Duration;
+use shepherd::{EnvPolicy, OutputMode, ProcessSpec};
+use shepherd::blocking::BlockingSupervisor;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let supervisor = BlockingSupervisor::new();
+    let spec = ProcessSpec::new("printf")
+        .arg("ok")
+        .env(EnvPolicy::Clear(Vec::new()))
+        .output(OutputMode::Capture {
+            buffer_bytes: 65_536,
+            tail_bytes: 4_096,
+        });
+    let run = supervisor.run(spec, Duration::from_secs(5))?;
+    assert!(run.all_verified());
+    Ok(())
+}
+```
+
+`run` applies one deadline to spawn *and* wait. On expiry Shepherd terminates
+the scope (process group or Job Object) and reports whether reap was verified.
+A naive `block_on` from inside a Tokio worker panics; `from_handle` and the
+owned runtime avoid that. A current-thread handle cannot be driven from the
+thread that is already running that runtime.
+
 Scope creation is allowed only before shutdown starts. The existing `create_scope()`
 method panics after that point; use `try_create_scope()` to handle
 `ScopeCreationError::SupervisorClosed`, including creation racing with shutdown.

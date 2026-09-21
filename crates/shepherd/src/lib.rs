@@ -18,6 +18,36 @@
 //! # }
 //! ```
 //!
+//! Callers that are not inside an async runtime use [`blocking::BlockingSupervisor`].
+//! That wrapper owns a small multi-thread runtime (or borrows a caller handle) and
+//! never calls `block_on` from a thread that is already driving Tokio.
+//!
+//! ```no_run
+//! # #[cfg(feature = "blocking")]
+//! use std::time::Duration;
+//! # #[cfg(feature = "blocking")]
+//! use shepherd::{EnvPolicy, OutputMode, ProcessSpec};
+//! # #[cfg(feature = "blocking")]
+//! use shepherd::blocking::BlockingSupervisor;
+//!
+//! # #[cfg(feature = "blocking")]
+//! fn sync_demo() -> Result<(), Box<dyn std::error::Error>> {
+//!     let supervisor = BlockingSupervisor::new();
+//!     let spec = ProcessSpec::new("printf")
+//!         .arg("ok")
+//!         .env(EnvPolicy::Clear(Vec::new()))
+//!         .output(OutputMode::Capture {
+//!             buffer_bytes: 65_536,
+//!             tail_bytes: 4_096,
+//!         });
+//!     let run = supervisor.run(spec, Duration::from_secs(5))?;
+//!     assert!(run.all_verified());
+//!     Ok(())
+//! }
+//! # #[cfg(not(feature = "blocking"))]
+//! # fn sync_demo() {}
+//! ```
+//!
 //! See `docs/DESIGN.md`, `docs/DIAGRAMS.md`, and `docs/GLOSSARY.md`.
 #![forbid(unsafe_code)]
 
@@ -149,3 +179,9 @@ pub fn process_observer() -> ProcessObserver {
 }
 
 pub use shepherd_app::usage::*;
+
+/// Synchronous entry points for callers that are not inside an async context.
+///
+/// Enabled by the `blocking` feature (on by default). See [`blocking::BlockingSupervisor`].
+#[cfg(feature = "blocking")]
+pub mod blocking;

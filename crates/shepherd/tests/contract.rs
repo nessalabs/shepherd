@@ -59,8 +59,43 @@ async fn natural_exit_is_reported() {
         .spawn(scope, ProcessSpec::new("exit-immediately"))
         .await
         .unwrap();
+    let os = sup
+        .os_pid(pid)
+        .expect("OS pid remains after an immediate natural exit");
     let exit = sup.wait(pid).await.unwrap();
     assert_eq!(exit.outcome, TerminationOutcome::ExitedNaturally);
+    assert_eq!(sup.os_pid(pid), Some(os));
+}
+
+#[tokio::test(start_paused = true)]
+async fn os_pid_history_evicts_oldest_after_immediate_exits() {
+    let sup = supervisor();
+    let mut first = None;
+    let mut latest = None;
+    for _ in 0..300 {
+        let scope = sup.create_scope();
+        let pid = sup
+            .spawn(scope, ProcessSpec::new("exit-immediately"))
+            .await
+            .unwrap();
+        first.get_or_insert(pid);
+        latest = Some(pid);
+        assert!(
+            sup.os_pid(pid).is_some(),
+            "OS pid remains after an immediate natural exit"
+        );
+        assert_eq!(
+            sup.wait(pid).await.unwrap().outcome,
+            TerminationOutcome::ExitedNaturally
+        );
+        assert!(sup
+            .terminate_scope(scope, short_opts())
+            .await
+            .unwrap()
+            .all_verified());
+    }
+    assert!(sup.os_pid(latest.unwrap()).is_some());
+    assert_eq!(sup.os_pid(first.unwrap()), None);
 }
 
 #[tokio::test(start_paused = true)]

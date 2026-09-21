@@ -31,3 +31,4 @@ they do not replace that document.
 | [0020](./0020-adversarial-validation-boundaries.md) | Generated invariants, targeted loom models and resource accounting |
 
 - [0021 — Read-only process-tree observation](0021-read-only-process-tree-observation.md)
+- [0022 — Synchronous blocking entry point](0022-blocking-entry-point.md)
