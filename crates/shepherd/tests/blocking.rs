@@ -1115,40 +1115,54 @@ fn wait_scope_cleanup_sees_recovered_terminate_after_initial_failure() {
 
 #[test]
 fn run_keeps_capture_while_cleanup_is_gated() {
-    let hold = Arc::new(tokio::sync::Notify::new());
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     let backend = Arc::new(GatedCaptureCleanup {
         inner: NullBackend::new(),
-        hold: hold.clone(),
-        started: Mutex::new(Some(started_tx)),
+        release: Mutex::new(Some(release_rx)),
+        exited: Mutex::new(Some(exited_tx)),
         labels: Mutex::new(std::collections::HashMap::new()),
+        next_label: AtomicUsize::new(0),
+        first_scope: Mutex::new(None),
     });
     let sup = BlockingSupervisor::builder()
         .backend(backend)
         .build()
         .unwrap();
-    let runner = {
-        let sup = sup.clone();
+    let flood = {
+        let inner = sup.supervisor().clone();
         std::thread::spawn(move || {
-            sup.run_with_options(capture_spec("run-a"), run_opts(Duration::from_secs(2)))
+            exited_rx.recv().expect("run-a reaped");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                for _ in 0..257 {
+                    let scope = inner.create_scope();
+                    let pid = inner
+                        .spawn(scope, capture_spec("exit-immediately"))
+                        .await
+                        .expect("flood spawn");
+                    assert!(inner.wait(pid).await.unwrap().outcome.is_verified());
+                    assert!(inner
+                        .terminate_scope(scope, short_opts())
+                        .await
+                        .unwrap()
+                        .all_verified());
+                }
+            });
+            release_tx.send(()).expect("release cleanup");
         })
     };
-    started_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("cleanup gated");
-    for _ in 0..257 {
-        let scope = sup.create_scope();
-        let pid = sup
-            .spawn(scope, capture_spec("other"))
-            .expect("flood spawn");
-        assert!(sup.wait(pid).unwrap().outcome.is_verified());
-        assert!(sup
-            .terminate_scope(scope, short_opts())
-            .unwrap()
-            .all_verified());
-    }
-    hold.notify_waiters();
-    let run = runner.join().expect("run").expect("completed");
+    let run = sup
+        .run_with_options(
+            capture_spec("exit-immediately"),
+            run_opts(Duration::from_secs(2)),
+        )
+        .expect("completed");
+    flood.join().expect("flood");
     assert!(!run.timed_out(), "{run:?}");
     assert!(run.all_verified(), "{:?}", run.termination());
     let snapshot = run.output().expect("run kept its capture");
@@ -1371,9 +1385,11 @@ impl ProcessBackend for FailFirstCleanup {
 
 struct GatedCaptureCleanup {
     inner: NullBackend,
-    hold: Arc<tokio::sync::Notify>,
-    started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    exited: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     labels: Mutex<std::collections::HashMap<u32, &'static [u8]>>,
+    next_label: AtomicUsize,
+    first_scope: Mutex<Option<ProcessScopeId>>,
 }
 
 #[async_trait]
@@ -1384,7 +1400,7 @@ impl ProcessBackend for GatedCaptureCleanup {
         spec: &ProcessSpec,
     ) -> Result<Spawned, SpawnError> {
         let spawned = self.inner.spawn(scope, spec).await?;
-        let label = if spec.program == "run-a" {
+        let label = if self.next_label.fetch_add(1, Ordering::SeqCst) == 0 {
             RUN_A_BYTES
         } else {
             b"other"
@@ -1393,6 +1409,10 @@ impl ProcessBackend for GatedCaptureCleanup {
             .lock()
             .expect("labels")
             .insert(spawned.os.pid, label);
+        let mut first_scope = self.first_scope.lock().expect("first scope");
+        if first_scope.is_none() {
+            *first_scope = Some(scope);
+        }
         Ok(spawned)
     }
     async fn signal(&self, target: &Spawned, signal: Signal) -> Result<(), TerminateError> {
@@ -1406,15 +1426,21 @@ impl ProcessBackend for GatedCaptureCleanup {
         self.inner.signal_scope(scope, signal).await
     }
     async fn cleanup_scope(&self, scope: ProcessScopeId) -> Result<(), TerminateError> {
-        let started = self.started.lock().expect("started").take();
-        if let Some(started) = started {
-            let _ = started.send(());
-            self.hold.notified().await;
+        let is_first = self.first_scope.lock().expect("first scope").as_ref() == Some(&scope);
+        if is_first {
+            let release = self.release.lock().expect("release").take();
+            if let Some(release) = release {
+                let _ = tokio::task::spawn_blocking(move || release.recv()).await;
+            }
         }
         self.inner.cleanup_scope(scope).await
     }
     async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
-        self.inner.wait(target).await
+        let exit = self.inner.wait(target).await;
+        if let Some(exited) = self.exited.lock().expect("exited").take() {
+            let _ = exited.send(());
+        }
+        exit
     }
     async fn sample(&self, target: &Spawned) -> Result<RawStats, shepherd::StatsError> {
         self.inner.sample(target).await
