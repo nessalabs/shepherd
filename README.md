@@ -60,7 +60,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 the scope (process group or Job Object) and reports whether reap was verified.
 A naive `block_on` from inside a Tokio worker panics; `from_handle` and the
 owned runtime avoid that. A current-thread handle cannot be driven from the
-thread that is already running that runtime.
+thread that is already running that runtime. Same-runtime multi-thread calls
+release the scheduler worker with `block_in_place` before joining their helper.
+Same-runtime `LocalSet` calls are refused before process admission; use the
+async supervisor or `tokio::task::spawn_blocking` there.
 
 Scope creation is allowed only before shutdown starts. The existing `create_scope()`
 method panics after that point; use `try_create_scope()` to handle

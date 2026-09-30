@@ -30,7 +30,8 @@ Driving a future never calls `block_on` from inside the same Tokio context:
 | Caller context | Action |
 | --- | --- |
 | No current handle | `Runtime::block_on` or `Handle::block_on` |
-| Same multi-thread runtime | a scoped helper thread calls `Handle::block_on` (also the `LocalSet` path; `block_in_place` is forbidden there) |
+| Same multi-thread runtime, scheduler task | `block_in_place` hands off the scheduler worker before a scoped helper drives the future and is joined |
+| Same multi-thread runtime, `LocalSet` | Tokio refuses `block_in_place` before the helper starts; use the async supervisor or call the blocking facade from `spawn_blocking` |
 | A different runtime | a scoped helper thread calls `block_on` outside Tokio |
 
 A current-thread `Handle` is refused at drive time: `Handle::block_on` does
@@ -38,6 +39,21 @@ not run that scheduler's I/O or timers, and using it from the driver thread
 deadlocks. `from_runtime` (owned `Runtime::block_on`) is the supported
 current-thread path from ordinary synchronous code. Same-runtime current-thread
 calls panic with that explanation instead of hanging.
+
+Moving the future to a helper alone does not release its caller's scheduler
+worker. A one-worker runtime, or a runtime whose workers all enter blocking
+methods together, cannot run `spawn_owned` while those callers join helpers.
+The same-runtime multi-thread branch must enter `block_in_place` **before**
+starting and joining the helper. A runtime timer cannot detect this deadlock;
+the regression runs the actual scheduler calls in an OS child with an external
+watchdog that kills and reaps that child on failure.
+
+| Ordering | Required result | Regression |
+| --- | --- | --- |
+| `from_handle` + `spawn` in a `tokio::spawn` task, one worker | Worker handed off; spawn, wait, scoped cleanup and shutdown complete with verified outcomes | `from_handle_single_worker_releases_scheduler` |
+| Every worker enters the same-runtime facade together | Each caller hands off its worker; all independently owned scopes complete | `from_handle_saturated_workers_release_scheduler` |
+| Same-runtime `LocalSet` calls a blocking method | Panic before process admission; async cleanup remains usable | `from_handle_inside_localset_refuses_before_spawn` |
+| No current runtime or a different runtime | Existing direct/helper drive path remains usable | Existing synchronous, owned-runtime and current-thread caller tests |
 
 `with_scope` / `with_scope_options` accept a synchronous closure. The body
 runs on the calling thread **outside** any driven future: each `spawn` /

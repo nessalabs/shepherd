@@ -358,6 +358,98 @@ fn from_handle_multi_thread_from_sync_code() {
     drop(runtime);
 }
 
+// The watchdog lives outside Tokio: the defect also prevents runtime timers
+// and task cancellation from making progress. Only NullBackend processes run
+// in the child; timeout kills and reaps the owned test process.
+fn check_runtime_workers(test_name: &str, workers: usize) {
+    use shepherd_test_support::probe::BLOCKING_RUNTIME_CHILD;
+    if std::env::var(BLOCKING_RUNTIME_CHILD).as_deref() == Ok(test_name) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(workers));
+        runtime.block_on(async {
+            let mut tasks = Vec::new();
+            for _ in 0..workers {
+                let barrier = barrier.clone();
+                tasks.push(tokio::spawn(async move {
+                    let sup = BlockingSupervisor::from_handle_and_builder(
+                        tokio::runtime::Handle::current(),
+                        SupervisorBuilder::new().backend(Arc::new(NullBackend::new())),
+                    );
+                    // Occupy every original scheduler worker before any
+                    // blocking call; an idle second worker cannot mask the bug.
+                    barrier.wait();
+                    let scope = sup.create_scope();
+                    let pid = sup
+                        .spawn(scope, ProcessSpec::new("exit-immediately"))
+                        .unwrap();
+                    assert_eq!(
+                        sup.wait(pid).unwrap().outcome,
+                        TerminationOutcome::ExitedNaturally
+                    );
+                    assert!(sup
+                        .terminate_scope(scope, short_opts())
+                        .unwrap()
+                        .all_verified());
+                    let run = sup
+                        .run_with_options(
+                            ProcessSpec::new("exit-immediately"),
+                            run_opts(Duration::from_secs(2)),
+                        )
+                        .unwrap();
+                    assert!(run.all_verified());
+                    assert!(!run.timed_out());
+                    let block = sup.with_scope(Vec::new(), |scoped| {
+                        let pid = scoped.spawn(ProcessSpec::new("exit-immediately")).unwrap();
+                        assert_eq!(
+                            scoped.wait(pid).unwrap().outcome,
+                            TerminationOutcome::ExitedNaturally
+                        );
+                    });
+                    assert!(block.result.is_ok());
+                    assert!(block.termination.unwrap().all_verified());
+                    sup.shutdown().unwrap();
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+        });
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env(BLOCKING_RUNTIME_CHILD, test_name)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "runtime worker child failed: {status}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("{workers}-worker runtime did not finish; watchdog killed and reaped its child");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn from_handle_single_worker_releases_scheduler() {
+    check_runtime_workers("from_handle_single_worker_releases_scheduler", 1);
+}
+
+#[test]
+fn from_handle_saturated_workers_release_scheduler() {
+    check_runtime_workers("from_handle_saturated_workers_release_scheduler", 2);
+}
+
 #[test]
 fn drop_without_shutdown_does_not_hang() {
     let sup = supervisor();
@@ -1180,9 +1272,9 @@ fn run_keeps_capture_while_cleanup_is_gated() {
 }
 
 #[test]
-fn from_handle_inside_localset_on_multi_thread() {
+fn from_handle_inside_localset_refuses_before_spawn() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(1)
         .enable_all()
         .build()
         .unwrap();
@@ -1194,24 +1286,37 @@ fn from_handle_inside_localset_on_multi_thread() {
         );
         tokio::task::spawn_local(async move {
             let scope = sup.create_scope();
+            let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sup.spawn(scope, ProcessSpec::new("exit-immediately"))
+            }));
+            assert!(
+                refusal.is_err(),
+                "LocalSet blocking must refuse before polling spawn"
+            );
+            assert!(sup.processes(scope).unwrap().is_empty());
+            // The normal async facade remains usable from the same LocalSet.
             let pid = sup
+                .supervisor()
                 .spawn(scope, ProcessSpec::new("exit-immediately"))
-                .expect("localset spawn");
+                .await
+                .unwrap();
             assert_eq!(
-                sup.wait(pid).unwrap().outcome,
+                sup.supervisor().wait(pid).await.unwrap().outcome,
                 TerminationOutcome::ExitedNaturally
             );
-            let run = sup
-                .run_with_options(
+            let blocking = sup.clone();
+            let run = tokio::task::spawn_blocking(move || {
+                blocking.run_with_options(
                     ProcessSpec::new("exit-immediately"),
                     run_opts(Duration::from_secs(2)),
                 )
-                .unwrap();
-            assert!(run.all_verified(), "{:?}", run.termination());
-            assert!(sup
-                .terminate_scope(scope, short_opts())
-                .unwrap()
-                .all_verified());
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(run.all_verified());
+            assert!(!run.timed_out());
+            sup.supervisor().shutdown().await.unwrap();
         })
         .await
         .expect("spawn_local");

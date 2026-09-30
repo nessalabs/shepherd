@@ -5,9 +5,9 @@
 //! caller-supplied handle, drives every future. When the caller is already
 //! inside Tokio:
 //!
-//! * same runtime (multi-thread): a scoped helper thread calls `Handle::block_on`
-//!   (`block_in_place` is forbidden inside a `LocalSet`, including on a
-//!   multi-thread runtime)
+//! * same runtime (multi-thread): `block_in_place` releases the scheduler worker
+//!   before a scoped helper thread drives the future and is joined. Tokio refuses
+//!   this inside a `LocalSet`; use the async API or call from `spawn_blocking`.
 //! * a different runtime: a scoped helper thread calls `block_on` outside Tokio
 //!
 //! A current-thread `Handle` is rejected: `Handle::block_on` does not drive
@@ -156,6 +156,9 @@ impl BlockingSupervisor {
     /// multi-thread. A current-thread handle cannot be driven by `Handle::block_on`
     /// (no I/O or timers) and deadlocks if used from its own driver thread.
     /// Use [`Self::from_runtime`] or [`Self::new`] for current-thread callers.
+    /// Same-runtime blocking calls from a `LocalSet` are unsupported: Tokio
+    /// refuses `block_in_place` before driving the future. Use the async
+    /// [`ProcessSupervisor`] or move the blocking call to `tokio::task::spawn_blocking`.
     #[must_use]
     pub fn from_handle(handle: Handle) -> Self {
         Self::from_handle_and_builder(handle, SupervisorBuilder::new())
@@ -564,10 +567,11 @@ where
                      runtime's driver."
                 );
             }
-            // `block_in_place` is forbidden inside a LocalSet even when the
-            // underlying runtime is multi-thread. A helper thread can always
-            // call Handle::block_on from outside Tokio.
-            drive_on_helper_thread(driver, future)
+            // The helper needs this runtime to schedule its owned work.
+            // Release the caller's worker before starting/joining it, including
+            // when every worker calls this facade together. Tokio refuses this
+            // in a LocalSet before the helper can poll the future.
+            tokio::task::block_in_place(|| drive_on_helper_thread(driver, future))
         }
         Ok(_) => drive_on_helper_thread(driver, future),
     }
