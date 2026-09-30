@@ -93,6 +93,28 @@ checks `all_verified()` / `into_verified()`. Callers express a cleared
 environment and a byte-capped capture through `ProcessSpec`
 (`EnvPolicy::Clear`, `OutputMode::Capture`).
 
+## Attachment observation
+
+Public `spawn` completion is a later boundary than attachment: its owned worker
+can finish while the caller has not yet been polled. The run future must not depend
+on bounded lookup history to recover an already admitted process's observer or exit.
+The application exposes one owned observed-spawn task: attachment transfers the
+capture observer and registers an exit receiver before monitoring starts. The
+ordinary public spawn path keeps its existing unclaimed capture history.
+
+| Ordering | Original owner and required result | Evidence |
+| --- | --- | --- |
+| Observed spawn attaches | One admission channel owns process id, capture and already registered exit future before monitor starts | Application attachment path |
+| Caller is not polled while root exits and 257 other roots complete | Original admission observation survives capture and wait-history eviction | Blocking run scheduling regression |
+| Deadline cancels the public completion await | Observed-spawn handle and admission receiver remain outside the timed attempt; scope cleanup waits for the original spawn worker | Deadline and in-flight spawn counterparts |
+| Cleanup completes after a delayed spawn | Consume the original admission channel, drain original capture; no PID lookup reconstruction | Blocking run timeout path |
+| Observed-spawn owner is dropped | Worker remains responsible for admitted process; unconsumed observer is released; no detach-based cleanup confirmation | Existing cancellation ownership contract |
+
+The current integration publisher is already isolated behind its bounded lossy
+queue, and ignores `ProcessSpawned`; blocking it is not a valid way to reproduce
+this scheduling window. The regression delays polling the real run future while
+its original worker and other lifecycles run on the supplied runtime.
+
 ## Consequences
 
 - Sync callers keep the same ownership invariant: every process belongs to a

@@ -5,6 +5,7 @@
 | build / clone | Only user-facing handles share CleanupGuard. Building needs no runtime. IDs belong to the originating supervisor. |
 | create_scope / try_create_scope | Atomically admits one lifetime scope before shutdown. try_create_scope returns ScopeCreationError afterward; create_scope panics after releasing its lock. It needs explicit cleanup even when all roots exit naturally; the containment resource may still own descendants. |
 | spawn | An internal worker holds the scope operation lock through backend spawn, attachment and monitor start. Dropping the caller future detaches that worker; cleanup waits for it. Last-owner Drop sets shutdown intent, so a late spawn is killed and reaped. A canceled spawn may complete in its scope even though its ID is not delivered. |
+| spawn_observed / ObservedSpawn | Starts the same owned spawn worker. At attachment, before monitor start, the handle receives the original capture observer and a registered exit receiver. Canceling complete retains both worker completion and admission in the handle. After cancellation, finish scope cleanup before recovering admission. Dropping the handle releases observation data and detaches the worker; it does not confirm cleanup. |
 | processes / capabilities / os_pid | Read-only snapshots; they do not transfer raw child ownership. `os_pid` stays available after an immediate natural exit (spawn may return after the monitor has already pruned) until the last 256 attachments. The bound is enforced at attach so a monitor that loses the registry race cannot grow the map. |
 | stats | Reads an interval cache. Cancellation performs no OS effect. NotReady is distinct from unknown/exited and sampler failure. Sampling failure never relinquishes ownership. |
 | take_output / read | Transfers an observation handle once. Clones share consumption. Retaining it retains only bounded bytes, not the child or supervisor. Root reap does not wait for inherited pipes. Read through both stream-closed flags for complete output; reader failures are observable independently of process cleanup. |
@@ -52,3 +53,17 @@ Verified completed notification channels serve no further publication purpose. R
 also retains platform synchronization allocations whose initialization depends on
 whether a receiver happened to poll before exit. The completed value is the evidence
 late callers need; pending subscriber channels have their own lifetime.
+
+## Ordinary scope report history
+
+| Report cardinality | Retained representation | Read behavior |
+| --- | --- | --- |
+| Empty | Inline empty value | Return an empty public outcomes vector |
+| One root | Inline original process ID and outcome | Return that exact pair in the public outcomes vector |
+| Multiple roots | Original ordered outcomes vector | Clone its exact ordered pairs for the public report |
+| History turnover | Same 256-scope FIFO, with table capacity reserved at construction | Expired scope lookup remains unknown; in-flight operation owners retain their report |
+
+Natural exit may prune a root before scope termination captures its outcome, so
+completed ordinary reports can alternate between zero and one outcome. Neither
+case needs a retained heap allocation. This changes only private storage;
+public reports preserve their scope, outcomes, ordering, and verification meaning.

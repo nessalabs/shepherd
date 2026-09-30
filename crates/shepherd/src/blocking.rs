@@ -451,26 +451,30 @@ impl BlockingSupervisor {
         options: RunOptions,
     ) -> Result<BlockingRun, BlockingRunError> {
         let scope = self.inner.try_create_scope()?;
-        let mut admitted = None;
-        let mut capture = None;
+        let mut spawn = self.inner.spawn_observed(scope, spec);
+        let mut observation = None;
         let attempt = async {
-            let pid = self.inner.spawn(scope, spec).await?;
-            // Own the observer at admission. Unclaimed completed captures live
-            // in a supervisor-wide 256-entry history; a delayed cleanup must
-            // not let other processes evict this run's output.
-            capture = self.inner.take_output(pid);
-            admitted = Some(pid);
-            let exit = self.inner.wait(pid).await?;
-            Ok::<_, BlockingRunError>((pid, exit))
+            observation = Some(spawn.complete().await?);
+            let exit = observation
+                .as_mut()
+                .expect("owned spawn observation")
+                .exit
+                .as_mut()
+                .await;
+            Ok::<_, BlockingRunError>(exit)
         };
         let outcome = tokio::time::timeout(options.deadline, attempt).await;
         match outcome {
-            Ok(Ok((_pid, exit))) => {
+            Ok(Ok(exit)) => {
                 // Cleanup uses the caller's terminate budget, not leftover
                 // deadline crumbs: a process that exits at T-1ms must still
                 // get a verified group reap. Drain the observer we already own.
                 let termination = self.finish_scope(scope, options.terminate).await?;
-                let output = drain_output(capture, options.output_drain).await;
+                let output = drain_output(
+                    observation.and_then(|observation| observation.output),
+                    options.output_drain,
+                )
+                .await;
                 Ok(BlockingRun::Completed {
                     exit,
                     output,
@@ -481,29 +485,16 @@ impl BlockingSupervisor {
                 .finish_scope_after_error(scope, options.terminate, error)
                 .await),
             Err(_) => {
-                // `admitted` is only set after `spawn` returns. If the deadline
-                // cancelled the JoinHandle await, spawn_owned may still be
-                // holding the scope lock; terminate_scope waits for it. Claim
-                // capture before that sweep so a delayed cleanup cannot lose it.
-                let pid = admitted.or_else(|| {
-                    self.inner
-                        .processes(scope)
-                        .and_then(|ids| ids.into_iter().next())
-                });
-                if capture.is_none() {
-                    if let Some(pid) = pid {
-                        capture = self.inner.take_output(pid);
-                    }
-                }
+                // Cleanup waits for the original spawn worker. Its attachment
+                // channel owns capture and exit even when public completion was
+                // never observed and all bounded lookup histories have expired.
                 let termination = self.finish_scope(scope, options.terminate).await?;
-                if capture.is_none() {
-                    if let Some(pid) =
-                        pid.or_else(|| termination.outcomes.first().map(|(id, _)| *id))
-                    {
-                        capture = self.inner.take_output(pid);
-                    }
-                }
-                let output = drain_output(capture, options.output_drain).await;
+                let observation = observation.or_else(|| spawn.take_admission());
+                let output = drain_output(
+                    observation.and_then(|observation| observation.output),
+                    options.output_drain,
+                )
+                .await;
                 Ok(BlockingRun::TimedOut {
                     output,
                     termination,
@@ -846,3 +837,7 @@ pub enum BlockingRunError {
         termination: ScopeTerminationReport,
     },
 }
+
+#[cfg(test)]
+#[path = "../tests/blocking/admission.rs"]
+mod admission_tests;
