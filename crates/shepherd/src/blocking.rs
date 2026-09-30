@@ -332,7 +332,7 @@ impl BlockingSupervisor {
     /// *inside* `Runtime::block_on` made those nested calls see `Handle::try_current`
     /// and panic (or deadlock) on current-thread.
     ///
-    /// A panic in the body still completes verified cleanup, then the panic is
+    /// A panic in the body still waits for cleanup and its hard-kill backstop, then is
     /// resumed. Observe that report with [`Self::wait_scope_cleanup`] — the
     /// scope is registered on the shared supervisor channel at admission, so a
     /// waiter can subscribe before the body returns.
@@ -411,14 +411,13 @@ impl BlockingSupervisor {
         scope: ProcessScopeId,
         opts: TerminateOptions,
     ) -> Result<ScopeTerminationReport, TerminateError> {
-        let termination = self.terminate_scope(scope, opts);
-        // terminate_scope publishes verified success. Failures and unverified
-        // reports must still wake waiters, and a later retry overwrites them.
-        self.inner.record_scoped_cleanup(scope, termination.clone());
-        termination
+        self.drive(self.inner.finish_scoped_cleanup(scope, opts))
     }
 
-    /// Runs one process with a deadline that covers spawn, wait, and cleanup.
+    /// Runs one process with a deadline that covers spawn and wait.
+    ///
+    /// Scope cleanup then receives its full termination budget; captured output
+    /// receives a separate drain budget. Total elapsed time can exceed `deadline`.
     ///
     /// On expiry the whole scope is terminated (group / job kill) and reap is
     /// confirmed. Output is drained when the spec requested capture.

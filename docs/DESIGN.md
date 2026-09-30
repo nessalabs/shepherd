@@ -293,7 +293,7 @@ supervisor.wait(pid).await                      -> Result<ProcessExit, _>
 supervisor.shutdown().await                     -> Result<ShutdownReport, ShutdownError>
 supervisor.with_scope(specs, |scope| async { .. }).await  // -> WithScopeResult<T>; cancellation report via wait_scope_cleanup
 // shepherd::blocking (feature "blocking", default) mirrors these as sync methods
-// and adds run(spec, deadline) covering spawn+wait+verified group cleanup.
+// and adds run(spec, deadline) covering spawn+wait, followed by separately budgeted group cleanup.
 ```
 
 Raw mutable `Child` ownership is never exposed. All cleanup APIs are idempotent.

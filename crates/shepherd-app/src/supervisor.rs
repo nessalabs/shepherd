@@ -344,26 +344,58 @@ impl ProcessSupervisor {
         Ok((scope, report_tx))
     }
 
-    /// Publishes a `with_scope` cleanup result onto the shared observation channel.
+    /// Finishes an observed scope with the same cleanup backstop as `with_scope`.
     ///
-    /// A verified success is not overwritten. An earlier failure is replaced when
-    /// a later `terminate_scope` recovers. No-ops if `scope` was not admitted
-    /// through [`Self::create_observed_scope`].
-    pub fn record_scoped_cleanup(
+    /// Retains verified success. Otherwise termination errors and unverified
+    /// reports issue a synchronous scope hard kill before being published unchanged.
+    /// Dropping the driven future while cleanup is pending also invokes the backstop.
+    /// A hard kill alone does not confirm reap.
+    ///
+    /// # Errors
+    /// Returns `UnknownScope` unless the scope was admitted for observation, or
+    /// the original termination error. Unverified reports remain successful values
+    /// whose `all_verified()` is false.
+    pub async fn finish_scoped_cleanup(
         &self,
         scope: ProcessScopeId,
-        result: Result<ScopeTerminationReport, TerminateError>,
-    ) {
-        let sender = self
+        opts: TerminateOptions,
+    ) -> Result<ScopeTerminationReport, TerminateError> {
+        let report = self
             .inner
             .scope_results
             .lock()
             .expect("scope results mutex")
             .get(&scope)
-            .cloned();
-        if let Some(sender) = sender {
-            publish_scope_cleanup_result(&sender, result);
+            .cloned()
+            .ok_or(TerminateError::UnknownScope(scope))?;
+        self.finish_scope_cleanup(
+            ScopeCleanupBackstop {
+                backend: self.inner.backend.clone(),
+                scope,
+                report,
+                armed: true,
+            },
+            opts,
+        )
+        .await
+    }
+
+    async fn finish_scope_cleanup(
+        &self,
+        mut backstop: ScopeCleanupBackstop,
+        opts: TerminateOptions,
+    ) -> Result<ScopeTerminationReport, TerminateError> {
+        let result = match backstop.verified_report() {
+            Some(report) => Ok(report),
+            None => self.terminate_scope(backstop.scope, opts).await,
+        };
+        let result = backstop.verified_report().map(Ok).unwrap_or(result);
+        if !result.as_ref().is_ok_and(|report| report.all_verified()) {
+            backstop.backend.hard_kill_scope(backstop.scope);
         }
+        // No suspension separates publication from disarming the Drop backstop.
+        backstop.complete(result.clone());
+        result
     }
 
     // The callback lets the concurrency regression pause at the publication boundary.
@@ -622,19 +654,8 @@ impl ProcessSupervisor {
             armed: true,
         };
         let cleanup = tokio::spawn(async move {
-            let mut backstop = backstop;
             let _ = finished.await;
-            let retained = backstop.verified_report();
-            let result = match retained {
-                Some(report) => Ok(report),
-                None => worker.terminate_scope(scope, opts).await,
-            };
-            let result = backstop.verified_report().map(Ok).unwrap_or(result);
-            if !result.as_ref().is_ok_and(|r| r.all_verified()) {
-                backstop.backend.hard_kill_scope(scope);
-            }
-            // Publish within this task: the runtime may stop before its observer runs.
-            backstop.complete(result);
+            let _ = worker.finish_scope_cleanup(backstop, opts).await;
         });
         tokio::spawn(async move {
             if let Err(error) = cleanup.await {

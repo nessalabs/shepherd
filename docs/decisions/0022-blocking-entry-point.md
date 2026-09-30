@@ -70,6 +70,18 @@ retaining every id. A panic is caught so cleanup can finish
 (`terminate_scope` + shared `wait_scope_cleanup` channel), then resumed.
 Nested blocks remain independent scopes.
 
+Both entry points finish observed scopes through the application cleanup owner.
+The facade drives that operation before returning or resuming a body panic.
+
+| Cleanup result | Action before returning or resuming panic | Evidence |
+| --- | --- | --- |
+| Retained verified report | Preserve report; no additional hard kill | Existing verified panic cleanup regression |
+| Termination error or unverified report | Issue synchronous scope hard kill; retain the original result on the observation channel | Blocking panic failure and unverified regressions |
+| Cleanup future interrupted | Armed `ScopeCleanupBackstop` issues hard kill and publishes interruption | Application backstop regressions |
+
+A hard kill is a backstop, not evidence of verified reap. The original failure
+or unverified report remains observable even after the body panic resumes.
+
 `run` / `run_with_options` bound the *whole* attempt — spawn and wait, not
 only reading output. The capture observer is claimed at admission so a
 delayed scope sweep cannot lose it to the supervisor-wide 256-entry

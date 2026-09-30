@@ -1001,8 +1001,9 @@ fn run_wait_failure_is_not_a_verified_success() {
 
 #[test]
 fn with_scope_panic_keeps_cleanup_error_visible() {
+    let backend = Arc::new(TimeoutThenContainmentFail::default());
     let sup = BlockingSupervisor::builder()
-        .backend(Arc::new(TimeoutThenContainmentFail::default()))
+        .backend(backend.clone())
         .build()
         .unwrap();
     let seen = std::sync::Mutex::new(None);
@@ -1016,13 +1017,56 @@ fn with_scope_panic_keeps_cleanup_error_visible() {
             },
         );
     }));
-    assert!(panicked.is_err());
+    assert_eq!(
+        *panicked.unwrap_err().downcast::<&str>().unwrap(),
+        "body panic before failed cleanup"
+    );
     let scope = seen.lock().expect("seen").expect("scope");
     let cleanup = sup.wait_scope_cleanup(scope);
     assert!(
         cleanup.is_err(),
         "cleanup failure after panic must stay visible: {cleanup:?}"
     );
+    assert_eq!(
+        *backend.hard_kills.lock().unwrap(),
+        vec![scope],
+        "panic must issue the scope backstop before returning to its catcher"
+    );
+}
+
+#[test]
+fn with_scope_panic_backstop_preserves_unverified_and_verified_reports() {
+    for wait_ok in [false, true] {
+        let backend = Arc::new(FailWaitAfterSpawn {
+            wait_ok,
+            ..Default::default()
+        });
+        let sup = BlockingSupervisor::builder()
+            .backend(backend.clone())
+            .build()
+            .unwrap();
+        let seen = std::sync::Mutex::new(None);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = sup.with_scope_options(
+                vec![ProcessSpec::new("ignore-graceful")],
+                short_opts(),
+                |scope| {
+                    *seen.lock().unwrap() = Some(scope.id());
+                    panic!("panic with observed cleanup");
+                },
+            );
+        }));
+        assert_eq!(
+            *panicked.unwrap_err().downcast::<&str>().unwrap(),
+            "panic with observed cleanup"
+        );
+        let scope = seen.lock().unwrap().unwrap();
+        let report = sup.wait_scope_cleanup(scope).unwrap();
+        assert_eq!(report.scope, scope);
+        assert_eq!(report.all_verified(), wait_ok);
+        let expected = if wait_ok { Vec::new() } else { vec![scope] };
+        assert_eq!(*backend.hard_kills.lock().unwrap(), expected);
+    }
 }
 
 /// Timeout, panic, self-terminate, and natural exit on one supervisor at once.
@@ -1326,6 +1370,8 @@ fn from_handle_inside_localset_refuses_before_spawn() {
 #[derive(Default)]
 struct FailWaitAfterSpawn {
     inner: NullBackend,
+    wait_ok: bool,
+    hard_kills: std::sync::Mutex<Vec<ProcessScopeId>>,
 }
 
 #[async_trait]
@@ -1347,8 +1393,12 @@ impl ProcessBackend for FailWaitAfterSpawn {
     ) -> Result<(), TerminateError> {
         self.inner.signal_scope(scope, signal).await
     }
-    async fn wait(&self, _target: &Spawned) -> Result<RawExit, WaitError> {
-        Err(WaitError::Backend("injected wait failure".into()))
+    async fn wait(&self, target: &Spawned) -> Result<RawExit, WaitError> {
+        if self.wait_ok {
+            self.inner.wait(target).await
+        } else {
+            Err(WaitError::Backend("injected wait failure".into()))
+        }
     }
     async fn sample(&self, target: &Spawned) -> Result<RawStats, shepherd::StatsError> {
         self.inner.sample(target).await
@@ -1357,6 +1407,7 @@ impl ProcessBackend for FailWaitAfterSpawn {
         self.inner.capabilities()
     }
     fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.hard_kills.lock().unwrap().push(scope);
         self.inner.hard_kill_scope(scope);
     }
     fn hard_kill_all(&self) {
@@ -1367,6 +1418,7 @@ impl ProcessBackend for FailWaitAfterSpawn {
 #[derive(Default)]
 struct TimeoutThenContainmentFail {
     inner: NullBackend,
+    hard_kills: std::sync::Mutex<Vec<ProcessScopeId>>,
 }
 
 #[async_trait]
@@ -1403,6 +1455,7 @@ impl ProcessBackend for TimeoutThenContainmentFail {
         self.inner.capabilities()
     }
     fn hard_kill_scope(&self, scope: ProcessScopeId) {
+        self.hard_kills.lock().unwrap().push(scope);
         self.inner.hard_kill_scope(scope);
     }
     fn hard_kill_all(&self) {
