@@ -1665,3 +1665,90 @@ impl ProcessBackend for SlowSpawnBackend {
         self.inner.hard_kill_all();
     }
 }
+
+#[test]
+fn with_scope_retains_original_cleanup_after_both_histories_expire() {
+    let sup = supervisor();
+    let outcome = sup.with_scope(Vec::new(), |scope| {
+        let original = sup.terminate_scope(scope.id(), short_opts()).unwrap();
+        for _ in 0..256 {
+            assert!(sup.with_scope(Vec::new(), |_| ()).termination.unwrap().all_verified());
+        }
+        assert!(matches!(sup.wait_scope_cleanup(scope.id()), Err(TerminateError::UnknownScope(id)) if id == scope.id()));
+        assert!(matches!(sup.terminate_scope(scope.id(), short_opts()), Err(TerminateError::UnknownScope(id)) if id == scope.id()));
+        original
+    });
+    let original = outcome.result.unwrap();
+    let retained = outcome
+        .termination
+        .expect("active invocation retains original cleanup");
+    assert_eq!(retained.scope, original.scope);
+    assert_eq!(retained.outcomes, original.outcomes);
+    assert!(retained.all_verified());
+    sup.shutdown().unwrap();
+}
+
+fn refused_scope_admission_consumes_no_id(sup: &BlockingSupervisor) {
+    let before = sup.create_scope();
+    for specs in [Vec::new(), vec![ProcessSpec::new("exit-immediately")]] {
+        let body_ran = AtomicBool::new(false);
+        let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sup.with_scope(specs, |_| {
+                body_ran.store(true, Ordering::SeqCst);
+            });
+        }));
+        assert!(
+            refusal.is_err(),
+            "unsupported driver must refuse scoped call"
+        );
+        assert!(
+            !body_ran.load(Ordering::SeqCst),
+            "body ran before driver refusal"
+        );
+    }
+    let after = sup.create_scope();
+    assert_eq!(
+        after.get(),
+        before.get() + 1,
+        "refused scoped calls admitted hidden scopes"
+    );
+}
+
+#[test]
+fn with_scope_localset_refuses_before_empty_or_nonempty_admission() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let sup = BlockingSupervisor::from_handle_and_builder(
+            tokio::runtime::Handle::current(),
+            SupervisorBuilder::new().backend(Arc::new(NullBackend::new())),
+        );
+        refused_scope_admission_consumes_no_id(&sup);
+        assert_eq!(sup.supervisor().shutdown().await.unwrap().scopes.len(), 2);
+    });
+}
+
+#[test]
+fn with_scope_borrowed_current_thread_refuses_before_empty_or_nonempty_admission() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sup = BlockingSupervisor::from_handle_and_builder(
+        runtime.handle().clone(),
+        SupervisorBuilder::new().backend(Arc::new(NullBackend::new())),
+    );
+    refused_scope_admission_consumes_no_id(&sup);
+    assert_eq!(
+        runtime
+            .block_on(sup.supervisor().shutdown())
+            .unwrap()
+            .scopes
+            .len(),
+        2
+    );
+}

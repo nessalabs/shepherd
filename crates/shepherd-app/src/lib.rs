@@ -25,8 +25,8 @@ pub use ports::{
 };
 pub use registry::ScopeRegistry;
 pub use supervisor::{
-    ObservedSpawn, ProcessSupervisor, ScopeTerminationReport, ScopedProcesses, ShutdownReport,
-    SpawnObservation, WithScopeResult,
+    ObservedScope, ObservedSpawn, ProcessSupervisor, ScopeTerminationReport, ScopedProcesses,
+    ShutdownReport, SpawnObservation, WithScopeResult,
 };
 
 pub mod output;

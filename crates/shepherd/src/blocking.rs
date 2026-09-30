@@ -33,10 +33,10 @@ use std::time::{Duration, Instant};
 use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 
 use crate::{
-    ObservationError, OutputSnapshot, ProcessExit, ProcessId, ProcessOutput, ProcessScopeId,
-    ProcessSpec, ProcessStats, ProcessSupervisor, ScopeCreationError, ScopeTerminationReport,
-    ScopeUsage, ScopedProcesses, ShutdownError, ShutdownReport, SpawnError, StatsError,
-    SupervisorBuilder, TerminateError, TerminateOptions, WaitError, WithScopeResult,
+    ObservationError, ObservedScope, OutputSnapshot, ProcessExit, ProcessId, ProcessOutput,
+    ProcessScopeId, ProcessSpec, ProcessStats, ProcessSupervisor, ScopeCreationError,
+    ScopeTerminationReport, ScopeUsage, ScopedProcesses, ShutdownError, ShutdownReport, SpawnError,
+    StatsError, SupervisorBuilder, TerminateError, TerminateOptions, WaitError, WithScopeResult,
 };
 
 /// Owns or borrows a Tokio runtime and exposes the supervisor synchronously.
@@ -338,8 +338,8 @@ impl BlockingSupervisor {
     /// waiter can subscribe before the body returns.
     ///
     /// # Panics
-    /// Panics if shutdown has started before the scope is admitted, or if `body`
-    /// panics (after cleanup).
+    /// Panics before admission if the runtime driver is unsupported or shutdown
+    /// has started, or resumes a body panic after cleanup.
     pub fn with_scope<T, F>(&self, specs: Vec<ProcessSpec>, body: F) -> WithScopeResult<T>
     where
         F: FnOnce(BlockingScopedProcesses) -> T + Send,
@@ -351,8 +351,8 @@ impl BlockingSupervisor {
     /// [`Self::with_scope`] with explicit termination options.
     ///
     /// # Panics
-    /// Panics if shutdown has started before the scope is admitted, or if `body`
-    /// panics (after cleanup).
+    /// Panics before admission if the runtime driver is unsupported or shutdown
+    /// has started, or resumes a body panic after cleanup.
     pub fn with_scope_options<T, F>(
         &self,
         specs: Vec<ProcessSpec>,
@@ -366,9 +366,11 @@ impl BlockingSupervisor {
         // Do not drive the body as part of an async `with_scope` future.
         // `drive` enters the runtime; a nested spawn/wait then hits the
         // same-runtime current-thread refusal (or a nested `block_on`).
-        // Register the shared cleanup channel before the body so another
-        // thread can `wait_scope_cleanup` without seeing UnknownScope.
-        let scope = self.inner.create_observed_scope();
+        // Drive admission itself: the existing runtime refusal then precedes
+        // scope/channel allocation, any spawn, and the synchronous body.
+        // The returned owner keeps its original report through lookup eviction.
+        let observed = self.drive(async { self.inner.create_observed_scope() });
+        let scope = observed.id();
         let mut processes = Vec::new();
         let mut spawn_error = None;
         for spec in specs {
@@ -391,14 +393,14 @@ impl BlockingSupervisor {
                 match catch_unwind(AssertUnwindSafe(|| body(handle))) {
                     Ok(value) => Ok(value),
                     Err(panic) => {
-                        let _ = self.finish_observed_scope(scope, opts);
+                        let _ = self.finish_observed_scope(observed, opts);
                         resume_unwind(panic);
                     }
                 }
             }
         };
 
-        let termination = self.finish_observed_scope(scope, opts);
+        let termination = self.finish_observed_scope(observed, opts);
         WithScopeResult {
             scope,
             result,
@@ -408,10 +410,10 @@ impl BlockingSupervisor {
 
     fn finish_observed_scope(
         &self,
-        scope: ProcessScopeId,
+        observed: ObservedScope,
         opts: TerminateOptions,
     ) -> Result<ScopeTerminationReport, TerminateError> {
-        self.drive(self.inner.finish_scoped_cleanup(scope, opts))
+        self.drive(observed.finish(opts))
     }
 
     /// Runs one process with a deadline that covers spawn and wait.

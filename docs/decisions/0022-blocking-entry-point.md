@@ -73,6 +73,22 @@ Nested blocks remain independent scopes.
 Both entry points finish observed scopes through the application cleanup owner.
 The facade drives that operation before returning or resuming a body panic.
 
+### Active scoped invocation ownership
+
+The active invocation owns its admission's cleanup backstop and original report
+channel, bound to the originating supervisor. A scope ID is lookup identity;
+bounded history is not the active invocation's cleanup owner. Async and blocking
+scopes carry this same application owner through body execution and cleanup.
+Blocking admission itself is driven through the existing runtime driver so its
+context refusal precedes every scope, channel, process, or body effect.
+
+| Ordering | Required owner and result | Evidence |
+| --- | --- | --- |
+| Runtime driver refuses LocalSet or borrowed current-thread handle | Refuse before polling scope admission; no scope ID consumed and no body executed | Empty and nonempty scoped runtime-refusal counterparts |
+| Body externally completes its scope, then 256 other observed scopes finish | Active owner retains original verified report after both lookup histories expire | Active blocking scope history-turnover regression |
+| Body returns or panics | Consume original owner through the shared cleanup routine; verified report survives independently of lookup | Normal history-turnover regression and existing original-panic cleanup regressions |
+| Active owner is dropped before cleanup finishes | Original armed backstop issues scope-only hard kill and retains unverified interruption | Shared application backstop contract |
+
 | Cleanup result | Action before returning or resuming panic | Evidence |
 | --- | --- | --- |
 | Retained verified report | Preserve report; no additional hard kill | Existing verified panic cleanup regression |

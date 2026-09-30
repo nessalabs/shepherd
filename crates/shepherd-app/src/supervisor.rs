@@ -76,6 +76,40 @@ impl ObservedSpawn {
     }
 }
 
+/// Owns one observed scope's original cleanup channel and armed backstop.
+/// Bounded history eviction cannot release this active owner's report. Dropping
+/// it before verified cleanup issues a scope-only synchronous hard kill and
+/// publishes interruption; that backstop does not confirm reap.
+pub struct ObservedScope {
+    supervisor: ProcessSupervisor,
+    cleanup: ScopeCleanupBackstop,
+}
+
+impl ObservedScope {
+    /// Identity of the scope admitted by the originating supervisor.
+    #[must_use]
+    pub fn id(&self) -> ProcessScopeId {
+        self.cleanup.scope
+    }
+
+    /// Consumes this owner through the shared application cleanup routine.
+    /// Retains its original verified report even after both lookup histories expire.
+    /// Otherwise errors and unverified reports issue the synchronous backstop
+    /// before being published unchanged. Dropping this future also runs the backstop.
+    ///
+    /// # Errors
+    /// Returns the original termination error. Unverified reports remain
+    /// successful values whose `all_verified()` is false.
+    pub async fn finish(
+        self,
+        opts: TerminateOptions,
+    ) -> Result<ScopeTerminationReport, TerminateError> {
+        self.supervisor
+            .finish_scope_cleanup(self.cleanup, opts)
+            .await
+    }
+}
+
 /// The aggregated result of terminating a scope.
 #[derive(Debug, Clone)]
 pub struct ScopeTerminationReport {
@@ -394,36 +428,25 @@ impl ProcessSupervisor {
         self.try_create_scope_before_publish(|_| {})
     }
 
-    /// Admits a scope and registers it for [`Self::wait_scope_cleanup`].
+    /// Admits an owned scope and registers it for [`Self::wait_scope_cleanup`].
     ///
-    /// `with_scope` and the blocking facade share this so a waiter can subscribe
-    /// before cleanup runs, and a later verified `terminate_scope` can replace
-    /// an earlier failure on the same channel.
+    /// The returned owner retains its original cleanup report independently of
+    /// bounded lookup history. It is bound to this supervisor's cleanup authority.
     ///
     /// # Panics
     /// Panics if shutdown has started. Use [`Self::try_create_observed_scope`]
     /// when rejection must be handled.
     #[must_use]
-    pub fn create_observed_scope(&self) -> ProcessScopeId {
-        self.admit_observed_scope().0
+    pub fn create_observed_scope(&self) -> ObservedScope {
+        self.try_create_observed_scope()
+            .expect("cannot create a scope after supervisor shutdown starts")
     }
 
     /// Fallible form of [`Self::create_observed_scope`].
     ///
     /// # Errors
     /// Returns [`ScopeCreationError::SupervisorClosed`] once shutdown starts.
-    pub fn try_create_observed_scope(&self) -> Result<ProcessScopeId, ScopeCreationError> {
-        Ok(self.try_admit_observed_scope()?.0)
-    }
-
-    fn admit_observed_scope(&self) -> (ProcessScopeId, ScopeCleanupSender) {
-        self.try_admit_observed_scope()
-            .expect("cannot create a scope after supervisor shutdown starts")
-    }
-
-    fn try_admit_observed_scope(
-        &self,
-    ) -> Result<(ProcessScopeId, ScopeCleanupSender), ScopeCreationError> {
+    pub fn try_create_observed_scope(&self) -> Result<ObservedScope, ScopeCreationError> {
         let (report_tx, _) = tokio::sync::watch::channel(None);
         let sender = report_tx.clone();
         let scope = self.try_create_scope_before_publish(|scope| {
@@ -433,43 +456,15 @@ impl ProcessSupervisor {
                 .expect("scope results mutex")
                 .insert(scope, sender);
         })?;
-        Ok((scope, report_tx))
-    }
-
-    /// Finishes an observed scope with the same cleanup backstop as `with_scope`.
-    ///
-    /// Retains verified success. Otherwise termination errors and unverified
-    /// reports issue a synchronous scope hard kill before being published unchanged.
-    /// Dropping the driven future while cleanup is pending also invokes the backstop.
-    /// A hard kill alone does not confirm reap.
-    ///
-    /// # Errors
-    /// Returns `UnknownScope` unless the scope was admitted for observation, or
-    /// the original termination error. Unverified reports remain successful values
-    /// whose `all_verified()` is false.
-    pub async fn finish_scoped_cleanup(
-        &self,
-        scope: ProcessScopeId,
-        opts: TerminateOptions,
-    ) -> Result<ScopeTerminationReport, TerminateError> {
-        let report = self
-            .inner
-            .scope_results
-            .lock()
-            .expect("scope results mutex")
-            .get(&scope)
-            .cloned()
-            .ok_or(TerminateError::UnknownScope(scope))?;
-        self.finish_scope_cleanup(
-            ScopeCleanupBackstop {
+        Ok(ObservedScope {
+            supervisor: self.worker(),
+            cleanup: ScopeCleanupBackstop {
                 backend: self.inner.backend.clone(),
                 scope,
-                report,
+                report: report_tx,
                 armed: true,
             },
-            opts,
-        )
-        .await
+        })
     }
 
     async fn finish_scope_cleanup(
@@ -765,18 +760,13 @@ impl ProcessSupervisor {
             finish: Some(finish),
         };
         // Register observation before shutdown can discover this scope.
-        let (scope, report_tx) = self.admit_observed_scope();
+        let observed = self.create_observed_scope();
+        let scope = observed.id();
+        let report_tx = observed.cleanup.report.clone();
         let mut report_rx = report_tx.subscribe();
-        let worker = self.worker();
-        let backstop = ScopeCleanupBackstop {
-            backend: self.inner.backend.clone(),
-            scope,
-            report: report_tx.clone(),
-            armed: true,
-        };
         let cleanup = tokio::spawn(async move {
             let _ = finished.await;
-            let _ = worker.finish_scope_cleanup(backstop, opts).await;
+            let _ = observed.finish(opts).await;
         });
         tokio::spawn(async move {
             if let Err(error) = cleanup.await {
