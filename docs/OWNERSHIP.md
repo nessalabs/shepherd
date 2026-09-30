@@ -8,7 +8,7 @@
 | processes / capabilities / os_pid | Read-only snapshots; they do not transfer raw child ownership. `os_pid` stays available after an immediate natural exit (spawn may return after the monitor has already pruned) until the last 256 attachments. The bound is enforced at attach so a monitor that loses the registry race cannot grow the map. |
 | stats | Reads an interval cache. Cancellation performs no OS effect. NotReady is distinct from unknown/exited and sampler failure. Sampling failure never relinquishes ownership. |
 | take_output / read | Transfers an observation handle once. Clones share consumption. Retaining it retains only bounded bytes, not the child or supervisor. Root reap does not wait for inherited pipes. Read through both stream-closed flags for complete output; reader failures are observable independently of process cleanup. |
-| wait | Registers under ownership lock. Dropping the future only removes that observer. The spawn monitor remains responsible for reap. Already registered waiters survive history eviction. |
+| wait | Registers under ownership lock. Dropping the future only removes that observer. The spawn monitor remains responsible for reap. Already registered waiters survive history eviction. Pending and unverified IDs own watch senders; verified completed history owns only ProcessExit values (at most 256). Verified publication replaces the pending sender after waking its subscribers; registered receivers retain their own channel until consumed or dropped. |
 | terminate | Sends grace, then force if still driven. Dropping the future does not itself signal or kill. Committed domain state and the monitor remain intact; retry is valid. Scope membership is unchanged. |
 | terminate_scope | Serialized against spawn and other cleanup calls. Dropping its future stops that invocation's fanout; it does not invoke an ownership Drop kill. Retry finishes cleanup. Verified reports require root monitor outcomes and successful containment cleanup. |
 | shutdown | Sets shutdown intent immediately and serializes cleanup. New scopes and spawns are rejected. Successful shutdown joins the sampler coordinator; cancellation retains its join for retry. Native observations already running in blocking workers finish independently, with at most 16 per backend and one per child; timing out an observation does not cancel its OS call. Failure/cancellation can be retried; no early flag turns failure into success. |
@@ -37,3 +37,18 @@ create/assign sequence has an abrupt-death setup window. No fallback claims a st
 containment capability than it implements. Non-child zombie reaping belongs to the OS
 parent/subreaper; cgroup emptiness proves absence of live members, not arbitrary waitpid
 ownership. Ordinary Windows graceful signaling is unsupported.
+
+## Waiter history publication
+
+| Ordering | Retained owner and result | Evidence |
+| --- | --- | --- |
+| Wait registers before exit | Pending slot owns sender; future owns receiver | Registration/publication interleaving and cancellation tests |
+| Verified exit arrives | Publish to registered receivers, then replace slot with completed exit value | Existing early waiter plus history turnover test |
+| Verified exit precedes wait | Completed value resolves directly; no notification channel enters completed history | Late waiter and verified correction tests |
+| Unverified exit is corrected | Keep its channel until verification so existing receivers get the correction; preserve verified evidence and one FIFO entry | Delayed unverified publication regression |
+| Completed history turns over | Evict oldest completed values; registered futures still resolve independently | Bounded history test and unchanged isolated heap workload |
+
+Verified completed notification channels serve no further publication purpose. Retaining them
+also retains platform synchronization allocations whose initialization depends on
+whether a receiver happened to poll before exit. The completed value is the evidence
+late callers need; pending subscriber channels have their own lifetime.
