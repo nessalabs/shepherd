@@ -30,7 +30,9 @@ By default, each Tokio runtime runs one supervisor through 512 warm-up process l
 then 1,024 measured lifecycles. Every child writes to both captured streams, exits,
 and receives verified scope cleanup. The supervisor stays alive throughout. The
 warm-up exceeds the 256-entry history limits; shutting down between cycles cannot
-hide growing registries.
+hide growing registries. `os_pid` history is one of those tables: it is bounded at
+attach (last 256), not only when the monitor still sees a verified reap. A
+`terminate_scope` that wins the registry race must not grow the map.
 
 After every 256 measured cycles, live allocations must stay within 16 blocks and
 64 KiB of the warm baseline. The byte allowance covers bounded history hash-table

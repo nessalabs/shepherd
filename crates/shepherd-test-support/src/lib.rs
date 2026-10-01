@@ -15,6 +15,7 @@ pub const CGROUP_ROOT: &str = "SHEPHERD_CGROUP_ROOT";
 
 /// Child-launch protocol names, not user-configurable test tuning.
 pub mod probe {
+    pub const BLOCKING_RUNTIME_CHILD: &str = "SHEPHERD_BLOCKING_RUNTIME_CHILD";
     pub const VALUE: &str = "SHEPHERD_PROBE_VALUE";
     pub const ABSENT: &str = "SHEPHERD_PROBE_ABSENT";
     pub const CWD: &str = "SHEPHERD_PROBE_CWD";

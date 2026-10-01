@@ -5,15 +5,18 @@
 | build / clone | Only user-facing handles share CleanupGuard. Building needs no runtime. IDs belong to the originating supervisor. |
 | create_scope / try_create_scope | Atomically admits one lifetime scope before shutdown. try_create_scope returns ScopeCreationError afterward; create_scope panics after releasing its lock. It needs explicit cleanup even when all roots exit naturally; the containment resource may still own descendants. |
 | spawn | An internal worker holds the scope operation lock through backend spawn, attachment and monitor start. Dropping the caller future detaches that worker; cleanup waits for it. Last-owner Drop sets shutdown intent, so a late spawn is killed and reaped. A canceled spawn may complete in its scope even though its ID is not delivered. |
-| processes / capabilities | Read-only snapshots; they do not transfer raw child ownership. |
+| create_observed_scope / ObservedScope | Admission returns one non-clone cleanup owner bound to its originating supervisor. It retains the original report channel and armed backstop independently of both bounded lookup histories. Consuming finish uses the shared application cleanup routine; dropping the owner or its pending finish future runs the scope-only interruption backstop. |
+| spawn_observed / ObservedSpawn | Starts the same owned spawn worker. At attachment, before monitor start, the handle receives the original capture observer and a registered exit receiver. Canceling complete retains both worker completion and admission in the handle. After cancellation, finish scope cleanup before recovering admission. Dropping the handle releases observation data and detaches the worker; it does not confirm cleanup. |
+| processes / capabilities / os_pid | Read-only snapshots; they do not transfer raw child ownership. `os_pid` stays available after an immediate natural exit (spawn may return after the monitor has already pruned) until the last 256 attachments. The bound is enforced at attach so a monitor that loses the registry race cannot grow the map. |
 | stats | Reads an interval cache. Cancellation performs no OS effect. NotReady is distinct from unknown/exited and sampler failure. Sampling failure never relinquishes ownership. |
 | take_output / read | Transfers an observation handle once. Clones share consumption. Retaining it retains only bounded bytes, not the child or supervisor. Root reap does not wait for inherited pipes. Read through both stream-closed flags for complete output; reader failures are observable independently of process cleanup. |
-| wait | Registers under ownership lock. Dropping the future only removes that observer. The spawn monitor remains responsible for reap. Already registered waiters survive history eviction. |
+| wait | Registers under ownership lock. Dropping the future only removes that observer. The spawn monitor remains responsible for reap. Already registered waiters survive history eviction. Pending and unverified IDs own watch senders; verified completed history owns only ProcessExit values (at most 256). Verified publication replaces the pending sender after waking its subscribers; registered receivers retain their own channel until consumed or dropped. |
 | terminate | Sends grace, then force if still driven. Dropping the future does not itself signal or kill. Committed domain state and the monitor remain intact; retry is valid. Scope membership is unchanged. |
 | terminate_scope | Serialized against spawn and other cleanup calls. Dropping its future stops that invocation's fanout; it does not invoke an ownership Drop kill. Retry finishes cleanup. Verified reports require root monitor outcomes and successful containment cleanup. |
 | shutdown | Sets shutdown intent immediately and serializes cleanup. New scopes and spawns are rejected. Successful shutdown joins the sampler coordinator; cancellation retains its join for retry. Native observations already running in blocking workers finish independently, with at most 16 per backend and one per child; timing out an observation does not cancel its OS call. Failure/cancellation can be retried; no early flag turns failure into success. |
-| with_scope / with_scope_options | Like create_scope, these panic if admission occurs after shutdown starts. The caller owns the closure future; a separate worker owns cleanup. Success, ?, partial spawn failure, panic and cancellation signal the same worker. Normal return carries both result and report; canceled callers observe wait_scope_cleanup. Nested scopes are independent. Active blocks retain externally completed results through lookup eviction. |
+| with_scope / with_scope_options | Like create_scope, these panic if admission occurs after shutdown starts. The caller owns the closure future; a separate worker owns cleanup. Success, ?, partial spawn failure, panic and cancellation signal the same worker. Normal return carries both result and report; canceled callers observe wait_scope_cleanup. Nested scopes are independent. Async and blocking active blocks retain externally completed results through the same owned observation, independent of lookup eviction. |
 | wait_scope_cleanup | Observes the cleanup report; cancellation does not stop cleanup. Reports are retained within the documented history bound. |
+| blocking::BlockingSupervisor | Facade driver only. Same ownership as ProcessSupervisor. `run` applies one deadline to spawn+wait, then terminate_scope with the caller's full terminate budget (not leftover crumbs). It claims the capture observer at admission so a delayed cleanup cannot lose it to the 256-entry unclaimed-output history. Spawn/wait errors do not hide a later terminate failure. `Completed`/`TimedOut` are not treated as verified cleanup unless `all_verified()` says so (`Completed` includes the wait `ProcessExit`). `with_scope` admits an observed scope (shared `wait_scope_cleanup` channel) and uses the async `ScopedProcesses` handle so authorization prunes with observation history. Scope admission is driven before the body or any spawn, so unsupported runtime contexts refuse without consuming a scope ID. The body runs outside any driven future so nested spawn/wait can `block_on` (including current-thread `from_runtime`); a body panic drives the shared application cleanup routine, issues the scope hard-kill backstop on failure or unverified cleanup, retains the original report on that channel, then resumes. Same-runtime multi-thread calls release their scheduler worker with `block_in_place` before starting/joining a helper thread. Same-runtime `LocalSet` blocking is refused before future polling; use the async facade or `spawn_blocking`. Current-thread `from_handle` is refused (deadlock / no I/O). Detaching `supervisor()` past the wrapper's runtime lifetime cannot complete verified wait/reap. Dropping an owned runtime from inside another Tokio context uses shutdown_background (unverified). |
 | last supervisor Drop | Synchronous hard_kill_all, no async verification. Internal workers cannot keep this guard alive. Ordinary terminate-future Drop is deliberately separate. |
 | runtime shutdown | Unfinished cleanup workers issue a scope-only sync backstop and retain an unverified error; already published verified reports are preserved. A stopped runtime cannot prove wait/reap. Explicit shutdown before runtime destruction is the verified path. |
 
@@ -36,3 +39,32 @@ create/assign sequence has an abrupt-death setup window. No fallback claims a st
 containment capability than it implements. Non-child zombie reaping belongs to the OS
 parent/subreaper; cgroup emptiness proves absence of live members, not arbitrary waitpid
 ownership. Ordinary Windows graceful signaling is unsupported.
+
+## Waiter history publication
+
+| Ordering | Retained owner and result | Evidence |
+| --- | --- | --- |
+| Wait registers before exit | Pending slot owns sender; future owns receiver | Registration/publication interleaving and cancellation tests |
+| Verified exit arrives | Publish to registered receivers, then replace slot with completed exit value | Existing early waiter plus history turnover test |
+| Verified exit precedes wait | Completed value resolves directly; no notification channel enters completed history | Late waiter and verified correction tests |
+| Unverified exit is corrected | Keep its channel until verification so existing receivers get the correction; preserve verified evidence and one FIFO entry | Delayed unverified publication regression |
+| Completed history turns over | Evict oldest completed values; registered futures still resolve independently | Bounded history test and unchanged isolated heap workload |
+
+Verified completed notification channels serve no further publication purpose. Retaining them
+also retains platform synchronization allocations whose initialization depends on
+whether a receiver happened to poll before exit. The completed value is the evidence
+late callers need; pending subscriber channels have their own lifetime.
+
+## Ordinary scope report history
+
+| Report cardinality | Retained representation | Read behavior |
+| --- | --- | --- |
+| Empty | Inline empty value | Return an empty public outcomes vector |
+| One root | Inline original process ID and outcome | Return that exact pair in the public outcomes vector |
+| Multiple roots | Original ordered outcomes vector | Clone its exact ordered pairs for the public report |
+| History turnover | Same 256-scope FIFO, with table capacity reserved at construction | Expired scope lookup remains unknown; in-flight operation owners retain their report |
+
+Natural exit may prune a root before scope termination captures its outcome, so
+completed ordinary reports can alternate between zero and one outcome. Neither
+case needs a retained heap allocation. This changes only private storage;
+public reports preserve their scope, outcomes, ordering, and verification meaning.

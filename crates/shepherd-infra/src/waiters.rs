@@ -12,8 +12,14 @@ use tokio::sync::watch;
 
 #[derive(Debug, Default)]
 struct Slots {
-    senders: HashMap<ProcessId, watch::Sender<Option<ProcessExit>>>,
+    entries: HashMap<ProcessId, Slot>,
     completed: VecDeque<ProcessId>,
+}
+
+#[derive(Debug)]
+enum Slot {
+    Pending(watch::Sender<Option<ProcessExit>>),
+    Completed(ProcessExit),
 }
 
 /// Wakes `wait(pid)` callers when a process is reaped. A late waiter (after the exit was
@@ -29,55 +35,69 @@ impl InMemoryWaiters {
     pub fn new() -> Self {
         Self::default()
     }
-
-    fn sender(&self, pid: ProcessId) -> watch::Sender<Option<ProcessExit>> {
-        let mut slots = self.slots.lock().expect("waiters mutex");
-        slots
-            .senders
-            .entry(pid)
-            .or_insert_with(|| watch::channel(None).0)
-            .clone()
-    }
 }
 
 impl Waiters for InMemoryWaiters {
     fn signal_exit(&self, pid: ProcessId, exit: ProcessExit) {
         let mut slots = self.slots.lock().expect("waiters mutex");
-        let sender = slots
-            .senders
-            .entry(pid)
-            .or_insert_with(|| watch::channel(None).0)
-            .clone();
-        let previous = *sender.borrow();
-        if previous.is_some_and(|exit| exit.outcome.is_verified()) {
-            return;
+        let previously_published = match slots.entries.get(&pid) {
+            Some(Slot::Completed(_)) => return,
+            Some(Slot::Pending(sender)) => sender.borrow().is_some(),
+            None => false,
+        };
+        if let Some(Slot::Pending(sender)) = slots.entries.get(&pid) {
+            // Registered receivers retain this channel independently of history.
+            sender.send_replace(Some(exit));
         }
-        sender.send_replace(Some(exit));
-        if previous.is_none() {
+        if exit.outcome.is_verified() {
+            slots.entries.insert(pid, Slot::Completed(exit));
+        } else {
+            // A later verified correction must still reach registered receivers.
+            slots
+                .entries
+                .entry(pid)
+                .or_insert_with(|| Slot::Pending(watch::channel(Some(exit)).0));
+        }
+        if !previously_published {
             slots.completed.push_back(pid);
         }
         while slots.completed.len() > 256 {
             if let Some(old) = slots.completed.pop_front() {
-                slots.senders.remove(&old);
+                slots.entries.remove(&old);
             }
         }
     }
 
     fn try_get(&self, pid: ProcessId) -> Option<ProcessExit> {
         let slots = self.slots.lock().expect("waiters mutex");
-        slots.senders.get(&pid).and_then(|tx| *tx.borrow())
+        match slots.entries.get(&pid) {
+            Some(Slot::Completed(exit)) => Some(*exit),
+            Some(Slot::Pending(sender)) => *sender.borrow(),
+            None => None,
+        }
     }
 
     fn wait(&self, pid: ProcessId) -> WaitFuture {
-        let sender = self.sender(pid);
-        let mut rx = sender.subscribe();
+        let mut slots = self.slots.lock().expect("waiters mutex");
+        let entry = slots
+            .entries
+            .entry(pid)
+            .or_insert_with(|| Slot::Pending(watch::channel(None).0));
+        let mut rx = match entry {
+            Slot::Completed(exit) => {
+                let exit = *exit;
+                return Box::pin(std::future::ready(exit));
+            }
+            Slot::Pending(sender) => sender.subscribe(),
+        };
+        drop(slots);
         Box::pin(async move {
             loop {
                 if let Some(exit) = *rx.borrow_and_update() {
                     return exit;
                 }
-                // The sender lives in the slots map, so this only errors if the map is
-                // dropped, which cannot happen while a caller holds the supervisor.
+                // Verified publication releases the registry sender. Receivers still
+                // own its final value, including across lookup-history eviction.
                 if rx.changed().await.is_err() {
                     // Fall back to a final read; if still empty the sender is gone.
                     if let Some(exit) = *rx.borrow() {
@@ -119,6 +139,14 @@ mod tests {
     async fn verified_correction_survives_delayed_unverified_publication() {
         let waiters = InMemoryWaiters::new();
         let pid = ProcessId::new(1);
+        let pending = waiters.wait(pid);
+        let channel = {
+            let slots = waiters.slots.lock().unwrap();
+            match slots.entries.get(&pid).unwrap() {
+                Slot::Pending(sender) => sender.subscribe(),
+                Slot::Completed(_) => panic!("not yet published"),
+            }
+        };
         let mut exit = ProcessExit {
             pid,
             code: None,
@@ -129,12 +157,21 @@ mod tests {
             forced: false,
         };
         waiters.signal_exit(pid, exit);
+        assert!(
+            channel.has_changed().is_ok(),
+            "unverified corrections need a sender"
+        );
         let failed = exit;
         exit.outcome = TerminationOutcome::GracefulSuccess;
         exit.code = Some(0);
         waiters.signal_exit(pid, exit);
         waiters.signal_exit(pid, failed);
+        assert!(
+            channel.has_changed().is_err(),
+            "verified history must release its notification sender"
+        );
         assert_eq!(waiters.try_get(pid), Some(exit));
+        assert_eq!(pending.await, exit);
         assert_eq!(waiters.wait(pid).await, exit);
         assert_eq!(
             waiters
@@ -232,6 +269,6 @@ mod retention_tests {
         }
         assert!(waiters.try_get(ProcessId::new(1)).is_none());
         assert_eq!(pending.await.pid, ProcessId::new(1));
-        assert_eq!(waiters.slots.lock().unwrap().senders.len(), 256);
+        assert_eq!(waiters.slots.lock().unwrap().entries.len(), 256);
     }
 }

@@ -13,7 +13,7 @@ nix = { version = "0.29", features = ["process", "signal", "resource"] }
 
 [dependencies]
 shepherd-test-support = { path = "../crates/shepherd-test-support" }
-shepherd = { path = "../crates/shepherd" }
+shepherd = { path = "../crates/shepherd", features = ["blocking"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 
 [lints]

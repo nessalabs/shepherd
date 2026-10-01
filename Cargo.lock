@@ -679,6 +679,7 @@ dependencies = [
  "shepherd-domain",
  "shepherd-infra",
  "shepherd-test-support",
+ "thiserror",
  "tokio",
 ]
 

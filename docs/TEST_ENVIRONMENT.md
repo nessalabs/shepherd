@@ -71,3 +71,7 @@ SHEPHERD_STRESS_RUNTIME=both SHEPHERD_STRESS_SEED=42 SHEPHERD_SOAK_ROUNDS=200 \
 `TestEnvironment::heap()` shares runtime selection but ignores mixed-stress seed and
 iteration settings. Its 512-cycle warm-up and 256-cycle batch size are fixed to
 exercise history eviction. Allocation limits remain fixed detector invariants.
+
+`SHEPHERD_BLOCKING_RUNTIME_CHILD` is an internal child-launch protocol marker
+for the blocking runtime deadlock regression, not a workload setting. The
+parent launches only its exact test and owns the watchdog, kill and reap.

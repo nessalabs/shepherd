@@ -27,6 +27,89 @@ use crate::ports::{
 };
 use crate::registry::ScopeRegistry;
 
+/// Observation transferred at process attachment, before monitoring starts.
+/// Owns the capture observer and a registered exit receiver independently of
+/// bounded completed-history lookup. Dropping it does not terminate the process.
+pub struct SpawnObservation {
+    /// The process attached to the originally requested scope.
+    pub pid: ProcessId,
+    /// The original capture observer, if the backend provided one.
+    pub output: Option<crate::output::ProcessOutput>,
+    /// An exit observer registered before monitoring can publish and prune exit.
+    pub exit: crate::ports::WaitFuture,
+}
+
+/// Owned spawn completion and its independently retained attachment observation.
+/// Dropping a completion await keeps both owners here. Dropping this handle
+/// detaches the worker (which still owns spawn/reap) and releases unclaimed
+/// observation data; neither operation confirms cleanup.
+pub struct ObservedSpawn {
+    completion: Option<tokio::task::JoinHandle<Result<ProcessId, SpawnError>>>,
+    admission: tokio::sync::oneshot::Receiver<SpawnObservation>,
+}
+impl ObservedSpawn {
+    /// Waits for public spawn completion and transfers its original observation.
+    /// Cancellation retains the worker and admission receiver in this handle.
+    ///
+    /// # Errors
+    /// Returns the original spawn error, worker failure, or an error if this
+    /// completion or its observation has already been consumed.
+    pub async fn complete(&mut self) -> Result<SpawnObservation, SpawnError> {
+        let completion = self
+            .completion
+            .as_mut()
+            .ok_or_else(|| SpawnError::Os("observed spawn completion already consumed".into()))?;
+        let result = completion.await;
+        self.completion = None;
+        result.map_err(|error| SpawnError::Os(format!("spawn worker failed: {error}")))??;
+        self.take_admission().ok_or_else(|| {
+            SpawnError::Os("observed spawn admission already consumed or unavailable".into())
+        })
+    }
+
+    /// Transfers an attached observation without waiting for public completion.
+    /// Returns `None` if attachment has not happened, failed, or was consumed.
+    /// After cancelling completion, first finish original scope cleanup before
+    /// using this to recover admission; cleanup waits for the original spawn worker.
+    pub fn take_admission(&mut self) -> Option<SpawnObservation> {
+        self.admission.try_recv().ok()
+    }
+}
+
+/// Owns one observed scope's original cleanup channel and armed backstop.
+/// Bounded history eviction cannot release this active owner's report. Dropping
+/// it before verified cleanup issues a scope-only synchronous hard kill and
+/// publishes interruption; that backstop does not confirm reap.
+pub struct ObservedScope {
+    supervisor: ProcessSupervisor,
+    cleanup: ScopeCleanupBackstop,
+}
+
+impl ObservedScope {
+    /// Identity of the scope admitted by the originating supervisor.
+    #[must_use]
+    pub fn id(&self) -> ProcessScopeId {
+        self.cleanup.scope
+    }
+
+    /// Consumes this owner through the shared application cleanup routine.
+    /// Retains its original verified report even after both lookup histories expire.
+    /// Otherwise errors and unverified reports issue the synchronous backstop
+    /// before being published unchanged. Dropping this future also runs the backstop.
+    ///
+    /// # Errors
+    /// Returns the original termination error. Unverified reports remain
+    /// successful values whose `all_verified()` is false.
+    pub async fn finish(
+        self,
+        opts: TerminateOptions,
+    ) -> Result<ScopeTerminationReport, TerminateError> {
+        self.supervisor
+            .finish_scope_cleanup(self.cleanup, opts)
+            .await
+    }
+}
+
 /// The aggregated result of terminating a scope.
 #[derive(Debug, Clone)]
 pub struct ScopeTerminationReport {
@@ -41,6 +124,45 @@ impl ScopeTerminationReport {
     #[must_use]
     pub fn all_verified(&self) -> bool {
         self.outcomes.iter().all(|(_, o)| o.is_verified())
+    }
+}
+
+/// Private bounded history avoids an allocation for empty and single-root reports.
+/// The public report keeps its current vector contract and exact ordered evidence.
+struct RetainedScopeReport {
+    scope: ProcessScopeId,
+    outcomes: RetainedScopeOutcomes,
+}
+
+enum RetainedScopeOutcomes {
+    Empty,
+    One((ProcessId, TerminationOutcome)),
+    Many(Vec<(ProcessId, TerminationOutcome)>),
+}
+
+impl RetainedScopeReport {
+    fn retain(report: &ScopeTerminationReport) -> Self {
+        let outcomes = match report.outcomes.as_slice() {
+            [] => RetainedScopeOutcomes::Empty,
+            [outcome] => RetainedScopeOutcomes::One(*outcome),
+            outcomes => RetainedScopeOutcomes::Many(outcomes.to_vec()),
+        };
+        Self {
+            scope: report.scope,
+            outcomes,
+        }
+    }
+
+    fn report(&self) -> ScopeTerminationReport {
+        let outcomes = match &self.outcomes {
+            RetainedScopeOutcomes::Empty => Vec::new(),
+            RetainedScopeOutcomes::One(outcome) => vec![*outcome],
+            RetainedScopeOutcomes::Many(outcomes) => outcomes.clone(),
+        };
+        ScopeTerminationReport {
+            scope: self.scope,
+            outcomes,
+        }
     }
 }
 
@@ -115,10 +237,79 @@ struct Inner {
     completed_scope_results: Mutex<VecDeque<ProcessScopeId>>,
     stats_interval: Duration,
     completed: Mutex<VecDeque<ProcessId>>,
-    reports: Mutex<HashMap<ProcessScopeId, ScopeTerminationReport>>,
+    reports: Mutex<HashMap<ProcessScopeId, RetainedScopeReport>>,
     pending_outcomes: Mutex<HashMap<ProcessScopeId, HashMap<ProcessId, TerminationOutcome>>>,
     completed_scopes: Mutex<VecDeque<ProcessScopeId>>,
     shutdown_serial: tokio::sync::Mutex<()>,
+    os_pids: Mutex<OsPidHistory>,
+}
+
+/// Last 256 attached OS identities. Bound is enforced at `remember`, not on
+/// verified reap: the monitor often returns after `terminate_scope` has already
+/// dropped the registry entry, and a failed wait never reached the old evictor.
+const OS_PID_HISTORY_BOUND: usize = 256;
+
+const SCOPE_REPORT_HISTORY_BOUND: usize = 256;
+
+/// `os_pid` must survive an immediate natural exit: spawn attaches, the monitor
+/// reaps, and prune can run before the caller looks up the OS identity.
+struct OsPidHistory {
+    by_pid: HashMap<ProcessId, u32>,
+    order: VecDeque<ProcessId>,
+}
+
+impl Default for OsPidHistory {
+    fn default() -> Self {
+        Self {
+            // Headroom so a full 256-entry table does not rehash after warmup.
+            by_pid: HashMap::with_capacity(OS_PID_HISTORY_BOUND * 2),
+            order: VecDeque::with_capacity(OS_PID_HISTORY_BOUND),
+        }
+    }
+}
+
+impl OsPidHistory {
+    fn remember(&mut self, pid: ProcessId, os_pid: u32) {
+        if self.by_pid.insert(pid, os_pid).is_some() {
+            return;
+        }
+        self.order.push_back(pid);
+        while self.order.len() > OS_PID_HISTORY_BOUND {
+            if let Some(old) = self.order.pop_front() {
+                self.by_pid.remove(&old);
+            }
+        }
+    }
+
+    fn get(&self, pid: ProcessId) -> Option<u32> {
+        self.by_pid.get(&pid).copied()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        debug_assert_eq!(self.by_pid.len(), self.order.len());
+        self.by_pid.len()
+    }
+}
+
+#[cfg(test)]
+mod os_pid_history_tests {
+    use super::*;
+
+    #[test]
+    fn remember_evicts_oldest_without_a_verified_reap() {
+        let mut history = OsPidHistory::default();
+        let ids: Vec<_> = (0..300).map(ProcessId::new).collect();
+        for (index, pid) in ids.iter().copied().enumerate() {
+            history.remember(pid, u32::try_from(index).expect("os pid"));
+            assert!(history.len() <= OS_PID_HISTORY_BOUND);
+        }
+        assert_eq!(history.len(), OS_PID_HISTORY_BOUND);
+        assert_eq!(history.get(ids[0]), None);
+        assert_eq!(history.get(ids[43]), None);
+        assert_eq!(history.get(ids[44]), Some(44));
+        assert_eq!(history.get(ids[299]), Some(299));
+    }
 }
 
 // Claims and completion share this lock order; only retained captures consume history.
@@ -193,10 +384,13 @@ impl ProcessSupervisor {
                 completed_scope_results: Mutex::new(VecDeque::new()),
                 stats_interval: stats_interval.max(Duration::from_millis(1)),
                 completed: Mutex::new(VecDeque::new()),
-                reports: Mutex::new(HashMap::new()),
+                reports: Mutex::new(HashMap::with_capacity(SCOPE_REPORT_HISTORY_BOUND * 2)),
                 pending_outcomes: Mutex::new(HashMap::new()),
-                completed_scopes: Mutex::new(VecDeque::new()),
+                completed_scopes: Mutex::new(VecDeque::with_capacity(
+                    SCOPE_REPORT_HISTORY_BOUND + 1,
+                )),
                 shutdown_serial: tokio::sync::Mutex::new(()),
+                os_pids: Mutex::new(OsPidHistory::default()),
                 shutting_down: Arc::clone(&shutting_down),
                 owners_dropped: Arc::clone(&owners_dropped),
             }),
@@ -232,6 +426,63 @@ impl ProcessSupervisor {
     /// without allocating an id, registry entry, or operation lock.
     pub fn try_create_scope(&self) -> Result<ProcessScopeId, ScopeCreationError> {
         self.try_create_scope_before_publish(|_| {})
+    }
+
+    /// Admits an owned scope and registers it for [`Self::wait_scope_cleanup`].
+    ///
+    /// The returned owner retains its original cleanup report independently of
+    /// bounded lookup history. It is bound to this supervisor's cleanup authority.
+    ///
+    /// # Panics
+    /// Panics if shutdown has started. Use [`Self::try_create_observed_scope`]
+    /// when rejection must be handled.
+    #[must_use]
+    pub fn create_observed_scope(&self) -> ObservedScope {
+        self.try_create_observed_scope()
+            .expect("cannot create a scope after supervisor shutdown starts")
+    }
+
+    /// Fallible form of [`Self::create_observed_scope`].
+    ///
+    /// # Errors
+    /// Returns [`ScopeCreationError::SupervisorClosed`] once shutdown starts.
+    pub fn try_create_observed_scope(&self) -> Result<ObservedScope, ScopeCreationError> {
+        let (report_tx, _) = tokio::sync::watch::channel(None);
+        let sender = report_tx.clone();
+        let scope = self.try_create_scope_before_publish(|scope| {
+            self.inner
+                .scope_results
+                .lock()
+                .expect("scope results mutex")
+                .insert(scope, sender);
+        })?;
+        Ok(ObservedScope {
+            supervisor: self.worker(),
+            cleanup: ScopeCleanupBackstop {
+                backend: self.inner.backend.clone(),
+                scope,
+                report: report_tx,
+                armed: true,
+            },
+        })
+    }
+
+    async fn finish_scope_cleanup(
+        &self,
+        mut backstop: ScopeCleanupBackstop,
+        opts: TerminateOptions,
+    ) -> Result<ScopeTerminationReport, TerminateError> {
+        let result = match backstop.verified_report() {
+            Some(report) => Ok(report),
+            None => self.terminate_scope(backstop.scope, opts).await,
+        };
+        let result = backstop.verified_report().map(Ok).unwrap_or(result);
+        if !result.as_ref().is_ok_and(|report| report.all_verified()) {
+            backstop.backend.hard_kill_scope(backstop.scope);
+        }
+        // No suspension separates publication from disarming the Drop backstop.
+        backstop.complete(result.clone());
+        result
     }
 
     // The callback lets the concurrency regression pause at the publication boundary.
@@ -298,14 +549,26 @@ impl ProcessSupervisor {
         self.inner.backend.scope_usage(scope).await
     }
 
-    /// Returns the OS PID of a retained managed process, for read-only observation.
+    /// Returns the OS PID of a managed process, for read-only observation.
     /// Shepherd's ProcessId is a logical ID and must not be passed as an OS PID.
     /// This lookup is not proof the process is still alive; it may exit immediately.
+    /// The identity stays available after an immediate natural exit until the
+    /// same 256-entry post-mortem bound as waiter history. The bound is the last
+    /// 256 attachments, including cases where the monitor never records a
+    /// verified reap because the registry was already pruned.
     #[must_use]
     pub fn os_pid(&self, pid: ProcessId) -> Option<u32> {
         let registry = self.lock_registry();
-        let scope = registry.scope_of(pid)?;
-        Some(registry.get(scope)?.get(pid)?.os_identity().pid)
+        if let Some(os) = registry
+            .scope_of(pid)
+            .and_then(|scope| registry.get(scope))
+            .and_then(|scope| scope.get(pid))
+            .map(|process| process.os_identity().pid)
+        {
+            return Some(os);
+        }
+        drop(registry);
+        self.inner.os_pids.lock().expect("os_pids mutex").get(pid)
     }
 
     /// Spawns a process into `scope`.
@@ -320,15 +583,34 @@ impl ProcessSupervisor {
         spec: ProcessSpec,
     ) -> Result<ProcessId, SpawnError> {
         let worker = self.worker();
-        tokio::spawn(async move { worker.spawn_owned(scope, spec).await })
+        tokio::spawn(async move { worker.spawn_owned(scope, spec, None).await })
             .await
             .map_err(|e| SpawnError::Os(format!("spawn worker failed: {e}")))?
+    }
+
+    /// Starts the existing owned spawn worker and retains attachment observation.
+    /// Capture is transferred and exit is registered before the monitor starts;
+    /// public completion still includes the original committed-event dispatch.
+    /// The caller must finish scope cleanup even if it drops this handle.
+    ///
+    /// # Panics
+    /// Panics outside an active Tokio runtime, as `tokio::spawn` does.
+    pub fn spawn_observed(&self, scope: ProcessScopeId, spec: ProcessSpec) -> ObservedSpawn {
+        let (admitted, admission) = tokio::sync::oneshot::channel();
+        let worker = self.worker();
+        ObservedSpawn {
+            completion: Some(tokio::spawn(async move {
+                worker.spawn_owned(scope, spec, Some(admitted)).await
+            })),
+            admission,
+        }
     }
 
     async fn spawn_owned(
         &self,
         scope: ProcessScopeId,
         spec: ProcessSpec,
+        admission: Option<tokio::sync::oneshot::Sender<SpawnObservation>>,
     ) -> Result<ProcessId, SpawnError> {
         let operation = self.scope_operation(scope).ok_or_else(|| {
             if self
@@ -413,7 +695,22 @@ impl ProcessSupervisor {
             .lock()
             .expect("spawn_times mutex")
             .insert(pid, self.inner.clock.now());
-        if let Some(output) = self.inner.backend.output(&spawned) {
+        self.inner
+            .os_pids
+            .lock()
+            .expect("os_pids mutex")
+            .remember(pid, spawned.os.pid);
+        let output = self.inner.backend.output(&spawned);
+        if let Some(admission) = admission {
+            let observation = SpawnObservation {
+                pid,
+                output,
+                exit: self.inner.waiters.wait(pid),
+            };
+            // No monitor or suspension can precede this transfer. A lost caller
+            // releases observation data; the original worker still owns the child.
+            let _ = admission.send(observation);
+        } else if let Some(output) = output {
             self.inner
                 .outputs
                 .lock()
@@ -462,36 +759,14 @@ impl ProcessSupervisor {
         let guard = ScopeExit {
             finish: Some(finish),
         };
-        let (report_tx, mut report_rx) = tokio::sync::watch::channel(None);
         // Register observation before shutdown can discover this scope.
-        let scope = self.create_scope_before_publish(|scope| {
-            self.inner
-                .scope_results
-                .lock()
-                .expect("scope results mutex")
-                .insert(scope, report_tx.clone());
-        });
-        let worker = self.worker();
-        let backstop = ScopeCleanupBackstop {
-            backend: self.inner.backend.clone(),
-            scope,
-            report: report_tx.clone(),
-            armed: true,
-        };
+        let observed = self.create_observed_scope();
+        let scope = observed.id();
+        let report_tx = observed.cleanup.report.clone();
+        let mut report_rx = report_tx.subscribe();
         let cleanup = tokio::spawn(async move {
-            let mut backstop = backstop;
             let _ = finished.await;
-            let retained = backstop.verified_report();
-            let result = match retained {
-                Some(report) => Ok(report),
-                None => worker.terminate_scope(scope, opts).await,
-            };
-            let result = backstop.verified_report().map(Ok).unwrap_or(result);
-            if !result.as_ref().is_ok_and(|r| r.all_verified()) {
-                backstop.backend.hard_kill_scope(scope);
-            }
-            // Publish within this task: the runtime may stop before its observer runs.
-            backstop.complete(result);
+            let _ = observed.finish(opts).await;
         });
         tokio::spawn(async move {
             if let Err(error) = cleanup.await {
@@ -516,13 +791,7 @@ impl ProcessSupervisor {
         }
         let result = match spawn_error {
             Some(error) => Err(error),
-            None => Ok(body(ScopedProcesses {
-                scope,
-                owned: Mutex::new(processes.iter().copied().collect()),
-                processes,
-                supervisor: self.worker(),
-            })
-            .await),
+            None => Ok(body(ScopedProcesses::new(self.worker(), scope, processes)).await),
         };
         drop(guard); // same cleanup path for success, closure error, panic, and cancel
         let termination = loop {
@@ -948,7 +1217,7 @@ impl ProcessSupervisor {
             .lock()
             .expect("reports mutex")
             .get(&scope)
-            .cloned()
+            .map(RetainedScopeReport::report)
         {
             return Ok(report);
         }
@@ -962,7 +1231,7 @@ impl ProcessSupervisor {
                     .lock()
                     .expect("reports mutex")
                     .get(&scope)
-                    .cloned()
+                    .map(RetainedScopeReport::report)
                     .ok_or(TerminateError::UnknownScope(scope));
             }
         };
@@ -985,7 +1254,7 @@ impl ProcessSupervisor {
             .lock()
             .expect("reports mutex")
             .get(&scope)
-            .cloned()
+            .map(RetainedScopeReport::report)
         {
             return Ok(report);
         }
@@ -1168,7 +1437,7 @@ impl ProcessSupervisor {
                 .reports
                 .lock()
                 .expect("reports mutex")
-                .insert(scope, report.clone());
+                .insert(scope, RetainedScopeReport::retain(&report));
             self.lock_registry().remove(scope);
             self.inner
                 .scope_operations
@@ -1186,7 +1455,7 @@ impl ProcessSupervisor {
                 .lock()
                 .expect("completed scopes mutex");
             completed.push_back(scope);
-            while completed.len() > 256 {
+            while completed.len() > SCOPE_REPORT_HISTORY_BOUND {
                 if let Some(old) = completed.pop_front() {
                     self.inner
                         .reports
@@ -1355,6 +1624,8 @@ impl ProcessSupervisor {
             // the retention bound after waiters have observed the terminal exit.
             // A failed reap may leave a live producer behind this observer. Only
             // verified completions are eligible for bounded post-mortem eviction.
+            // `os_pid` history is bounded at attach: this path often runs after
+            // terminate_scope has already dropped the registry entry.
             if verified_reap {
                 retain_completed_output(&inner, pid);
             }
@@ -1412,11 +1683,33 @@ pub struct ScopedProcesses {
     supervisor: ProcessSupervisor,
 }
 impl ScopedProcesses {
+    /// Builds a scoped handle that prunes authorization with the supervisor's
+    /// live registry and bounded observation history.
+    #[must_use]
+    pub fn new(
+        supervisor: ProcessSupervisor,
+        scope: ProcessScopeId,
+        processes: Vec<ProcessId>,
+    ) -> Self {
+        Self {
+            scope,
+            owned: Mutex::new(processes.iter().copied().collect()),
+            processes,
+            supervisor: supervisor.worker(),
+        }
+    }
+
     pub fn id(&self) -> ProcessScopeId {
         self.scope
     }
     pub fn processes(&self) -> &[ProcessId] {
         &self.processes
+    }
+
+    /// Process ids this handle still authorizes after pruning expired history.
+    #[must_use]
+    pub fn authorized_len(&self) -> usize {
+        self.observable_owned().len()
     }
     // Retain authorization while any owned process or bounded observation remains.
     // The lock order extends the supervisor's registry -> outputs/waiters order; no
@@ -1557,7 +1850,7 @@ mod spawn_cleanup_tests {
         let operation = sup.scope_operation(scope).unwrap();
         let held = operation.lock().await;
         let mut cleanup = std::pin::pin!(sup.terminate_scope(scope, TerminateOptions::default()));
-        let mut spawn = std::pin::pin!(sup.spawn_owned(scope, ProcessSpec::new("unused")));
+        let mut spawn = std::pin::pin!(sup.spawn_owned(scope, ProcessSpec::new("unused"), None));
         let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
         // Explicit polls establish FIFO lock order, with spawn retaining the old lock
         // while cleanup will remove both the registry entry and its lock-map entry.
@@ -1829,10 +2122,59 @@ mod scoped_history_tests {
                 // Both completed caches have evicted this root; registry quarantine
                 // must still authorize observing its unverified outcome.
                 assert!(!scope.wait(quarantined).await.unwrap().outcome.is_verified());
+                latest
             })
             .await;
-        assert!(result.result.is_ok());
+        let latest = result.result.expect("scoped body returned the latest pid");
         assert!(!result.termination.unwrap().all_verified());
+        assert!(
+            supervisor.inner.os_pids.lock().unwrap().len() <= OS_PID_HISTORY_BOUND,
+            "os_pid history must stay bounded across 650 immediate roots"
+        );
+        assert!(supervisor.os_pid(latest).is_some());
+    }
+
+    #[tokio::test]
+    async fn os_pid_history_stays_bounded_when_monitor_loses_the_registry() {
+        let ports = Arc::new(HistoryPorts::default());
+        let supervisor = ProcessSupervisor::new(ports.clone(), ports.clone(), ports.clone(), ports);
+        // HistoryPorts treats OS pid 1 as a quarantined wait failure.
+        let discarded = supervisor.create_scope();
+        let _ = supervisor
+            .spawn(discarded, ProcessSpec::new("unverified"))
+            .await
+            .unwrap();
+        let _ = supervisor
+            .terminate_scope(discarded, TerminateOptions::default())
+            .await;
+        let mut first = None;
+        let mut latest = None;
+        for _ in 0..300 {
+            let scope = supervisor.create_scope();
+            let pid = supervisor
+                .spawn(scope, ProcessSpec::new("immediate"))
+                .await
+                .unwrap();
+            first.get_or_insert(pid);
+            latest = Some(pid);
+            assert!(supervisor.os_pid(pid).is_some());
+            assert!(supervisor.wait(pid).await.unwrap().outcome.is_verified());
+            assert!(supervisor
+                .terminate_scope(scope, TerminateOptions::default())
+                .await
+                .unwrap()
+                .all_verified());
+            assert!(
+                supervisor.inner.os_pids.lock().unwrap().len() <= OS_PID_HISTORY_BOUND,
+                "os_pid history grew past the attach bound"
+            );
+        }
+        assert!(supervisor.os_pid(latest.unwrap()).is_some());
+        assert_eq!(supervisor.os_pid(first.unwrap()), None);
+        assert_eq!(
+            supervisor.inner.os_pids.lock().unwrap().len(),
+            OS_PID_HISTORY_BOUND
+        );
     }
 }
 
@@ -2110,6 +2452,42 @@ mod scope_operation_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_report_history_preserves_exact_evidence_at_each_cardinality() {
+        let supervisor = supervisor();
+        let outcomes = [
+            (ProcessId::new(7), TerminationOutcome::ExitedNaturally),
+            (
+                ProcessId::new(9),
+                TerminationOutcome::CleanupUnverified(UnverifiedReason::ReapFailed),
+            ),
+            (ProcessId::new(12), TerminationOutcome::ExitedNaturally),
+        ];
+        for count in [0, 1, 3] {
+            let report = ScopeTerminationReport {
+                scope: ProcessScopeId::new(100 + count as u64),
+                outcomes: outcomes[..count].to_vec(),
+            };
+            // Exercise the public cached lookup without a live scope or operation
+            // to reconstruct evidence from. Every pair must come from the cache.
+            supervisor
+                .inner
+                .reports
+                .lock()
+                .unwrap()
+                .insert(report.scope, RetainedScopeReport::retain(&report));
+            for _ in 0..2 {
+                let cached = supervisor
+                    .terminate_scope(report.scope, Default::default())
+                    .await
+                    .unwrap();
+                assert_eq!(cached.scope, report.scope);
+                assert_eq!(cached.outcomes, report.outcomes);
+                assert_eq!(cached.all_verified(), report.all_verified());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn ordinary_scope_history_does_not_evict_scoped_cleanup_results() {
         let supervisor = supervisor();
         let first = supervisor.with_scope(Vec::new(), |_| async {}).await;
@@ -2368,7 +2746,8 @@ mod scope_operation_tests {
         let held = operation.lock().await;
         let mut cleanup =
             std::pin::pin!(supervisor.terminate_scope(scope, TerminateOptions::default()));
-        let mut spawn = std::pin::pin!(supervisor.spawn_owned(scope, ProcessSpec::new("unused")));
+        let mut spawn =
+            std::pin::pin!(supervisor.spawn_owned(scope, ProcessSpec::new("unused"), None));
         let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
         assert!(cleanup.as_mut().poll(&mut cx).is_pending());
         assert!(spawn.as_mut().poll(&mut cx).is_pending());
