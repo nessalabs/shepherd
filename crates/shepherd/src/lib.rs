@@ -185,3 +185,42 @@ pub use shepherd_app::usage::*;
 /// Enabled by the `blocking` feature (on by default). See [`blocking::BlockingSupervisor`].
 #[cfg(feature = "blocking")]
 pub mod blocking;
+
+// Kept processes: opt-in processes that outlive their owner (ADR 0023).
+pub use shepherd_app::kept::{
+    KeptCommit, KeptEntry, KeptError, KeptExit, KeptLaunch, KeptLauncher, KeptLock, KeptProcess,
+    KeptProcesses, KeptSpec, KeptStore, KeptTarget, KeptTermination,
+};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use shepherd_infra::{DirectoryKeptStore, UnixKeptLauncher};
+pub use shepherd_domain::{KeptName, KeptNameError, KeptRecord, SpecFingerprint};
+
+/// Opens the kept-process records in `dir` (created owner-only if missing). `owner`
+/// labels the records this application writes.
+///
+/// Kept processes are supported on Linux and macOS.
+///
+/// # Errors
+/// [`KeptError::Unsupported`] on other platforms, or [`KeptError::Store`] when the
+/// directory cannot be created.
+pub fn kept_processes(
+    dir: impl Into<std::path::PathBuf>,
+    owner: impl Into<String>,
+) -> Result<KeptProcesses, KeptError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let store = shepherd_infra::DirectoryKeptStore::open(dir)
+            .map_err(|error| KeptError::Store(error.to_string()))?;
+        Ok(KeptProcesses::new(
+            Arc::new(store),
+            Arc::new(shepherd_infra::UnixKeptLauncher::new()),
+            Arc::new(SystemClock),
+            owner,
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (dir.into(), owner.into());
+        Err(KeptError::Unsupported)
+    }
+}

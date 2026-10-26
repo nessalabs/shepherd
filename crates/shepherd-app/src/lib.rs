@@ -7,6 +7,7 @@
 
 pub mod dispatch;
 pub mod error;
+pub mod kept;
 pub mod ports;
 pub mod registry;
 pub mod supervisor;
@@ -22,6 +23,10 @@ pub use error::{
 pub use ports::{
     Clock, EventHandler, IntegrationEventPublisher, ProcessBackend, Spawned, TerminateOptions,
     WaitFuture, Waiters,
+};
+pub use kept::{
+    KeptCommit, KeptEntry, KeptError, KeptExit, KeptLaunch, KeptLauncher, KeptLock, KeptProcess,
+    KeptProcesses, KeptSpec, KeptStore, KeptTarget, KeptTermination,
 };
 pub use registry::ScopeRegistry;
 pub use supervisor::{
