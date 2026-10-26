@@ -21,6 +21,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -37,6 +38,10 @@ use crate::backend::unix as native;
 
 /// The byte that lets a gated child run its program.
 const GO: u8 = b'G';
+/// The byte that tells a gated child to exit without running it.
+const ABORT: u8 = b'A';
+/// How long the group may take to empty after the sweep.
+const GROUP_SWEEP: Duration = Duration::from_secs(2);
 /// How often liveness is polled where the OS offers no exit notification.
 const POLL: Duration = Duration::from_millis(250);
 
@@ -69,28 +74,22 @@ impl KeptLauncher for UnixKeptLauncher {
     ) -> Result<(KeptLaunch, Arc<dyn KeptTarget>), KeptError> {
         let spec = spec.clone();
         let log = log.map(Path::to_path_buf);
-        let launch =
+        let (launch, watched) =
             tokio::task::spawn_blocking(move || gated_spawn(&spec, log.as_deref(), commit))
                 .await
                 .map_err(|e| KeptError::Launch(e.to_string()))??;
-        #[cfg(target_os = "linux")]
-        let pidfd = native::open_pidfd(launch.os_pid);
-        let watched = Arc::new(Watched::new(
-            launch.os_pid,
-            launch.start_token,
-            Owner::Child,
-            read_exe(launch.os_pid),
-            #[cfg(target_os = "linux")]
-            pidfd,
-        ));
-        children().insert(launch.os_pid, watched.clone());
         watched.watch();
         Ok((launch, Arc::new(UnixKeptTarget { watched })))
     }
 
     async fn attach(&self, record: &KeptRecord) -> Result<Option<Arc<dyn KeptTarget>>, KeptError> {
         if let Some(known) = children().get(&record.os_pid).cloned() {
-            if known.start_token == record.start_token && !known.has_exited() {
+            if known.start_token == record.start_token {
+                if known.has_exited() {
+                    return Ok(None);
+                }
+                // Re-arm in case the runtime that watched it has gone away.
+                known.watch();
                 return Ok(Some(Arc::new(UnixKeptTarget { watched: known })));
             }
         }
@@ -127,13 +126,9 @@ impl KeptLauncher for UnixKeptLauncher {
             pidfd,
         ));
         if owner == Owner::Child {
-            let mut registry = children();
-            if let Some(known) = registry.get(&record.os_pid).cloned() {
-                return Ok(Some(Arc::new(UnixKeptTarget { watched: known })));
-            }
-            registry.insert(record.os_pid, watched.clone());
-            drop(registry);
+            let watched = children().entry(record.os_pid).or_insert(watched).clone();
             watched.watch();
+            return Ok(Some(Arc::new(UnixKeptTarget { watched })));
         }
         Ok(Some(Arc::new(UnixKeptTarget { watched })))
     }
@@ -150,19 +145,34 @@ fn children() -> MutexGuard<'static, HashMap<u32, Arc<Watched>>> {
         .unwrap_or_else(|p| p.into_inner())
 }
 
+fn forget_child(watched: &Watched) {
+    let mut registry = children();
+    if registry
+        .get(&watched.os_pid)
+        .is_some_and(|known| std::ptr::eq(Arc::as_ptr(known), watched))
+    {
+        registry.remove(&watched.os_pid);
+    }
+}
+
 fn launch_error(context: &str, error: impl std::fmt::Display) -> KeptError {
     KeptError::Launch(format!("{context}: {error}"))
 }
 
 /// Forks the child, holds it before `exec`, commits, then lets it run. Blocking.
+///
+/// The child is registered for reaping before the record exists, so anyone who finds
+/// the record (a concurrent `list`) also finds this one registration.
 fn gated_spawn(
     spec: &ProcessSpec,
     log: Option<&Path>,
     commit: KeptCommit,
-) -> Result<KeptLaunch, KeptError> {
+) -> Result<(KeptLaunch, Arc<Watched>), KeptError> {
     let _serial = GATE.lock().unwrap_or_else(|p| p.into_inner());
+    // macOS sets close-on-exec after creating the pair; no Shepherd fork may run in
+    // between, or that child would hold the gate open for its whole life.
     let (mut owner_end, child_end) =
-        UnixStream::pair().map_err(|e| launch_error("gate socket", e))?;
+        native::with_spawn_lock(UnixStream::pair).map_err(|e| launch_error("gate socket", e))?;
     let owner_fd = owner_end.as_raw_fd();
     let child_fd = child_end.as_raw_fd();
 
@@ -224,45 +234,63 @@ fn gated_spawn(
             .join()
             .unwrap_or_else(|_| Err(std::io::Error::other("spawn thread panicked")))
     };
+    // Refuse explicitly as well as by EOF: a descriptor copy leaked into a fork outside
+    // Shepherd would otherwise keep the child waiting.
+    let abort = |owner_end: UnixStream| {
+        let _ = nix::sys::socket::send(owner_end.as_raw_fd(), &[ABORT], no_sigpipe());
+        drop(owner_end);
+    };
 
     let mut pid = [0u8; 4];
     if let Err(error) = owner_end.read_exact(&mut pid) {
-        drop(owner_end);
+        abort(owner_end);
         return Err(match join(spawner) {
             Err(spawn) => launch_error("spawn", spawn),
             Ok(_) => launch_error("child did not report", error),
         });
     }
     let os_pid = i32::from_ne_bytes(pid) as u32;
-    let committed = native::read_start_time(os_pid)
-        .ok_or_else(|| KeptError::Launch("child start time unreadable".into()))
-        .and_then(|start_token| {
-            let launch = KeptLaunch {
-                os_pid,
-                start_token,
-            };
-            commit(launch).map(|()| launch)
-        });
-    let launch = match committed {
-        Ok(launch) => launch,
-        Err(error) => {
-            // EOF on the gate: the child exits before exec and std reaps it.
-            drop(owner_end);
-            let _ = join(spawner);
-            return Err(error);
-        }
+    let Some(start_token) = native::read_start_time(os_pid) else {
+        abort(owner_end);
+        let _ = join(spawner);
+        return Err(KeptError::Launch("child start time unreadable".into()));
     };
+    let launch = KeptLaunch {
+        os_pid,
+        start_token,
+    };
+    // The child is ours and unreaped, so its pid is pinned while we register it.
+    let watched = Arc::new(Watched::new(
+        os_pid,
+        start_token,
+        Owner::Child,
+        None,
+        #[cfg(target_os = "linux")]
+        native::open_pidfd(os_pid),
+    ));
+    children().insert(os_pid, watched.clone());
+    if let Err(error) = commit(launch) {
+        abort(owner_end);
+        // std reaps a child that fails before exec.
+        let _ = join(spawner);
+        forget_child(&watched);
+        return Err(error);
+    }
     let opened = nix::sys::socket::send(owner_fd, &[GO], no_sigpipe());
     let spawned = join(spawner);
     drop(owner_end);
-    if let Err(error) = opened {
-        return Err(launch_error("open gate", error));
-    }
-    match spawned {
+    let failure = match (opened, spawned) {
         // Not waited on through `Child`: the watcher reaps by pid after sweeping.
-        Ok(_child) => Ok(launch),
-        Err(error) => Err(launch_error("exec", error)),
+        (Ok(_), Ok(_child)) => None,
+        (Err(error), _) => Some(launch_error("open gate", error)),
+        (_, Err(error)) => Some(launch_error("exec", error)),
+    };
+    if let Some(error) = failure {
+        forget_child(&watched);
+        return Err(error);
     }
+    *watched.exe.lock().unwrap_or_else(|p| p.into_inner()) = read_exe(os_pid);
+    Ok((launch, watched))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -319,13 +347,25 @@ struct Watched {
     os_pid: u32,
     start_token: u64,
     owner: Owner,
-    exe: Option<PathBuf>,
+    exe: Mutex<Option<PathBuf>>,
     #[cfg(target_os = "linux")]
     pidfd: Option<std::os::fd::OwnedFd>,
     /// Serializes group signals with the exit sweep: true once exited.
     exited: Mutex<bool>,
     exit: watch::Sender<Option<KeptExit>>,
-    started: std::sync::atomic::AtomicBool,
+    /// Whether a watcher task is running (reset if its runtime drops it).
+    started: AtomicBool,
+}
+
+/// Lets a later `watch` start a new watcher if this one is dropped before finishing.
+struct Rearm(Arc<Watched>);
+
+impl Drop for Rearm {
+    fn drop(&mut self) {
+        if !self.0.has_exited() {
+            self.0.started.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Watched {
@@ -340,12 +380,12 @@ impl Watched {
             os_pid,
             start_token,
             owner,
-            exe,
+            exe: Mutex::new(exe),
             #[cfg(target_os = "linux")]
             pidfd,
             exited: Mutex::new(false),
             exit: watch::channel(None).0,
-            started: std::sync::atomic::AtomicBool::new(false),
+            started: AtomicBool::new(false),
         }
     }
 
@@ -357,16 +397,18 @@ impl Watched {
         Pid::from_raw(self.os_pid as i32)
     }
 
-    /// Starts the exit watcher once. Children are watched from launch or attach (they
-    /// must be reaped); foreign processes only when someone waits for them.
+    /// Starts the exit watcher unless one is running. Children are watched from launch
+    /// or attach (they must be reaped); foreign processes when someone waits for them.
     fn watch(self: &Arc<Self>) {
-        if self.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if self.has_exited() || self.started.swap(true, Ordering::SeqCst) {
             return;
         }
         let watched = self.clone();
         tokio::spawn(async move {
+            let rearm = Rearm(watched.clone());
             watched.wait_for_exit().await;
-            watched.finish();
+            watched.finish().await;
+            drop(rearm);
         });
     }
 
@@ -378,48 +420,87 @@ impl Watched {
                 tokio::io::Interest::READABLE,
             ) {
                 // A pidfd turns readable when the process exits, before it is reaped.
-                let _ = fd.readable().await;
-                return;
+                if fd.readable().await.is_ok() {
+                    return;
+                }
             }
         }
         #[cfg(target_vendor = "apple")]
         if let Some(queue) = ExitQueue::register(self.os_pid) {
-            if queue.exited().await {
+            // The registration is by number: if that number is now someone else, the
+            // recorded instance is already gone.
+            if self.gone() || queue.exited().await {
                 return;
             }
         }
         // No notification available (for example a kernel without pidfds): poll.
-        while self.alive() {
+        while !self.gone() {
             tokio::time::sleep(POLL).await;
         }
     }
 
-    /// Whether the instance is still running (same start token, not a zombie). Never
-    /// reaps, so a child's group stays pinned.
-    fn alive(&self) -> bool {
+    /// Positively the recorded instance, running. Required before any numeric signal.
+    fn confirmed_alive(&self) -> bool {
         native::read_start_time(self.os_pid) == Some(self.start_token) && !is_zombie(self.os_pid)
     }
 
-    /// Sweeps the group while it is still pinned, then reaps and publishes.
-    fn finish(&self) {
-        let mut exited = self.exited.lock().unwrap_or_else(|p| p.into_inner());
-        let _ = killpg(self.pid(), NixSignal::SIGKILL);
-        let exit = match self.owner {
-            Owner::Child => reap(self.pid()),
-            Owner::Foreign => KeptExit::default(),
-        };
-        *exited = true;
-        self.exit.send_replace(Some(exit));
-        drop(exited);
-        if self.owner == Owner::Child {
-            let mut registry = children();
-            if registry
-                .get(&self.os_pid)
-                .is_some_and(|known| std::ptr::eq(Arc::as_ptr(known), self))
-            {
-                registry.remove(&self.os_pid);
-            }
+    /// Positively gone: no process at the pid, another instance there, or a zombie.
+    /// An unreadable identity is not gone. Never reaps, so a child's group stays pinned.
+    fn gone(&self) -> bool {
+        match native::read_start_time(self.os_pid) {
+            Some(token) if token != self.start_token => true,
+            Some(_) => is_zombie(self.os_pid),
+            None => kill(self.pid(), None) == Err(Errno::ESRCH) || is_zombie(self.os_pid),
         }
+    }
+
+    /// Sweeps the group while it is still pinned, reaps a child, waits for the group to
+    /// empty and publishes.
+    async fn finish(&self) {
+        let (mut exit, swept) = {
+            let mut exited = self.exited.lock().unwrap_or_else(|p| p.into_inner());
+            // A child's exited leader pins its group until reaped. A foreign leader pins
+            // it only while it is still a zombie of the same instance; once init reaps
+            // it the number may belong to a stranger, so it is left alone.
+            let pinned = self.owner == Owner::Child
+                || (native::read_start_time(self.os_pid) == Some(self.start_token)
+                    && is_zombie(self.os_pid));
+            if pinned {
+                let _ = killpg(self.pid(), NixSignal::SIGKILL);
+            }
+            let exit = match self.owner {
+                Owner::Child => reap(self.pid()),
+                Owner::Foreign => KeptExit::default(),
+            };
+            *exited = true;
+            (exit, pinned)
+        };
+        // Members still alive keep the group number in use, so it cannot be reused.
+        exit.stragglers = swept && !group_empties(self.pid()).await;
+        self.exit.send_replace(Some(exit));
+        if self.owner == Owner::Child {
+            forget_child(self);
+        }
+    }
+}
+
+/// Re-sends SIGKILL to `pgid` until no member is running, for at most `GROUP_SWEEP`.
+/// Zombies are dead already; they wait for their own parent (often init) to reap them.
+async fn group_empties(pgid: Pid) -> bool {
+    let deadline = tokio::time::Instant::now() + GROUP_SWEEP;
+    loop {
+        if killpg(pgid, NixSignal::SIGKILL) == Err(Errno::ESRCH) {
+            return true;
+        }
+        if group_members(pgid.as_raw())
+            .is_some_and(|members| members.iter().all(|&pid| is_zombie(pid as u32)))
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -429,13 +510,13 @@ fn reap(pid: Pid) -> KeptExit {
             Ok(WaitStatus::Exited(_, code)) => {
                 return KeptExit {
                     code: Some(code),
-                    signal: None,
+                    ..KeptExit::default()
                 }
             }
             Ok(WaitStatus::Signaled(_, signal, _)) => {
                 return KeptExit {
-                    code: None,
                     signal: Some(native::signal_from_raw(signal as i32)),
+                    ..KeptExit::default()
                 }
             }
             Ok(_) | Err(Errno::EINTR) => {}
@@ -455,7 +536,11 @@ impl KeptTarget for UnixKeptTarget {
     }
 
     fn exe(&self) -> Option<PathBuf> {
-        self.watched.exe.clone()
+        self.watched
+            .exe
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     async fn signal(&self, signal: Signal) -> Result<(), KeptError> {
@@ -465,24 +550,25 @@ impl KeptTarget for UnixKeptTarget {
         if *exited {
             return Ok(());
         }
-        // A child's group is pinned until `finish` reaps it under this lock. A foreign
-        // leader is re-identified first; on Linux its pidfd signals exactly that instance.
         let sent = |result: nix::Result<()>| match result {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
             Err(error) => Err(KeptError::Signal(error.to_string())),
         };
+        // A child's group is pinned until `finish` reaps it under this lock. A foreign
+        // leader must be positively re-identified before any numeric signal; on Linux
+        // its pidfd signals exactly that instance.
         if watched.owner == Owner::Foreign {
             #[cfg(target_os = "linux")]
             if let Some(pidfd) = &watched.pidfd {
                 native::pidfd_kill(pidfd.as_raw_fd(), signal)
                     .map_err(|e| KeptError::Signal(e.to_string()))?;
-                return if watched.alive() {
+                return if watched.confirmed_alive() {
                     sent(killpg(watched.pid(), signal))
                 } else {
                     Ok(())
                 };
             }
-            if !watched.alive() {
+            if !watched.confirmed_alive() {
                 return Ok(());
             }
         }
@@ -565,6 +651,30 @@ fn stat_field(pid: u32, index: usize) -> Option<String> {
         .split_whitespace()
         .nth(index)
         .map(str::to_string)
+}
+
+/// The pids in process group `pgid`, or `None` if they cannot be listed.
+#[cfg(target_os = "linux")]
+fn group_members(pgid: i32) -> Option<Vec<i32>> {
+    let mut members = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // Field 5 (pgrp) is the third after comm; a process that just exited is skipped.
+        if stat_field(pid, 2).and_then(|g| g.parse::<i32>().ok()) == Some(pgid) {
+            members.push(pid as i32);
+        }
+    }
+    Some(members)
+}
+#[cfg(target_vendor = "apple")]
+fn group_members(pgid: i32) -> Option<Vec<i32>> {
+    crate::usage::group_members(pgid).ok()
 }
 
 #[cfg(target_os = "linux")]

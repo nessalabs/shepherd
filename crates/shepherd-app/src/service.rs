@@ -489,6 +489,9 @@ impl<S: Service> Runner<S> {
         let mut failures = 0u32;
         let mut attempt = 0u32;
         let mut reason = String::new();
+        // Only a runner that has not yet started or adopted a run may adopt one: a
+        // failed first attempt must not turn a matching earlier run into a stranger.
+        let mut may_adopt = true;
         loop {
             if failures > 0 {
                 if self.options.restart.gives_up(failures) {
@@ -519,11 +522,14 @@ impl<S: Service> Runner<S> {
             // Starting is never interrupted: a half-started run would have no owner. A
             // stop request waits in the channel and is seen right after.
             let started = match self.options.kept.clone() {
-                Some(kept) => self.start_kept(&kept, launch, attempt == 1).await,
+                Some(kept) => self.start_kept(&kept, launch, may_adopt).await,
                 None => self.start_scoped(launch).await,
             };
             let (running, instance) = match started {
-                Ok(started) => started,
+                Ok(started) => {
+                    may_adopt = false;
+                    started
+                }
                 Err(failure) => {
                     (failures, reason) = self.failed(failures, failure);
                     continue;
@@ -595,12 +601,12 @@ impl<S: Service> Runner<S> {
         &self,
         kept: &KeptProcesses,
         launch: ServiceLaunch,
-        first: bool,
+        may_adopt: bool,
     ) -> Result<(Running, ServiceInstance), String> {
         let fingerprint = launch.fingerprint();
         // Any live record under this name is this service's earlier run.
         if let Some(previous) = kept.adopt(&self.name).await.map_err(kept_failure)? {
-            if first && previous.record().fingerprint == fingerprint {
+            if may_adopt && previous.record().fingerprint == fingerprint {
                 let instance = ServiceInstance {
                     os_pid: previous.os_pid(),
                     adopted: true,
@@ -647,10 +653,14 @@ impl<S: Service> Runner<S> {
                 self.clock.sleep(self.options.ready_poll).await;
             }
         };
+        // The deadline also bounds a readiness check that never returns.
         tokio::select! {
             result = check => result,
             exit = exited(&self.supervisor, running) => {
                 Err(ServiceFailure(format!("exited before ready: {exit}")))
+            }
+            () = self.clock.sleep(self.options.ready_within) => {
+                Err(ServiceFailure("not ready in time".into()))
             }
         }
     }
@@ -717,7 +727,7 @@ async fn exited(supervisor: &ProcessSupervisor, running: &Running) -> String {
             Err(error) => format!("wait failed: {error}"),
         },
         Running::Kept(process) => {
-            let KeptExit { code, signal } = process.exited().await;
+            let KeptExit { code, signal, .. } = process.exited().await;
             describe(code, signal.map(|s| format!("{s:?}")))
         }
     }

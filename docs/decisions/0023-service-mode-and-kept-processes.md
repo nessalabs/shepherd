@@ -34,10 +34,21 @@ confirmed gone.
   record only when its process is gone and no owner holds the name. `adopt` attaches
   a later owner. A dropped or released `KeptProcess` leaves the process running.
 - Exit is observed without reaping (pidfd on Linux, kqueue on macOS, polling
-  otherwise). The process group is swept with `SIGKILL` while the exited leader still
-  pins it, then the leader is reaped if it is this process's child (including one
-  inherited across `execve`). After the owner dies the kept process belongs to init,
-  its exit status is unknown, and the sweep is best effort.
+  otherwise; an unreadable identity is never taken as an exit). If the kept process is
+  this process's child (including one inherited across `execve`), its group is swept
+  with `SIGKILL` while the exited leader still pins the number, the leader is reaped,
+  and the sweep repeats until no running member is left (zombies excepted) for up to
+  two seconds. Members still running after that make the termination
+  `CleanupUnverified`. After the owner dies the kept process belongs to init: its exit
+  status is unknown, and its group is swept only while the leader is still a zombie of
+  the recorded instance, because once init reaps it the number may be a stranger's.
+- Numeric signals to a process that is not this process's child are sent only after
+  its start token was just re-read and matched (on Linux the leader is signalled by
+  pidfd).
+- The child is registered for reaping before its record is written, so a concurrent
+  `list` that finds the record finds the same registration. On macOS the gate socket
+  is created under the native-spawn lock, because Darwin sets close-on-exec after
+  creating it. A refused launch sends an explicit abort byte as well as closing it.
 - Output cannot be piped to an owner that may go away, so kept processes take a log
   file instead of `OutputMode::Capture`.
 
@@ -75,5 +86,8 @@ sequenceDiagram
 - On Linux a kept process stays in its owner's cgroup. A service manager that kills a
   whole cgroup on stop (systemd's default `KillMode=control-group`) also kills kept
   processes; such owners need `KillMode=process` or a separate unit.
-- After the owner dies, descendants that left the kept process group (`setsid`) are
-  not tracked, as with the process-group fallback (ADR 0019).
+- Kept processes are contained by their process group only. A descendant that calls
+  `setsid` or `setpgid` leaves it and is not tracked, whether or not the owner is
+  alive, as with the process-group fallback (ADR 0019).
+- A service adopts an earlier run only until it has started or adopted one; a failed
+  first attempt (a busy name, a launch error) does not forfeit adoption.

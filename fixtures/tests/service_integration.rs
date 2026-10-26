@@ -66,7 +66,7 @@ struct PidFile {
     revision: String,
     launches: Arc<AtomicU32>,
     fail_launch: bool,
-    never_ready: bool,
+    hang_ready: bool,
 }
 
 impl PidFile {
@@ -76,7 +76,7 @@ impl PidFile {
             revision: "r1".into(),
             launches: Arc::default(),
             fail_launch: false,
-            never_ready: false,
+            hang_ready: false,
         }
     }
     fn file(&self) -> PathBuf {
@@ -102,8 +102,8 @@ impl Service for PidFile {
     }
 
     async fn ready(&self, instance: &ServiceInstance) -> Result<Option<u32>, ServiceFailure> {
-        if self.never_ready {
-            return Ok(None);
+        if self.hang_ready {
+            std::future::pending::<()>().await;
         }
         let pid = std::fs::read_to_string(self.file())
             .ok()
@@ -169,12 +169,13 @@ async fn a_service_restarts_after_its_process_dies() {
 }
 
 #[tokio::test]
-async fn a_service_that_never_gets_ready_backs_off_and_gives_up() {
+async fn a_readiness_check_that_hangs_backs_off_and_gives_up() {
     let dir = scratch("never");
     let supervisor = SupervisorBuilder::new().build();
     let services = shepherd::service_supervisor(&supervisor);
     let mut service = PidFile::new(&dir);
-    service.never_ready = true;
+    // A check that never returns is bounded by the readiness deadline.
+    service.hang_ready = true;
     let launches = service.launches.clone();
     let mut options = fast();
     options.ready_within = Duration::from_millis(200);

@@ -94,7 +94,8 @@ pub trait KeptStore: Send + Sync {
     /// # Errors
     /// [`KeptError::Store`] when the record exists but cannot be read.
     fn read(&self, name: &KeptName) -> Result<Option<KeptRecord>, KeptError>;
-    /// Durably replaces the record for `lock`'s name.
+    /// Durably replaces the record for `lock`'s name. Called while a launched child is
+    /// held before `exec`, so it must not start processes itself.
     ///
     /// # Errors
     /// [`KeptError::Store`] when the record was not made durable.
@@ -166,6 +167,9 @@ pub struct KeptExit {
     pub code: Option<i32>,
     /// Terminating signal, if known.
     pub signal: Option<Signal>,
+    /// Members of its process group were still running after the sweep. They are no
+    /// longer owned by any record, so a termination reporting this is not verified.
+    pub stragglers: bool,
 }
 
 /// What to start as a kept process.
@@ -432,17 +436,18 @@ impl KeptProcesses {
 
     /// Claims `name`, retrying briefly: a listing probes each claim for a moment.
     async fn claim(&self, name: &KeptName) -> Result<KeptLock, KeptError> {
-        for attempt in 0..CLAIM_ATTEMPTS {
+        let deadline = self.inner.clock.now() + CLAIM_WAIT;
+        loop {
             let store = self.inner.store.clone();
             let claim = name.clone();
             if let Some(lock) = blocking(move || store.lock(&claim)).await? {
                 return Ok(lock);
             }
-            if attempt + 1 < CLAIM_ATTEMPTS {
-                self.inner.clock.sleep(CLAIM_RETRY).await;
+            if self.inner.clock.now() >= deadline {
+                return Err(KeptError::Busy(name.clone()));
             }
+            self.inner.clock.sleep(CLAIM_RETRY).await;
         }
-        Err(KeptError::Busy(name.clone()))
     }
 
     async fn read(&self, name: &KeptName) -> Result<Option<KeptRecord>, KeptError> {
@@ -452,8 +457,11 @@ impl KeptProcesses {
     }
 }
 
-const CLAIM_ATTEMPTS: u32 = 10;
-const CLAIM_RETRY: Duration = Duration::from_millis(10);
+/// How long a claim waits out another owner's brief hold (a listing's probe, a prune).
+const CLAIM_WAIT: Duration = Duration::from_secs(2);
+const CLAIM_RETRY: Duration = Duration::from_millis(20);
+/// Reported as the wait when a swept group did not empty (the adapter's sweep bound).
+const GROUP_REPORT: Duration = Duration::from_secs(2);
 
 fn unix_ms() -> u64 {
     SystemTime::now()
@@ -554,6 +562,17 @@ impl KeptProcess {
     pub fn release(self) {}
 
     async fn finish(self, outcome: TerminationOutcome, exit: Option<KeptExit>) -> KeptTermination {
+        // The leader is gone, so the record can no longer reach members that outlived
+        // the sweep: drop it, but never call that verified.
+        let outcome = if exit.is_some_and(|exit| exit.stragglers) {
+            tracing::warn!(name = %self.record.name, pgid = self.record.os_pid,
+                "kept process group still had members after the sweep");
+            TerminationOutcome::CleanupUnverified(UnverifiedReason::WaitTimedOut {
+                waited: GROUP_REPORT,
+            })
+        } else {
+            outcome
+        };
         match self.forget().await {
             Ok(()) => KeptTermination { outcome, exit },
             Err(error) => {

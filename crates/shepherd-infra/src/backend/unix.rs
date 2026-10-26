@@ -2230,11 +2230,17 @@ mod signal_identity_tests {
 pub(crate) fn spawn_native(
     command: &mut std::process::Command,
 ) -> std::io::Result<std::process::Child> {
+    with_spawn_lock(|| command.spawn())
+}
+
+/// Runs `work` while no Shepherd native spawn can fork. On macOS, descriptors whose
+/// close-on-exec flag is set after creation must be created under this lock.
+pub(crate) fn with_spawn_lock<T>(work: impl FnOnce() -> T) -> T {
     #[cfg(target_os = "macos")]
     static NATIVE_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[cfg(target_os = "macos")]
     let _guard = NATIVE_SPAWN
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    command.spawn()
+    work()
 }

@@ -89,10 +89,11 @@ pub(super) fn sample(identity: ObservedProcessIdentity) -> Result<ProcessUsage, 
         disk_write_bytes: (flavor >= libc::RUSAGE_INFO_V2).then_some(raw.ri_diskio_byteswritten),
     })
 }
-pub(super) fn group(pgid: i32) -> Result<UsageSnapshot, ObservationError> {
+/// Every pid in process group `pgid` (zombies included).
+pub(crate) fn group_members(pgid: i32) -> Result<Vec<i32>, ObservationError> {
     // Grow on a full buffer, with a hard cap. Never silently truncate membership.
     let mut capacity = 64usize;
-    let pids = loop {
+    loop {
         let mut pids = vec![0i32; capacity];
         // SAFETY: writable PID array and its exact byte capacity.
         let count = unsafe {
@@ -106,7 +107,7 @@ pub(super) fn group(pgid: i32) -> Result<UsageSnapshot, ObservationError> {
         // Unlike proc_listpids, this wrapper returns a PID count, not bytes.
         if (count as usize) < capacity {
             pids.truncate(count as usize);
-            break pids;
+            return Ok(pids);
         }
         capacity *= 2;
         if capacity > 1_048_576 {
@@ -114,7 +115,11 @@ pub(super) fn group(pgid: i32) -> Result<UsageSnapshot, ObservationError> {
                 "PID list exceeds sampling bound".into(),
             ));
         }
-    };
+    }
+}
+
+pub(super) fn group(pgid: i32) -> Result<UsageSnapshot, ObservationError> {
+    let pids = group_members(pgid)?;
     let members = pids
         .into_iter()
         .filter(|p| *p > 0 && *p != pgid)
