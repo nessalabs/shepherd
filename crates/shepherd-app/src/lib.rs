@@ -31,9 +31,9 @@ pub use ports::{
 };
 pub use registry::ScopeRegistry;
 pub use service::{
-    Service, ServiceFailure, ServiceHandle, ServiceInstance, ServiceLaunch, ServiceNameInUse,
-    ServiceOptions, ServiceState, ServiceStatus, ServiceStop, ServiceStopped, ServiceSummary,
-    ServiceSupervisor,
+    Service, ServiceFailure, ServiceFailureKind, ServiceHandle, ServiceInstance, ServiceLaunch,
+    ServiceNameInUse, ServiceOptions, ServiceState, ServiceStatus, ServiceStop, ServiceStopped,
+    ServiceSummary, ServiceSupervisor,
 };
 pub use supervisor::{
     ObservedScope, ObservedSpawn, ProcessSupervisor, ScopeTerminationReport, ScopedProcesses,

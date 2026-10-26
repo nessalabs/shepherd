@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use shepherd::{
-    GracePeriod, KeptName, ProcessSpec, RestartPolicy, Service, ServiceFailure, ServiceInstance,
-    ServiceLaunch, ServiceOptions, ServiceState, ServiceStatus, ServiceStop, SupervisorBuilder,
-    TerminateOptions,
+    GracePeriod, KeptName, ProcessSpec, RestartPolicy, Service, ServiceFailure, ServiceFailureKind,
+    ServiceInstance, ServiceLaunch, ServiceOptions, ServiceState, ServiceStatus, ServiceStop,
+    SupervisorBuilder, TerminateOptions,
 };
 
 const SETTLE: Duration = Duration::from_secs(20);
@@ -67,6 +67,8 @@ struct PidFile {
     launches: Arc<AtomicU32>,
     fail_launch: bool,
     hang_ready: bool,
+    fail_ready: bool,
+    exit_early: bool,
 }
 
 impl PidFile {
@@ -77,6 +79,8 @@ impl PidFile {
             launches: Arc::default(),
             fail_launch: false,
             hang_ready: false,
+            fail_ready: false,
+            exit_early: false,
         }
     }
     fn file(&self) -> PathBuf {
@@ -93,7 +97,11 @@ impl Service for PidFile {
         if self.fail_launch {
             return Err(ServiceFailure::new("no binary"));
         }
-        let script = format!("echo $$ > '{}'; exec sleep 300", self.file().display());
+        let script = if self.exit_early {
+            "exit 3".to_owned()
+        } else {
+            format!("echo $$ > '{}'; exec sleep 300", self.file().display())
+        };
         Ok(
             ServiceLaunch::new(ProcessSpec::new("/bin/sh").args(["-c", &script]))
                 .revision(self.revision.clone())
@@ -104,6 +112,9 @@ impl Service for PidFile {
     async fn ready(&self, instance: &ServiceInstance) -> Result<Option<u32>, ServiceFailure> {
         if self.hang_ready {
             std::future::pending::<()>().await;
+        }
+        if self.fail_ready {
+            return Err(ServiceFailure::new("bad answer"));
         }
         let pid = std::fs::read_to_string(self.file())
             .ok()
@@ -149,7 +160,7 @@ async fn a_service_restarts_after_its_process_dies() {
     .unwrap();
     let backoff = status_where(&mut status, |s| matches!(s, ServiceStatus::Backoff { .. })).await;
     assert!(
-        matches!(&backoff, ServiceStatus::Backoff { failures: 1, reason, .. } if reason.contains("SIGKILL") || reason.contains("Kill")),
+        matches!(&backoff, ServiceStatus::Backoff { failures: 1, kind: ServiceFailureKind::Exited, reason, .. } if reason.contains("SIGKILL") || reason.contains("Kill")),
         "{backoff:?}"
     );
     let second = match status_where(&mut status, |s| matches!(s, ServiceStatus::Ready { .. })).await
@@ -188,6 +199,7 @@ async fn a_readiness_check_that_hangs_backs_off_and_gives_up() {
     assert_eq!(
         failed,
         ServiceStatus::Failed {
+            kind: ServiceFailureKind::NotReadyInTime,
             reason: "not ready in time".into()
         }
     );
@@ -217,6 +229,7 @@ async fn launch_failures_back_off_and_a_stop_ends_the_wait() {
         ServiceStatus::Backoff {
             failures: 1,
             delay: Duration::from_secs(600),
+            kind: ServiceFailureKind::Launch,
             reason: "launch: no binary".into()
         }
     );
@@ -226,6 +239,49 @@ async fn launch_failures_back_off_and_a_stop_ends_the_wait() {
     assert_eq!(stopped.outcome, None);
     assert_eq!(*status.borrow(), ServiceStatus::Stopped);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A caller tells a run that ended before it was ready from one whose check refused
+/// it by the failure's kind, never by its wording.
+#[tokio::test]
+async fn a_failure_names_the_step_that_failed() {
+    for (label, configure, kind) in [
+        (
+            "early",
+            (|service: &mut PidFile| service.exit_early = true) as fn(&mut PidFile),
+            ServiceFailureKind::ExitedBeforeReady,
+        ),
+        (
+            "refused",
+            |service: &mut PidFile| service.fail_ready = true,
+            ServiceFailureKind::ReadyCheck,
+        ),
+    ] {
+        let dir = scratch(label);
+        let supervisor = SupervisorBuilder::new().build();
+        let services = shepherd::service_supervisor(&supervisor);
+        let mut service = PidFile::new(&dir);
+        configure(&mut service);
+        let mut options = fast();
+        options.restart = options.restart.max_failures(Some(1));
+        let handle = services
+            .start(KeptName::new(label).unwrap(), service, options)
+            .unwrap();
+        let mut status = handle.status();
+        let failed = status_where(&mut status, ServiceStatus::is_final).await;
+        assert!(
+            matches!(&failed, ServiceStatus::Failed { kind: found, .. } if *found == kind),
+            "{label}: {failed:?}"
+        );
+        // A run killed while writing its pid may leave the file empty.
+        let pid = std::fs::read_to_string(dir.join("pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse().ok());
+        if let Some(pid) = pid {
+            until_gone(pid).await;
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
