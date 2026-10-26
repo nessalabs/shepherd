@@ -39,9 +39,14 @@ confirmed gone.
   with `SIGKILL` while the exited leader still pins the number, the leader is reaped,
   and the sweep repeats until no running member is left (zombies excepted) for up to
   two seconds. Members still running after that make the termination
-  `CleanupUnverified`. After the owner dies the kept process belongs to init: its exit
-  status is unknown, and its group is swept only while the leader is still a zombie of
-  the recorded instance, because once init reaps it the number may be a stranger's.
+  `CleanupUnverified`. After the owner dies the kept process belongs to init and its
+  exit status is unknown. Its group is swept while the leader is still a zombie of the
+  recorded instance; after init reaps the leader it is swept only if listing it finds a
+  running member (a group with a member cannot be renumbered), and a group that cannot
+  be listed is reported unverified, never empty.
+- The record is removed once the leader is gone, even when group members outlived the
+  sweep: the termination says `CleanupUnverified` and a warning is logged. The record
+  names the leader only, so keeping it would not let a later owner reach the members.
 - Numeric signals to a process that is not this process's child are sent only after
   its start token was just re-read and matched (on Linux the leader is signalled by
   pidfd).

@@ -53,6 +53,9 @@ static GATE: Mutex<()> = Mutex::new(());
 static CHILDREN: OnceLock<Mutex<HashMap<u32, Arc<Watched>>>> = OnceLock::new();
 
 /// The Unix [`KeptLauncher`].
+///
+/// Its methods must run inside a Tokio runtime with IO and time enabled: exit watchers
+/// wait on descriptors and time the group sweep.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UnixKeptLauncher;
 
@@ -78,6 +81,7 @@ impl KeptLauncher for UnixKeptLauncher {
             tokio::task::spawn_blocking(move || gated_spawn(&spec, log.as_deref(), commit))
                 .await
                 .map_err(|e| KeptError::Launch(e.to_string()))??;
+        watched.launching.store(false, Ordering::SeqCst);
         watched.watch();
         Ok((launch, Arc::new(UnixKeptTarget { watched })))
     }
@@ -85,10 +89,11 @@ impl KeptLauncher for UnixKeptLauncher {
     async fn attach(&self, record: &KeptRecord) -> Result<Option<Arc<dyn KeptTarget>>, KeptError> {
         if let Some(known) = children().get(&record.os_pid).cloned() {
             if known.start_token == record.start_token {
-                if known.has_exited() {
+                if known.ended() {
                     return Ok(None);
                 }
-                // Re-arm in case the runtime that watched it has gone away.
+                // Re-arm in case the runtime that watched it has gone away (a no-op
+                // while its launch is still in progress).
                 known.watch();
                 return Ok(Some(Arc::new(UnixKeptTarget { watched: known })));
             }
@@ -268,12 +273,14 @@ fn gated_spawn(
         #[cfg(target_os = "linux")]
         native::open_pidfd(os_pid),
     ));
+    // No watcher may start (and reap) until the launch has succeeded: std reaps a
+    // child that fails before exec.
+    watched.launching.store(true, Ordering::SeqCst);
     children().insert(os_pid, watched.clone());
     if let Err(error) = commit(launch) {
         abort(owner_end);
-        // std reaps a child that fails before exec.
         let _ = join(spawner);
-        forget_child(&watched);
+        watched.abandon();
         return Err(error);
     }
     let opened = nix::sys::socket::send(owner_fd, &[GO], no_sigpipe());
@@ -286,7 +293,7 @@ fn gated_spawn(
         (_, Err(error)) => Some(launch_error("exec", error)),
     };
     if let Some(error) = failure {
-        forget_child(&watched);
+        watched.abandon();
         return Err(error);
     }
     *watched.exe.lock().unwrap_or_else(|p| p.into_inner()) = read_exe(os_pid);
@@ -350,11 +357,15 @@ struct Watched {
     exe: Mutex<Option<PathBuf>>,
     #[cfg(target_os = "linux")]
     pidfd: Option<std::os::fd::OwnedFd>,
-    /// Serializes group signals with the exit sweep: true once exited.
-    exited: Mutex<bool>,
+    /// Serializes group signals with the reap. Set when the leader is reaped (or known
+    /// gone), before the sweep finishes, so nothing treats it as live meanwhile.
+    ended: Mutex<Option<KeptExit>>,
+    /// The published exit, once the sweep has finished.
     exit: watch::Sender<Option<KeptExit>>,
     /// Whether a watcher task is running (reset if its runtime drops it).
     started: AtomicBool,
+    /// Set while `gated_spawn` has not yet finished: no watcher may start then.
+    launching: AtomicBool,
 }
 
 /// Lets a later `watch` start a new watcher if this one is dropped before finishing.
@@ -383,14 +394,38 @@ impl Watched {
             exe: Mutex::new(exe),
             #[cfg(target_os = "linux")]
             pidfd,
-            exited: Mutex::new(false),
+            ended: Mutex::new(None),
             exit: watch::channel(None).0,
             started: AtomicBool::new(false),
+            launching: AtomicBool::new(false),
         }
     }
 
+    /// Whether the exit has been published.
     fn has_exited(&self) -> bool {
         self.exit.borrow().is_some()
+    }
+
+    /// Whether the leader has been reaped or is known gone (the sweep may still run).
+    fn ended(&self) -> bool {
+        self.ended
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+    /// Ends a registration whose launch failed: std has reaped (or will reap) the
+    /// child, so it is forgotten and anyone already waiting is woken.
+    fn abandon(&self) {
+        *self.ended.lock().unwrap_or_else(|p| p.into_inner()) = Some(KeptExit::default());
+        self.publish(KeptExit::default());
+    }
+
+    fn publish(&self, exit: KeptExit) {
+        self.exit.send_replace(Some(exit));
+        if self.owner == Owner::Child {
+            forget_child(self);
+        }
     }
 
     fn pid(&self) -> Pid {
@@ -400,7 +435,10 @@ impl Watched {
     /// Starts the exit watcher unless one is running. Children are watched from launch
     /// or attach (they must be reaped); foreign processes when someone waits for them.
     fn watch(self: &Arc<Self>) {
-        if self.has_exited() || self.started.swap(true, Ordering::SeqCst) {
+        if self.launching.load(Ordering::SeqCst)
+            || self.has_exited()
+            || self.started.swap(true, Ordering::SeqCst)
+        {
             return;
         }
         let watched = self.clone();
@@ -455,13 +493,22 @@ impl Watched {
     }
 
     /// Sweeps the group while it is still pinned, reaps a child, waits for the group to
-    /// empty and publishes.
+    /// empty and publishes. Reports stragglers unless the group is seen empty.
     async fn finish(&self) {
-        let (mut exit, swept) = {
-            let mut exited = self.exited.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut exit, pinned) = {
+            let mut ended = self.ended.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(exit) = *ended {
+                // An earlier watcher reaped it and was dropped mid-sweep; the leader no
+                // longer pins the group, so the sweep cannot safely be redone.
+                drop(ended);
+                self.publish(KeptExit {
+                    stragglers: true,
+                    ..exit
+                });
+                return;
+            }
             // A child's exited leader pins its group until reaped. A foreign leader pins
-            // it only while it is still a zombie of the same instance; once init reaps
-            // it the number may belong to a stranger, so it is left alone.
+            // it only while it is still a zombie of the same instance.
             let pinned = self.owner == Owner::Child
                 || (native::read_start_time(self.os_pid) == Some(self.start_token)
                     && is_zombie(self.os_pid));
@@ -472,15 +519,22 @@ impl Watched {
                 Owner::Child => reap(self.pid()),
                 Owner::Foreign => KeptExit::default(),
             };
-            *exited = true;
+            *ended = Some(exit);
             (exit, pinned)
         };
-        // Members still alive keep the group number in use, so it cannot be reused.
-        exit.stragglers = swept && !group_empties(self.pid()).await;
-        self.exit.send_replace(Some(exit));
-        if self.owner == Owner::Child {
-            forget_child(self);
-        }
+        // Members still alive keep the group number in use, so it cannot be reused: a
+        // group that still has a running member is the recorded one even after init
+        // reaped its leader. A group that cannot be listed is never reported empty.
+        exit.stragglers = if pinned {
+            !group_empties(self.pid()).await
+        } else {
+            match group_members(self.os_pid as i32) {
+                None => true,
+                Some(members) if members.iter().all(|&pid| is_zombie(pid as u32)) => false,
+                Some(_) => !group_empties(self.pid()).await,
+            }
+        };
+        self.publish(exit);
     }
 }
 
@@ -546,8 +600,8 @@ impl KeptTarget for UnixKeptTarget {
     async fn signal(&self, signal: Signal) -> Result<(), KeptError> {
         let signal = native::to_nix(signal).map_err(|e| KeptError::Signal(e.to_string()))?;
         let watched = &self.watched;
-        let exited = watched.exited.lock().unwrap_or_else(|p| p.into_inner());
-        if *exited {
+        let ended = watched.ended.lock().unwrap_or_else(|p| p.into_inner());
+        if ended.is_some() {
             return Ok(());
         }
         let sent = |result: nix::Result<()>| match result {
