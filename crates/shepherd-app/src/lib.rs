@@ -7,8 +7,10 @@
 
 pub mod dispatch;
 pub mod error;
+pub mod kept;
 pub mod ports;
 pub mod registry;
+pub mod service;
 pub mod supervisor;
 
 pub use dispatch::{
@@ -19,11 +21,20 @@ pub use error::{
     HandlerError, ScopeCreationError, ShutdownError, SpawnError, StatsError, TerminateError,
     WaitError,
 };
+pub use kept::{
+    KeptCommit, KeptEntry, KeptError, KeptExit, KeptLaunch, KeptLauncher, KeptLock, KeptProcess,
+    KeptProcesses, KeptSpec, KeptStore, KeptTarget, KeptTermination,
+};
 pub use ports::{
     Clock, EventHandler, IntegrationEventPublisher, ProcessBackend, Spawned, TerminateOptions,
     WaitFuture, Waiters,
 };
 pub use registry::ScopeRegistry;
+pub use service::{
+    Service, ServiceFailure, ServiceHandle, ServiceInstance, ServiceLaunch, ServiceNameInUse,
+    ServiceOptions, ServiceState, ServiceStatus, ServiceStop, ServiceStopped, ServiceSummary,
+    ServiceSupervisor,
+};
 pub use supervisor::{
     ObservedScope, ObservedSpawn, ProcessSupervisor, ScopeTerminationReport, ScopedProcesses,
     ShutdownReport, SpawnObservation, WithScopeResult,

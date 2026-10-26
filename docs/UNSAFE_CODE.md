@@ -35,6 +35,17 @@ and transferred once into `OwnedFd`. Plain numeric-PID signaling is not an equiv
 replacement. Existing scope-isolation, cancellation, anchor-reuse, and privileged
 cgroup tests cover these paths.
 
+**Kept-process launch gate.** A kept process must never run its program before its
+record is durable (ADR 0023). The child calls `setsid`, closes the owner's end of a
+private socket, writes its pid and blocks in `read` until the owner sends one byte;
+EOF (the owner died) or any other byte makes it fail before `exec`. This needs
+`pre_exec`. The closure uses only copied descriptor numbers, a stack buffer and the
+async-signal-safe `setsid`, `close`, `getpid`, `write` and `read`. A safe
+alternative would have to run user code first (a trampoline program) or start the
+program before the record exists. `kept_integration` kills an owner between the
+record and the gate and checks the program never ran; launches are serialized so
+no gated child can hold another gate's socket open.
+
 **macOS measurements.** `proc_pid_rusage`, PID-group enumeration, and Mach timebase
 queries require native ABI buffers. Records are initialized, correctly aligned and
 sized for the requested version; errors are checked. PID lists grow within a fixed
@@ -69,6 +80,7 @@ above and also has a local safety comment.
 | File | Sites | Justification and source |
 | --- | ---: | --- |
 | `crates/shepherd-infra/src/backend/unix.rs` | 6 | Pre-exec containment setup, owned pidfd syscalls, and Mach timebase conversion. [Source](../crates/shepherd-infra/src/backend/unix.rs) |
+| `crates/shepherd-infra/src/kept/unix.rs` | 1 | Kept-process launch gate: `setsid`, report the pid and block before `exec` until the owner commits the record. [Source](../crates/shepherd-infra/src/kept/unix.rs) |
 | `crates/shepherd-infra/src/backend/windows.rs` | 33 | Job/process/thread FFI, initialized ABI records, owned-handle transfer, and native lifecycle tests. [Source](../crates/shepherd-infra/src/backend/windows.rs) |
 | `crates/shepherd-infra/src/usage/macos.rs` | 4 | Versioned rusage buffer, Mach timebase, and bounded PID-group enumeration. [Source](../crates/shepherd-infra/src/usage/macos.rs) |
 | `crates/shepherd-infra/src/usage/windows.rs` | 1 | Read-only process handle and correctly sized time/memory outputs. [Source](../crates/shepherd-infra/src/usage/windows.rs) |

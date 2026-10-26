@@ -1285,7 +1285,7 @@ fn apply_env(cmd: &mut tokio::process::Command, env: &EnvPolicy) {
     }
 }
 
-fn to_nix(signal: Signal) -> Result<NixSignal, TerminateError> {
+pub(crate) fn to_nix(signal: Signal) -> Result<NixSignal, TerminateError> {
     Ok(match signal {
         Signal::Term => NixSignal::SIGTERM,
         Signal::Kill => NixSignal::SIGKILL,
@@ -1296,7 +1296,7 @@ fn to_nix(signal: Signal) -> Result<NixSignal, TerminateError> {
     })
 }
 
-fn signal_from_raw(raw: i32) -> Signal {
+pub(crate) fn signal_from_raw(raw: i32) -> Signal {
     match raw {
         libc::SIGTERM => Signal::Term,
         libc::SIGKILL => Signal::Kill,
@@ -1306,7 +1306,7 @@ fn signal_from_raw(raw: i32) -> Signal {
 }
 
 #[cfg(target_os = "linux")]
-fn open_pidfd(pid: u32) -> Option<OwnedFd> {
+pub(crate) fn open_pidfd(pid: u32) -> Option<OwnedFd> {
     // SAFETY: pidfd_open takes integer arguments only and returns a new descriptor
     // on success; errors are checked before transferring it to OwnedFd.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0i32) };
@@ -1319,7 +1319,7 @@ fn open_pidfd(pid: u32) -> Option<OwnedFd> {
 }
 
 #[cfg(target_os = "linux")]
-fn pidfd_kill(fd: i32, signal: NixSignal) -> Result<(), TerminateError> {
+pub(crate) fn pidfd_kill(fd: i32, signal: NixSignal) -> Result<(), TerminateError> {
     // SAFETY: the caller holds the live pidfd; null siginfo is permitted, flags
     // are zero, and no userspace output pointers are passed.
     let rc = unsafe {
@@ -1380,14 +1380,14 @@ fn peak_support() -> Support {
 }
 
 #[cfg(target_os = "linux")]
-fn read_start_time(pid: u32) -> Option<u64> {
+pub(crate) fn read_start_time(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // Field 22 (1-based) is starttime; it follows the ")" that closes comm.
     let after_comm = stat.rsplit_once(')')?.1;
     after_comm.split_whitespace().nth(19)?.parse().ok()
 }
 #[cfg(target_os = "macos")]
-fn read_start_time(pid: u32) -> Option<u64> {
+pub(crate) fn read_start_time(pid: u32) -> Option<u64> {
     let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid as i32, 0).ok()?;
     Some(
         info.pbi_start_tvsec
@@ -1396,7 +1396,7 @@ fn read_start_time(pid: u32) -> Option<u64> {
     )
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_start_time(_pid: u32) -> Option<u64> {
+pub(crate) fn read_start_time(_pid: u32) -> Option<u64> {
     None
 }
 
@@ -2227,12 +2227,20 @@ mod signal_identity_tests {
 // every Shepherd native spawn, including anchors and independent backend instances.
 // The gate is always released before callers acquire/reacquire backend state.
 // Callers that already hold state keep the ordering state -> native-spawn gate.
-fn spawn_native(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+pub(crate) fn spawn_native(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    with_spawn_lock(|| command.spawn())
+}
+
+/// Runs `work` while no Shepherd native spawn can fork. On macOS, descriptors whose
+/// close-on-exec flag is set after creation must be created under this lock.
+pub(crate) fn with_spawn_lock<T>(work: impl FnOnce() -> T) -> T {
     #[cfg(target_os = "macos")]
     static NATIVE_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[cfg(target_os = "macos")]
     let _guard = NATIVE_SPAWN
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    command.spawn()
+    work()
 }

@@ -72,6 +72,9 @@ pub(crate) fn group(pgid: i32) -> Result<UsageSnapshot, ObservationError> {
     macos::group(pgid)
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) use macos::group_members;
+
 #[cfg(test)]
 mod tests {
     use super::*;

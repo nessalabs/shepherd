@@ -37,6 +37,11 @@ Shepherd must **not** contain, depend on, or be coupled to:
 The caller provides **policy** ("this process exceeds 1 GB, stop it"). Shepherd provides
 **observation and mechanism** ("PID 1432 is using 2 GB RSS"; "terminate this scope").
 
+Two opt-in layers sit on top of the core ([ADR 0023](./decisions/0023-service-mode-and-kept-processes.md)):
+service mode (restart with a caller-chosen backoff and readiness check) and kept
+processes (outlive their owner, owned by a durable record in a caller-chosen
+directory). The core never restarts or persists anything on its own.
+
 ## 2. Strategy: build on vetted primitives
 
 We do **not** re-implement solved OS mechanics. We compose established crates and spend

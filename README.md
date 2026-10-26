@@ -70,6 +70,28 @@ method panics after that point; use `try_create_scope()` to handle
 `ScopeCreationError::SupervisorClosed`, including creation racing with shutdown.
 Rejected creation allocates no scope id or retained state.
 
+## Services and kept processes
+
+`ServiceSupervisor` keeps named processes running. A `Service` builds each run and
+checks it is ready (returning a value, such as an address). Runs restart with
+backoff when they exit or miss readiness, and status arrives on a `watch` channel.
+
+```rust,ignore
+let services = shepherd::service_supervisor(&supervisor);
+let handle = services.start(KeptName::new("tunnel")?, Tunnel::new(), ServiceOptions {
+    kept: Some(shepherd::kept_processes(state_dir.join("kept"), "my-app")?),
+    ..ServiceOptions::default()
+})?;
+let url = handle.ready().await;            // what Tunnel::ready returned
+handle.stop(ServiceStop::Leave).await;     // or ServiceStop::Terminate to turn it off
+```
+
+With `kept`, a run outlives its owner (Linux and macOS). It is owned by a record
+written before the program may run, so it is never a hidden orphan:
+`kept_processes(dir, owner).list()` shows every live one, and the next owner adopts it
+while its spec fingerprint still matches. Without `kept`, a run stops with its owner
+like any other scoped process. See [ADR 0023](docs/decisions/0023-service-mode-and-kept-processes.md).
+
 ## Architecture (Domain-Driven Design)
 
 Shepherd is one bounded context split into layers with a strict *dependencies point inward*

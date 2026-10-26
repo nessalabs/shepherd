@@ -6,6 +6,8 @@
 
 pub mod backend;
 pub mod clock;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod kept;
 pub mod publisher;
 pub mod waiters;
 
@@ -13,6 +15,8 @@ pub use backend::NullBackend;
 #[cfg(unix)]
 pub use backend::UnixProcessBackend;
 pub use clock::SystemClock;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use kept::{DirectoryKeptStore, UnixKeptLauncher};
 pub use publisher::{BroadcastIntegrationPublisher, NoopIntegrationPublisher};
 pub use waiters::InMemoryWaiters;
 

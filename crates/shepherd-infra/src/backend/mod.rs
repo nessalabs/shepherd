@@ -4,7 +4,7 @@ mod null;
 pub use null::NullBackend;
 
 #[cfg(unix)]
-mod unix;
+pub(crate) mod unix;
 #[cfg(unix)]
 pub use unix::UnixProcessBackend;
 

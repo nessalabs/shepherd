@@ -32,3 +32,4 @@ they do not replace that document.
 
 - [0021 — Read-only process-tree observation](0021-read-only-process-tree-observation.md)
 - [0022 — Synchronous blocking entry point](0022-blocking-entry-point.md)
+- [0023 — Service mode and kept processes](0023-service-mode-and-kept-processes.md)
