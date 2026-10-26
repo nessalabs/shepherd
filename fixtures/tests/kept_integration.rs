@@ -70,7 +70,11 @@ async fn read_pid(path: &Path) -> u32 {
         {
             return pid;
         }
-        assert!(Instant::now() < deadline, "{} never written", path.display());
+        assert!(
+            Instant::now() < deadline,
+            "{} never written",
+            path.display()
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -102,7 +106,10 @@ async fn start_list_release_adopt_and_terminate() {
     assert_eq!(record.owner, "tests");
     assert_eq!(record.log.as_deref(), Some(log.as_path()));
     assert_eq!(record.revision.as_deref(), Some("r1"));
-    assert!(record.exe.is_some(), "the executable is recorded after exec");
+    assert!(
+        record.exe.is_some(),
+        "the executable is recorded after exec"
+    );
 
     let listed = kept.list().await.unwrap();
     assert_eq!(listed.len(), 1);
@@ -125,7 +132,10 @@ async fn start_list_release_adopt_and_terminate() {
     let adopted = kept.adopt(&name("cycle")).await.unwrap().unwrap();
     assert_eq!(adopted.os_pid(), pid);
     let deadline = Instant::now() + SETTLE;
-    while !std::fs::read_to_string(&log).unwrap_or_default().contains("hello") {
+    while !std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("hello")
+    {
         assert!(Instant::now() < deadline, "log never received output");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -150,7 +160,11 @@ async fn a_kept_process_outlives_its_owner_and_is_adopted_by_the_next() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    let pid: u32 = String::from_utf8(output.stdout).unwrap().trim().parse().unwrap();
+    let pid: u32 = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     assert!(running(pid), "the kept process outlived its owner");
 
     let kept = kept(&dir);
@@ -187,14 +201,24 @@ async fn an_owner_that_dies_before_the_gate_opens_leaves_nothing_running() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    let pid: u32 = String::from_utf8(output.stdout).unwrap().trim().parse().unwrap();
+    let pid: u32 = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     until_gone(pid).await;
     assert!(!marker.exists(), "the program ran without its gate opening");
-    assert!(records.join("gated.json").exists(), "the record was durable first");
+    assert!(
+        records.join("gated.json").exists(),
+        "the record was durable first"
+    );
 
     let kept = kept(&dir);
     assert!(kept.list().await.unwrap().is_empty());
-    assert!(!records.join("gated.json").exists(), "a dead record is pruned");
+    assert!(
+        !records.join("gated.json").exists(),
+        "a dead record is pruned"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -209,7 +233,9 @@ async fn natural_exit_is_observed_with_its_code_and_clears_the_record() {
         ))
         .await
         .unwrap();
-    let exit = tokio::time::timeout(SETTLE, process.exited()).await.unwrap();
+    let exit = tokio::time::timeout(SETTLE, process.exited())
+        .await
+        .unwrap();
     assert_eq!(exit.code, Some(3));
     assert!(kept.list().await.unwrap().is_empty());
     assert!(!dir.join("records/short.json").exists());
@@ -284,7 +310,8 @@ async fn a_record_never_grants_authority_over_a_different_process() {
     let lock = store.lock(&real.name).unwrap().unwrap();
     let forged = shepherd::KeptRecord {
         os_pid: std::process::id(),
-        start_token: real.start_token ^ 1,
+        // No process started at the end of time, so this can never match.
+        start_token: u64::MAX,
         ..real
     };
     store.write(&lock, &forged).unwrap();
@@ -294,5 +321,28 @@ async fn a_record_never_grants_authority_over_a_different_process() {
     assert!(kept.list().await.unwrap().is_empty());
     assert!(!dir.join("records/stranger.json").exists());
     assert!(running(std::process::id()));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_process_that_execs_another_program_is_still_adopted() {
+    let dir = scratch("exec");
+    let kept = kept(&dir);
+    let process = kept
+        .start(KeptSpec::new(
+            name("wrapper"),
+            ProcessSpec::new("/bin/sh").args(["-c", "sleep 0.3; exec sleep 300"]),
+        ))
+        .await
+        .unwrap();
+    let pid = process.os_pid();
+    process.release();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    // The executable changed under the same instance; it must not look gone.
+    let adopted = kept.adopt(&name("wrapper")).await.unwrap();
+    let adopted = adopted.expect("the same instance after exec");
+    assert_eq!(adopted.os_pid(), pid);
+    assert!(adopted.terminate(quick()).await.outcome.is_verified());
+    until_gone(pid).await;
     std::fs::remove_dir_all(dir).unwrap();
 }

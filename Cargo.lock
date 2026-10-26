@@ -717,6 +717,7 @@ dependencies = [
 name = "shepherd-fixtures"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "dhat",
  "libc",
  "nix",

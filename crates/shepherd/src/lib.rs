@@ -191,9 +191,23 @@ pub use shepherd_app::kept::{
     KeptCommit, KeptEntry, KeptError, KeptExit, KeptLaunch, KeptLauncher, KeptLock, KeptProcess,
     KeptProcesses, KeptSpec, KeptStore, KeptTarget, KeptTermination,
 };
+pub use shepherd_domain::{KeptName, KeptNameError, KeptRecord, SpecFingerprint};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use shepherd_infra::{DirectoryKeptStore, UnixKeptLauncher};
-pub use shepherd_domain::{KeptName, KeptNameError, KeptRecord, SpecFingerprint};
+
+// Service mode: keep named processes running with restart, readiness and status (ADR 0023).
+pub use shepherd_app::service::{
+    Service, ServiceFailure, ServiceHandle, ServiceInstance, ServiceLaunch, ServiceNameInUse,
+    ServiceOptions, ServiceState, ServiceStatus, ServiceStop, ServiceStopped, ServiceSummary,
+    ServiceSupervisor,
+};
+pub use shepherd_domain::RestartPolicy;
+
+/// A [`ServiceSupervisor`] that runs services on `supervisor` with the system clock.
+#[must_use]
+pub fn service_supervisor(supervisor: &ProcessSupervisor) -> ServiceSupervisor {
+    ServiceSupervisor::new(supervisor.clone(), Arc::new(SystemClock))
+}
 
 /// Opens the kept-process records in `dir` (created owner-only if missing). `owner`
 /// labels the records this application writes.

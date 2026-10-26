@@ -281,10 +281,7 @@ mod tests {
         let a = KeptName::new("a").unwrap();
         let lock_b = store.lock(&b).unwrap().unwrap();
         let lock_a = store.lock(&a).unwrap().unwrap();
-        for (lock, signal) in [
-            (&lock_b, Signal::Custom(10)),
-            (&lock_a, Signal::Interrupt),
-        ] {
+        for (lock, signal) in [(&lock_b, Signal::Custom(10)), (&lock_a, Signal::Interrupt)] {
             let record = record(lock.name().as_str(), signal);
             store.write(lock, &record).unwrap();
             assert_eq!(store.read(lock.name()).unwrap(), Some(record));
@@ -297,7 +294,10 @@ mod tests {
         std::fs::write(dir.join("other.txt"), b"").unwrap();
         assert_eq!(store.names().unwrap(), vec![a.clone(), b.clone()]);
         let wrong = record("b", Signal::Term);
-        assert!(matches!(store.write(&lock_a, &wrong), Err(KeptError::Store(_))));
+        assert!(matches!(
+            store.write(&lock_a, &wrong),
+            Err(KeptError::Store(_))
+        ));
         store.remove(&lock_a).unwrap();
         store.remove(&lock_a).unwrap();
         assert_eq!(store.read(&a).unwrap(), None);

@@ -5,7 +5,7 @@
 //! the supervisor. This module holds only the pure parts: names, records, fingerprints
 //! and the identity rule. Storage and the OS live behind application ports.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::spec::{EnvPolicy, ProcessSpec, Signal};
 
@@ -172,8 +172,6 @@ pub struct KeptObservation {
     pub start_token: u64,
     /// The current boot, where the OS names one.
     pub boot_id: Option<String>,
-    /// The executable the process now runs, when readable.
-    pub exe: Option<PathBuf>,
 }
 
 /// The durable owner of one kept process.
@@ -191,8 +189,9 @@ pub struct KeptRecord {
     /// The boot the process started in, where the OS names one (start tokens restart
     /// with each boot on Linux).
     pub boot_id: Option<String>,
-    /// The executable the process runs, read after `exec`. `None` only if the owner
-    /// stopped between `exec` and the record update.
+    /// The executable it ran right after `exec`, for display. Not part of its identity:
+    /// a process may exec another program (a shell wrapper does) and stay the same
+    /// instance. `None` if the owner stopped before the record update.
     pub exe: Option<PathBuf>,
     /// The program as given in the spec (lossy text, for display).
     pub program: String,
@@ -215,19 +214,17 @@ pub struct KeptRecord {
 impl KeptRecord {
     /// Whether `observed` is the same process instance this record owns.
     ///
-    /// The start token must match. A boot id or executable path is compared only when
-    /// both sides have one, so a missing reading never makes a stranger look owned: the
-    /// start token alone already rejects a reused pid.
+    /// The start token must match, and the boot id too when both sides have one. The
+    /// start token alone already rejects a reused pid; the boot id covers tokens that
+    /// restart with each boot. The executable path is deliberately not compared: a
+    /// process that execs keeps its identity, and treating it as gone would orphan it.
     #[must_use]
     pub fn is_same_instance(&self, observed: &KeptObservation) -> bool {
-        let same = |a: Option<&str>, b: Option<&str>| a.zip(b).map_or(true, |(a, b)| a == b);
-        observed.start_token == self.start_token
-            && same(self.boot_id.as_deref(), observed.boot_id.as_deref())
-            && self
-                .exe
-                .as_deref()
-                .zip(observed.exe.as_deref())
-                .map_or(true, |(a, b): (&Path, &Path)| a == b)
+        let same_boot = match (self.boot_id.as_deref(), observed.boot_id.as_deref()) {
+            (Some(recorded), Some(now)) => recorded == now,
+            _ => true,
+        };
+        observed.start_token == self.start_token && same_boot
     }
 }
 
@@ -238,10 +235,22 @@ mod tests {
 
     #[test]
     fn names_accept_the_portable_set_only() {
-        assert_eq!(KeptName::new("tunnel-1.quick_A").unwrap().as_str(), "tunnel-1.quick_A");
+        assert_eq!(
+            KeptName::new("tunnel-1.quick_A").unwrap().as_str(),
+            "tunnel-1.quick_A"
+        );
         assert_eq!(KeptName::new("a").unwrap().to_string(), "a");
         assert!(KeptName::new("x".repeat(64)).is_ok());
-        for bad in ["", ".hidden", "a/b", "a b", "ü", "a\\b", "..", &"x".repeat(65)] {
+        for bad in [
+            "",
+            ".hidden",
+            "a/b",
+            "a b",
+            "ü",
+            "a\\b",
+            "..",
+            &"x".repeat(65),
+        ] {
             let error = KeptName::new(bad).unwrap_err();
             assert_eq!(error.0, bad);
             assert!(error.to_string().contains("invalid kept process name"));
@@ -290,7 +299,10 @@ mod tests {
             SpecFingerprint::of(&base(), Some("token-2")),
         ];
         for (index, variant) in variants.iter().enumerate() {
-            assert_ne!(*variant, same, "variant {index} must change the fingerprint");
+            assert_ne!(
+                *variant, same,
+                "variant {index} must change the fingerprint"
+            );
             for other in &variants[index + 1..] {
                 assert_ne!(variant, other);
             }
@@ -316,23 +328,21 @@ mod tests {
     }
 
     #[test]
-    fn identity_requires_the_start_token_and_any_shared_readings() {
+    fn identity_is_the_start_token_within_one_boot() {
         let record = record();
-        let seen = |start_token, boot: Option<&str>, exe: Option<&str>| KeptObservation {
+        let seen = |start_token, boot: Option<&str>| KeptObservation {
             start_token,
             boot_id: boot.map(Into::into),
-            exe: exe.map(PathBuf::from),
         };
-        assert!(record.is_same_instance(&seen(7, Some("boot-a"), Some("/bin/prog"))));
-        assert!(record.is_same_instance(&seen(7, None, None)));
-        assert!(!record.is_same_instance(&seen(8, Some("boot-a"), Some("/bin/prog"))));
-        assert!(!record.is_same_instance(&seen(7, Some("boot-b"), Some("/bin/prog"))));
-        assert!(!record.is_same_instance(&seen(7, Some("boot-a"), Some("/bin/sh"))));
-        let unread = KeptRecord {
+        assert!(record.is_same_instance(&seen(7, Some("boot-a"))));
+        assert!(record.is_same_instance(&seen(7, None)));
+        assert!(!record.is_same_instance(&seen(8, Some("boot-a"))));
+        assert!(!record.is_same_instance(&seen(7, Some("boot-b"))));
+        let unbooted = KeptRecord {
             boot_id: None,
-            exe: None,
             ..record
         };
-        assert!(unread.is_same_instance(&seen(7, Some("boot-b"), Some("/bin/sh"))));
+        assert!(unbooted.is_same_instance(&seen(7, Some("boot-b"))));
+        assert!(!unbooted.is_same_instance(&seen(8, None)));
     }
 }

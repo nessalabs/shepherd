@@ -75,7 +75,9 @@ impl KeptLock {
 
 impl std::fmt::Debug for KeptLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KeptLock").field("name", &self.name).finish()
+        f.debug_struct("KeptLock")
+            .field("name", &self.name)
+            .finish()
     }
 }
 
@@ -456,7 +458,9 @@ const CLAIM_RETRY: Duration = Duration::from_millis(10);
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// A kept process held by this owner.
@@ -507,7 +511,9 @@ impl KeptProcess {
         let exited = target.exited();
         tokio::pin!(exited);
         if let Some(exit) = futures_util::FutureExt::now_or_never(&mut exited) {
-            return self.finish(TerminationOutcome::ExitedNaturally, Some(exit)).await;
+            return self
+                .finish(TerminationOutcome::ExitedNaturally, Some(exit))
+                .await;
         }
         if target.signal(self.record.graceful_signal).await.is_ok() {
             tokio::select! {
@@ -528,7 +534,10 @@ impl KeptProcess {
             },
         };
         match exit {
-            Some(exit) => self.finish(TerminationOutcome::ForcedRequired, Some(exit)).await,
+            Some(exit) => {
+                self.finish(TerminationOutcome::ForcedRequired, Some(exit))
+                    .await
+            }
             None => KeptTermination {
                 outcome: TerminationOutcome::CleanupUnverified(UnverifiedReason::WaitTimedOut {
                     waited: options

@@ -262,3 +262,38 @@ Application access handle for a fresh block scope; escaping it does not extend s
 - **ObservedProcess**: one visible process and its reported parent and display name.
 - **ProcessSnapshot**: a best-effort, non-atomic inventory of visible processes.
 - **ProcessTree**: a selected root and observed descendants in parent-before-child order.
+
+## Kept processes and services (ADR 0023)
+
+### KeptName
+**Value Object.** A caller-chosen name for one kept process or service: 1-64 of
+`[A-Za-z0-9._-]`, not starting with `.`. Safe as a file name. Rejected names produce a
+`KeptNameError`.
+
+### KeptRecord
+**Value Object.** The durable owner of a kept process: name, pid, start token, boot id,
+fingerprint, graceful signal, log path and owner label. Written before the program may
+run and removed only after the process is confirmed gone, so a live kept process
+always has one.
+
+### KeptObservation
+**Value Object.** What the OS reports now about the process at a recorded pid (start
+token and boot id). `KeptRecord::is_same_instance` decides whether it is the recorded
+instance; the executable path is not part of identity because a process may exec.
+
+### SpecFingerprint
+**Value Object.** A stable 64-bit digest of a `ProcessSpec` plus a caller revision.
+A kept service adopts its earlier run only while the fingerprint matches.
+
+### RestartPolicy
+**Value Object.** Exponential backoff between service restarts: initial delay, growth
+factor, maximum, the ready time that clears the failure count, and an optional limit
+of consecutive failures.
+
+### KeptProcesses
+**Application Service.** Starts, lists and adopts kept processes through the
+`KeptStore` and `KeptLauncher` ports. `list` shows every live kept process.
+
+### ServiceSupervisor
+**Application Service.** Keeps named services running: launch, readiness polling,
+restart with backoff, a status stream, and optional kept runs that outlive the owner.

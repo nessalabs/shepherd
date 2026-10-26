@@ -13,8 +13,8 @@ async fn main() {
     use std::sync::Arc;
 
     use shepherd::{
-        DirectoryKeptStore, KeptLauncher, KeptName, KeptRecord, KeptSpec, KeptStore,
-        ProcessSpec, SpecFingerprint, UnixKeptLauncher,
+        DirectoryKeptStore, KeptLauncher, KeptName, KeptRecord, KeptSpec, KeptStore, ProcessSpec,
+        SpecFingerprint, UnixKeptLauncher,
     };
 
     let args: Vec<String> = std::env::args().skip(1).collect();

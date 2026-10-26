@@ -116,7 +116,11 @@ mod tests {
             .healthy_after(3 * S)
             .max_failures(Some(2));
         assert_eq!(policy.delay(1), 5 * S);
-        assert_eq!(policy.delay(4), 5 * S, "max is raised to initial; factor 1 is flat");
+        assert_eq!(
+            policy.delay(4),
+            5 * S,
+            "max is raised to initial; factor 1 is flat"
+        );
         assert_eq!(policy.healthy_duration(), 3 * S);
         assert!(!policy.gives_up(2));
         assert!(policy.gives_up(3));

@@ -29,9 +29,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{kill, killpg, Signal as NixSignal};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
-use shepherd_app::kept::{
-    KeptCommit, KeptError, KeptExit, KeptLaunch, KeptLauncher, KeptTarget,
-};
+use shepherd_app::kept::{KeptCommit, KeptError, KeptExit, KeptLaunch, KeptLauncher, KeptTarget};
 use shepherd_domain::{EnvPolicy, KeptObservation, KeptRecord, ProcessSpec, Signal};
 use tokio::sync::watch;
 
@@ -71,9 +69,10 @@ impl KeptLauncher for UnixKeptLauncher {
     ) -> Result<(KeptLaunch, Arc<dyn KeptTarget>), KeptError> {
         let spec = spec.clone();
         let log = log.map(Path::to_path_buf);
-        let launch = tokio::task::spawn_blocking(move || gated_spawn(&spec, log.as_deref(), commit))
-            .await
-            .map_err(|e| KeptError::Launch(e.to_string()))??;
+        let launch =
+            tokio::task::spawn_blocking(move || gated_spawn(&spec, log.as_deref(), commit))
+                .await
+                .map_err(|e| KeptError::Launch(e.to_string()))??;
         #[cfg(target_os = "linux")]
         let pidfd = native::open_pidfd(launch.os_pid);
         let watched = Arc::new(Watched::new(
@@ -102,7 +101,7 @@ impl KeptLauncher for UnixKeptLauncher {
         // leave a process and come back, so a match proves the pin is that process.
         #[cfg(target_os = "linux")]
         let pidfd = native::open_pidfd(record.os_pid);
-        let Some(observed) = observe(record.os_pid) else {
+        let Some(observed) = observe(record.os_pid)? else {
             return Ok(None);
         };
         if !record.is_same_instance(&observed) {
@@ -123,7 +122,7 @@ impl KeptLauncher for UnixKeptLauncher {
             record.os_pid,
             record.start_token,
             owner,
-            observed.exe,
+            read_exe(record.os_pid),
             #[cfg(target_os = "linux")]
             pidfd,
         ));
@@ -203,8 +202,7 @@ fn gated_spawn(
                 if read == 1 && go == GO {
                     return Ok(());
                 }
-                if read < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
-                {
+                if read < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
                 return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
@@ -362,10 +360,7 @@ impl Watched {
     /// Starts the exit watcher once. Children are watched from launch or attach (they
     /// must be reaped); foreign processes only when someone waits for them.
     fn watch(self: &Arc<Self>) {
-        if self
-            .started
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
         let watched = self.clone();
@@ -509,12 +504,24 @@ impl KeptTarget for UnixKeptTarget {
 }
 
 /// What the OS reports now about `pid`, or `None` if no process is there.
-fn observe(pid: u32) -> Option<KeptObservation> {
-    Some(KeptObservation {
-        start_token: native::read_start_time(pid)?,
-        boot_id: boot_id(),
-        exe: read_exe(pid),
-    })
+///
+/// An identity that exists but cannot be read is an error, never "gone": treating it
+/// as gone would drop the record of a live process.
+fn observe(pid: u32) -> Result<Option<KeptObservation>, KeptError> {
+    if let Some(start_token) = native::read_start_time(pid) {
+        return Ok(Some(KeptObservation {
+            start_token,
+            boot_id: boot_id(),
+        }));
+    }
+    match kill(Pid::from_raw(pid as i32), None) {
+        Err(Errno::ESRCH) => Ok(None),
+        // A zombie has exited; it no longer needs a record.
+        _ if is_zombie(pid) => Ok(None),
+        _ => Err(KeptError::Signal(format!(
+            "pid {pid} exists but its start time is unreadable"
+        ))),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -534,11 +541,15 @@ fn read_exe(pid: u32) -> Option<PathBuf> {
     let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
     // A replaced binary still identifies the instance; drop the kernel's marker.
     let text = path.to_str()?;
-    Some(PathBuf::from(text.strip_suffix(" (deleted)").unwrap_or(text)))
+    Some(PathBuf::from(
+        text.strip_suffix(" (deleted)").unwrap_or(text),
+    ))
 }
 #[cfg(target_vendor = "apple")]
 fn read_exe(pid: u32) -> Option<PathBuf> {
-    libproc::proc_pid::pidpath(pid as i32).ok().map(PathBuf::from)
+    libproc::proc_pid::pidpath(pid as i32)
+        .ok()
+        .map(PathBuf::from)
 }
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 fn read_exe(_pid: u32) -> Option<PathBuf> {
@@ -620,11 +631,9 @@ impl ExitQueue {
         );
         // ESRCH here means it already exited; the liveness loop then sees that at once.
         queue.kevent(&[change], &mut [], None).ok()?;
-        let queue = tokio::io::unix::AsyncFd::with_interest(
-            QueueFd(queue),
-            tokio::io::Interest::READABLE,
-        )
-        .ok()?;
+        let queue =
+            tokio::io::unix::AsyncFd::with_interest(QueueFd(queue), tokio::io::Interest::READABLE)
+                .ok()?;
         Some(Self { queue })
     }
 

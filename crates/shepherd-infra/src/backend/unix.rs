@@ -2227,7 +2227,9 @@ mod signal_identity_tests {
 // every Shepherd native spawn, including anchors and independent backend instances.
 // The gate is always released before callers acquire/reacquire backend state.
 // Callers that already hold state keep the ordering state -> native-spawn gate.
-pub(crate) fn spawn_native(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+pub(crate) fn spawn_native(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
     #[cfg(target_os = "macos")]
     static NATIVE_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[cfg(target_os = "macos")]
