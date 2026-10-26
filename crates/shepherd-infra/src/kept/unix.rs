@@ -611,20 +611,18 @@ impl KeptTarget for UnixKeptTarget {
         // A child's group is pinned until `finish` reaps it under this lock. A foreign
         // leader must be positively re-identified before any numeric signal; on Linux
         // its pidfd signals exactly that instance.
-        if watched.owner == Owner::Foreign {
-            #[cfg(target_os = "linux")]
-            if let Some(pidfd) = &watched.pidfd {
-                native::pidfd_kill(pidfd.as_raw_fd(), signal)
-                    .map_err(|e| KeptError::Signal(e.to_string()))?;
-                return if watched.confirmed_alive() {
-                    sent(killpg(watched.pid(), signal))
-                } else {
-                    Ok(())
-                };
-            }
-            if !watched.confirmed_alive() {
-                return Ok(());
-            }
+        #[cfg(target_os = "linux")]
+        if let (Owner::Foreign, Some(pidfd)) = (watched.owner, &watched.pidfd) {
+            native::pidfd_kill(pidfd.as_raw_fd(), signal)
+                .map_err(|e| KeptError::Signal(e.to_string()))?;
+            return if watched.confirmed_alive() {
+                sent(killpg(watched.pid(), signal))
+            } else {
+                Ok(())
+            };
+        }
+        if watched.owner == Owner::Foreign && !watched.confirmed_alive() {
+            return Ok(());
         }
         sent(killpg(watched.pid(), signal))?;
         // The leader may have left its group; it is pinned (child) or just re-identified.
