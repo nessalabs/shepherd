@@ -83,7 +83,6 @@ impl KeptLauncher for UnixKeptLauncher {
             tokio::task::spawn_blocking(move || gated_spawn(&spec, log.as_deref(), commit))
                 .await
                 .map_err(|e| KeptError::Launch(e.to_string()))??;
-        watched.watch();
         Ok((launch, Arc::new(UnixKeptTarget { watched })))
     }
 
@@ -307,9 +306,10 @@ fn gated_spawn(
         return Err(error);
     }
     *watched.exe.lock().unwrap_or_else(|p| p.into_inner()) = read_exe(os_pid);
-    // Cleared here, not by the caller: a cancelled `launch` must not leave the child
-    // unwatchable. The next `attach` (or `launch` itself) starts the watcher.
+    // Cleared and watched here, not by the caller: a cancelled `launch` must not leave
+    // the child unwatched. This runs on a `spawn_blocking` thread of the runtime.
     watched.launching.store(false, Ordering::SeqCst);
+    watched.watch();
     Ok((launch, watched))
 }
 
