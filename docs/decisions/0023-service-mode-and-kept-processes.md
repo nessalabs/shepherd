@@ -63,7 +63,9 @@ confirmed gone.
 (`launch`) and checks it (`ready`, which returns a value such as an address). The
 supervisor publishes `ServiceStatus` on a `watch` channel, restarts on exit or missed
 readiness with `RestartPolicy` backoff, and can give up after a set number of
-consecutive failures. Each run lives in its own scope by default. With
+consecutive failures. `Backoff` and `Failed` name the step that failed as a
+`ServiceFailureKind` (launch, start, readiness check, not ready in time, exited before
+or after ready), so a caller branches on that and leaves `reason` to its log. Each run lives in its own scope by default. With
 `ServiceOptions::kept`, each run is a kept process; the first start adopts the
 previous run when its `SpecFingerprint` (spec plus a caller revision) still matches,
 and stops it otherwise. `stop(Terminate)` ends the run and its tree;

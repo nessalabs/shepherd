@@ -170,7 +170,9 @@ pub enum ServiceStatus<T> {
         failures: u32,
         /// How long until the next start.
         delay: Duration,
-        /// Why the last run failed.
+        /// Which step of the last run failed.
+        kind: ServiceFailureKind,
+        /// Why the last run failed, in words for a log.
         reason: String,
     },
     /// Stopping on request.
@@ -184,9 +186,44 @@ pub enum ServiceStatus<T> {
     },
     /// Gave up after too many consecutive failures; nothing is running.
     Failed {
-        /// Why the last run failed.
+        /// Which step of the last run failed.
+        kind: ServiceFailureKind,
+        /// Why the last run failed, in words for a log.
         reason: String,
     },
+}
+
+/// Which step of a run failed. Callers branch on this; `reason` is for a log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceFailureKind {
+    /// [`Service::launch`] returned an error.
+    Launch,
+    /// The run could not be started: spawning it, keeping its record, or ending a
+    /// previous run that had to stop first failed.
+    Start,
+    /// [`Service::ready`] returned an error.
+    ReadyCheck,
+    /// It did not become ready within [`ServiceOptions::ready_within`].
+    NotReadyInTime,
+    /// It exited before it was ready.
+    ExitedBeforeReady,
+    /// It exited after it was ready.
+    Exited,
+}
+
+/// A failed run: which step, and why in words.
+struct RunFailure {
+    kind: ServiceFailureKind,
+    reason: String,
+}
+
+impl RunFailure {
+    fn new(kind: ServiceFailureKind, reason: impl Into<String>) -> Self {
+        Self {
+            kind,
+            reason: reason.into(),
+        }
+    }
 }
 
 impl<T> ServiceStatus<T> {
@@ -488,20 +525,24 @@ impl<S: Service> Runner<S> {
         let mut stop = std::mem::replace(&mut self.stop, mpsc::channel(1).1);
         let mut failures = 0u32;
         let mut attempt = 0u32;
-        let mut reason = String::new();
+        let mut last = RunFailure::new(ServiceFailureKind::Start, String::new());
         // Only a runner that has not yet started or adopted a run may adopt one: a
         // failed first attempt must not turn a matching earlier run into a stranger.
         let mut may_adopt = true;
         loop {
             if failures > 0 {
                 if self.options.restart.gives_up(failures) {
-                    self.publish(ServiceStatus::Failed { reason });
+                    self.publish(ServiceStatus::Failed {
+                        kind: last.kind,
+                        reason: last.reason,
+                    });
                     return stopped(None, None);
                 }
                 self.publish(ServiceStatus::Backoff {
                     failures,
                     delay: self.options.restart.delay(failures),
-                    reason: reason.clone(),
+                    kind: last.kind,
+                    reason: last.reason.clone(),
                 });
                 let delay = self.options.restart.delay(failures);
                 if let Step::Stop(_) = or_stop(&mut stop, self.clock.sleep(delay)).await {
@@ -515,7 +556,10 @@ impl<S: Service> Runner<S> {
                 Step::Stop(how) => return self.finish(None, how).await,
                 Step::Done(Ok(launch)) => launch,
                 Step::Done(Err(failure)) => {
-                    (failures, reason) = self.failed(failures, format!("launch: {failure}"));
+                    (failures, last) = self.failed(
+                        failures,
+                        RunFailure::new(ServiceFailureKind::Launch, format!("launch: {failure}")),
+                    );
                     continue;
                 }
             };
@@ -531,7 +575,10 @@ impl<S: Service> Runner<S> {
                     started
                 }
                 Err(failure) => {
-                    (failures, reason) = self.failed(failures, failure);
+                    (failures, last) = self.failed(
+                        failures,
+                        RunFailure::new(ServiceFailureKind::Start, failure),
+                    );
                     continue;
                 }
             };
@@ -540,7 +587,7 @@ impl<S: Service> Runner<S> {
                 Step::Done(Ok(value)) => value,
                 Step::Done(Err(failure)) => {
                     let _ = self.end(running, ServiceStop::Terminate).await;
-                    (failures, reason) = self.failed(failures, failure.0);
+                    (failures, last) = self.failed(failures, failure);
                     continue;
                 }
             };
@@ -561,13 +608,20 @@ impl<S: Service> Runner<S> {
             {
                 failures = 0;
             }
-            (failures, reason) = self.failed(failures, exit);
+            (failures, last) =
+                self.failed(failures, RunFailure::new(ServiceFailureKind::Exited, exit));
         }
     }
 
-    fn failed(&self, failures: u32, reason: String) -> (u32, String) {
-        tracing::warn!(service = %self.name, failures, %reason, "service run failed");
-        (failures.saturating_add(1), reason)
+    fn failed(&self, failures: u32, failure: RunFailure) -> (u32, RunFailure) {
+        tracing::warn!(
+            service = %self.name,
+            failures,
+            kind = ?failure.kind,
+            reason = %failure.reason,
+            "service run failed"
+        );
+        (failures.saturating_add(1), failure)
     }
 
     async fn start_scoped(
@@ -638,17 +692,23 @@ impl<S: Service> Runner<S> {
         &self,
         running: &Running,
         instance: &ServiceInstance,
-    ) -> Result<S::Ready, ServiceFailure> {
+    ) -> Result<S::Ready, RunFailure> {
         let deadline = self.clock.now() + self.options.ready_within;
+        let late = || RunFailure::new(ServiceFailureKind::NotReadyInTime, "not ready in time");
         let check = async {
             loop {
                 match self.service.ready(instance).await {
                     Ok(Some(value)) => return Ok(value),
                     Ok(None) => {}
-                    Err(failure) => return Err(ServiceFailure(format!("not ready: {failure}"))),
+                    Err(failure) => {
+                        return Err(RunFailure::new(
+                            ServiceFailureKind::ReadyCheck,
+                            format!("not ready: {failure}"),
+                        ))
+                    }
                 }
                 if self.clock.now() >= deadline {
-                    return Err(ServiceFailure("not ready in time".into()));
+                    return Err(late());
                 }
                 self.clock.sleep(self.options.ready_poll).await;
             }
@@ -656,12 +716,11 @@ impl<S: Service> Runner<S> {
         // The deadline also bounds a readiness check that never returns.
         tokio::select! {
             result = check => result,
-            exit = exited(&self.supervisor, running) => {
-                Err(ServiceFailure(format!("exited before ready: {exit}")))
-            }
-            () = self.clock.sleep(self.options.ready_within) => {
-                Err(ServiceFailure("not ready in time".into()))
-            }
+            exit = exited(&self.supervisor, running) => Err(RunFailure::new(
+                ServiceFailureKind::ExitedBeforeReady,
+                format!("exited before ready: {exit}"),
+            )),
+            () = self.clock.sleep(self.options.ready_within) => Err(late()),
         }
     }
 

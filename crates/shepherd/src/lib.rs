@@ -197,9 +197,9 @@ pub use shepherd_infra::{DirectoryKeptStore, UnixKeptLauncher};
 
 // Service mode: keep named processes running with restart, readiness and status (ADR 0023).
 pub use shepherd_app::service::{
-    Service, ServiceFailure, ServiceHandle, ServiceInstance, ServiceLaunch, ServiceNameInUse,
-    ServiceOptions, ServiceState, ServiceStatus, ServiceStop, ServiceStopped, ServiceSummary,
-    ServiceSupervisor,
+    Service, ServiceFailure, ServiceFailureKind, ServiceHandle, ServiceInstance, ServiceLaunch,
+    ServiceNameInUse, ServiceOptions, ServiceState, ServiceStatus, ServiceStop, ServiceStopped,
+    ServiceSummary, ServiceSupervisor,
 };
 pub use shepherd_domain::RestartPolicy;
 
