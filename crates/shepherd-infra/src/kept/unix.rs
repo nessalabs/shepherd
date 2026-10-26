@@ -11,8 +11,8 @@
 //! **Exit.** A kept process this process started (or inherited across `execve`) is
 //! reaped here. Its exit is observed without reaping first (pidfd on Linux, kqueue on
 //! macOS), so the process group is still pinned when it is swept with `SIGKILL`. A
-//! kept process whose owner died belongs to init; its exit is observed the same way,
-//! its group swept best-effort, and its status is unknown.
+//! kept process whose owner died belongs to init; it is watched from adoption, its
+//! group swept only while its number provably still names it, and its status is unknown.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -49,8 +49,10 @@ const POLL: Duration = Duration::from_millis(250);
 /// execs, so two overlapping gates could each keep the other's socket alive.
 static GATE: Mutex<()> = Mutex::new(());
 
-/// Kept processes this process must reap, by pid. An entry lives until the reap.
-static CHILDREN: OnceLock<Mutex<HashMap<u32, Arc<Watched>>>> = OnceLock::new();
+/// Kept processes this process watches, by pid: children it must reap and adopted
+/// foreign ones. An entry lives until its exit is published, so each instance has one
+/// watcher however often it is attached.
+static WATCHED: OnceLock<Mutex<HashMap<u32, Arc<Watched>>>> = OnceLock::new();
 
 /// The Unix [`KeptLauncher`].
 ///
@@ -81,13 +83,12 @@ impl KeptLauncher for UnixKeptLauncher {
             tokio::task::spawn_blocking(move || gated_spawn(&spec, log.as_deref(), commit))
                 .await
                 .map_err(|e| KeptError::Launch(e.to_string()))??;
-        watched.launching.store(false, Ordering::SeqCst);
         watched.watch();
         Ok((launch, Arc::new(UnixKeptTarget { watched })))
     }
 
     async fn attach(&self, record: &KeptRecord) -> Result<Option<Arc<dyn KeptTarget>>, KeptError> {
-        if let Some(known) = children().get(&record.os_pid).cloned() {
+        if let Some(known) = watched_registry().get(&record.os_pid).cloned() {
             if known.start_token == record.start_token {
                 if known.ended() {
                     return Ok(None);
@@ -130,11 +131,20 @@ impl KeptLauncher for UnixKeptLauncher {
             #[cfg(target_os = "linux")]
             pidfd,
         ));
-        if owner == Owner::Child {
-            let watched = children().entry(record.os_pid).or_insert(watched).clone();
-            watched.watch();
-            return Ok(Some(Arc::new(UnixKeptTarget { watched })));
-        }
+        // Watched at once, children and foreign alike, so the exit is handled within
+        // moments of happening, before the number can be reused.
+        let watched = {
+            let mut registry = watched_registry();
+            match registry.get(&record.os_pid) {
+                Some(known) if known.start_token == record.start_token => known.clone(),
+                // An entry for an earlier instance at this number is already gone.
+                _ => {
+                    registry.insert(record.os_pid, watched.clone());
+                    watched
+                }
+            }
+        };
+        watched.watch();
         Ok(Some(Arc::new(UnixKeptTarget { watched })))
     }
 
@@ -143,15 +153,15 @@ impl KeptLauncher for UnixKeptLauncher {
     }
 }
 
-fn children() -> MutexGuard<'static, HashMap<u32, Arc<Watched>>> {
-    CHILDREN
+fn watched_registry() -> MutexGuard<'static, HashMap<u32, Arc<Watched>>> {
+    WATCHED
         .get_or_init(Mutex::default)
         .lock()
         .unwrap_or_else(|p| p.into_inner())
 }
 
-fn forget_child(watched: &Watched) {
-    let mut registry = children();
+fn forget_watched(watched: &Watched) {
+    let mut registry = watched_registry();
     if registry
         .get(&watched.os_pid)
         .is_some_and(|known| std::ptr::eq(Arc::as_ptr(known), watched))
@@ -276,7 +286,7 @@ fn gated_spawn(
     // No watcher may start (and reap) until the launch has succeeded: std reaps a
     // child that fails before exec.
     watched.launching.store(true, Ordering::SeqCst);
-    children().insert(os_pid, watched.clone());
+    watched_registry().insert(os_pid, watched.clone());
     if let Err(error) = commit(launch) {
         abort(owner_end);
         let _ = join(spawner);
@@ -297,6 +307,9 @@ fn gated_spawn(
         return Err(error);
     }
     *watched.exe.lock().unwrap_or_else(|p| p.into_inner()) = read_exe(os_pid);
+    // Cleared here, not by the caller: a cancelled `launch` must not leave the child
+    // unwatchable. The next `attach` (or `launch` itself) starts the watcher.
+    watched.launching.store(false, Ordering::SeqCst);
     Ok((launch, watched))
 }
 
@@ -423,9 +436,7 @@ impl Watched {
 
     fn publish(&self, exit: KeptExit) {
         self.exit.send_replace(Some(exit));
-        if self.owner == Owner::Child {
-            forget_child(self);
-        }
+        forget_watched(self);
     }
 
     fn pid(&self) -> Pid {
@@ -522,11 +533,14 @@ impl Watched {
             *ended = Some(exit);
             (exit, pinned)
         };
-        // Members still alive keep the group number in use, so it cannot be reused: a
-        // group that still has a running member is the recorded one even after init
-        // reaped its leader. A group that cannot be listed is never reported empty.
+        // Members still alive keep the group number in use, so it cannot be reused.
+        // After init reaped a foreign leader, the group is swept only while no process
+        // holds its number: another process there may lead a new group of that number.
+        // A group that cannot be listed or swept is never reported empty.
         exit.stragglers = if pinned {
             !group_empties(self.pid()).await
+        } else if kill(self.pid(), None) != Err(Errno::ESRCH) {
+            true
         } else {
             match group_members(self.os_pid as i32) {
                 None => true,

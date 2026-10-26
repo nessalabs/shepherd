@@ -40,10 +40,12 @@ confirmed gone.
   and the sweep repeats until no running member is left (zombies excepted) for up to
   two seconds. Members still running after that make the termination
   `CleanupUnverified`. After the owner dies the kept process belongs to init and its
-  exit status is unknown. Its group is swept while the leader is still a zombie of the
-  recorded instance; after init reaps the leader it is swept only if listing it finds a
-  running member (a group with a member cannot be renumbered), and a group that cannot
-  be listed is reported unverified, never empty.
+  exit status is unknown. It is watched from the moment it is adopted, so its exit is
+  handled promptly. Its group is swept while the leader is still a zombie of the
+  recorded instance. After init reaps the leader, the group is swept only if no process
+  holds the number (one that does may lead a new group of that number) and listing it
+  finds a running member; otherwise, or if it cannot be listed, the termination is
+  reported unverified, never clean.
 - The record is removed once the leader is gone, even when group members outlived the
   sweep: the termination says `CleanupUnverified` and a warning is logged. The record
   names the leader only, so keeping it would not let a later owner reach the members.
