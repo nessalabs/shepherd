@@ -110,3 +110,25 @@ flowchart LR
 Capture never blocks on caller consumption. Discard uses the OS null device. Sample
 and output errors do not relinquish process ownership. Inspect TerminationOutcome
 before treating a terminal event as proof of reap.
+
+## Background command ownership
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Task as Background task worker
+    participant Scope as Observed scope
+    Caller->>Task: start command
+    Task-->>Caller: observation and cancellation handle
+    Task->>Scope: observed spawn
+    Note over Caller,Task: Dropping the handle leaves worker ownership intact
+    Scope-->>Task: root exit, timeout or cancellation
+    Task->>Scope: finish original scope
+    Scope-->>Task: cleanup report
+    Task-->>Caller: retained outcome and bounded output
+```
+
+The worker retains its supervisor through cleanup. Ordinary process-monitor workers
+still retain only the supervisor's inner state. Background task cause, physical exit,
+output completeness and confirmed cleanup are separate facts in the returned result.
+The caller owns admission across tasks and any durable completion delivery.

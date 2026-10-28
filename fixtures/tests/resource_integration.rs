@@ -101,7 +101,11 @@ async fn real_io_counters_increase() {
         .build();
     assert!(sup.capabilities().io.is_supported());
     let scope = sup.create_scope();
-    let path = std::env::temp_dir().join(format!("shepherd-io-{}", std::process::id()));
+    // Linux write_bytes counts storage I/O, not writes to tmpfs. New runner
+    // images may mount /tmp in memory; use the checkout's backing filesystem.
+    let path = std::env::current_dir()
+        .unwrap()
+        .join(format!("shepherd-io-{}", std::process::id()));
     let pid = sup
         .spawn(
             scope,
