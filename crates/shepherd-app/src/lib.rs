@@ -42,6 +42,8 @@ pub use supervisor::{
 
 pub mod output;
 
+pub mod background_task;
+
 pub mod observation;
 pub use observation::{ObservationError, ProcessObservationBackend, ProcessObserver};
 

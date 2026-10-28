@@ -70,6 +70,18 @@ method panics after that point; use `try_create_scope()` to handle
 `ScopeCreationError::SupervisorClosed`, including creation racing with shutdown.
 Rejected creation allocates no scope id or retained state.
 
+## Background tasks
+
+`BackgroundTask::start(supervisor.clone(), spec, options, clock)` returns a handle
+without waiting for a command. `status()` and `output()` observe it; `wait().await`
+returns its retained exit, bounded output tail and cleanup evidence. Dropping the
+handle or cancelling a wait leaves the command with its worker. `cancel()` requests
+scope cleanup; callers inspect `cleanup_verified()` on the result.
+
+Tasks do not restart or survive the supervisor's host process. The caller owns
+concurrency limits, persistent records and session association. See
+[the lifecycle and ordering contract](docs/decisions/0024-background-tasks.md).
+
 ## Services and kept processes
 
 `ServiceSupervisor` keeps named processes running. A `Service` builds each run and

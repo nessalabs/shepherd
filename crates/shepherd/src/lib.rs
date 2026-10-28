@@ -53,8 +53,12 @@
 
 use std::sync::Arc;
 
+pub use shepherd_app::background_task::{
+    BackgroundTask, BackgroundTaskCause, BackgroundTaskOptions, BackgroundTaskOutput,
+    BackgroundTaskResult, BackgroundTaskStatus,
+};
 pub use shepherd_app::output::{OutputChunk, OutputSnapshot, OutputStream, ProcessOutput};
-pub use shepherd_app::ports::{IntegrationEventPublisher, ProcessBackend, Spawned};
+pub use shepherd_app::ports::{Clock, IntegrationEventPublisher, ProcessBackend, Spawned};
 pub use shepherd_app::{
     HandlerError, ObservedScope, ObservedSpawn, ProcessSupervisor, ScopeCreationError,
     ScopeTerminationReport, ScopedProcesses, ShutdownError, ShutdownReport, SpawnError,
