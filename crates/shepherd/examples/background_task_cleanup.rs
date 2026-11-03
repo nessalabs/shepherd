@@ -1,7 +1,9 @@
 //! Compile with `cargo check -p shepherd --example background_task_cleanup`.
 //! Run with a trusted program and arguments, for example `-- sleep 30` on Unix.
+use shepherd::{
+    BackgroundTask, BackgroundTaskOptions, ProcessSpec, SupervisorBuilder, SystemClock,
+};
 use std::sync::Arc;
-use shepherd::{BackgroundTask, BackgroundTaskOptions, ProcessSpec, SupervisorBuilder, SystemClock};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
