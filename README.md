@@ -121,6 +121,8 @@ The domain's purity, the layering, and the ubiquitous language are enforced by t
 
 ## Documentation
 
+- [Browsable system and state map](docs/state/README.md) — caller journeys, ownership, failure outcomes and reproducible model verification.
+
 - [`docs/AGGREGATE_STATISTICS.md`](docs/AGGREGATE_STATISTICS.md) — aggregate process and scope measurements, with a linked beginner primer.
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture and implementation plan.
 - [`docs/DIAGRAMS.md`](docs/DIAGRAMS.md) — class and state diagrams.

@@ -1,0 +1,165 @@
+ Downloading crates ...
+  Downloaded glob v0.3.4
+  Downloaded rand_chacha v0.3.1
+  Downloaded cfg_aliases v0.2.2
+  Downloaded memoffset v0.9.1
+  Downloaded unarray v0.1.4
+  Downloaded itoa v1.0.18
+  Downloaded rand_xorshift v0.3.0
+  Downloaded zmij v1.0.23
+  Downloaded autocfg v1.5.1
+  Downloaded libloading v0.8.9
+  Downloaded mach2 v0.4.3
+  Downloaded rustc-hash v2.1.3
+  Downloaded cexpr v0.6.0
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded either v1.18.0
+  Downloaded rand_core v0.6.4
+  Downloaded shlex v1.3.0
+  Downloaded clang-sys v1.9.1
+  Downloaded core-foundation-sys v0.8.7
+  Downloaded getrandom v0.2.17
+  Downloaded bitflags v2.13.2
+  Downloaded num-traits v0.2.19
+  Downloaded serde_core v1.0.229
+  Downloaded serde_derive v1.0.229
+  Downloaded libproc v0.14.11
+  Downloaded socket2 v0.6.5
+  Downloaded serde v1.0.229
+  Downloaded minimal-lexical v0.2.1
+  Downloaded rand v0.8.8
+  Downloaded nom v7.1.3
+  Downloaded itertools v0.13.0
+  Downloaded regex v1.13.1
+  Downloaded serde_json v1.0.151
+  Downloaded sysinfo v0.33.1
+  Downloaded proptest v1.6.0
+  Downloaded nix v0.29.0
+  Downloaded bindgen v0.72.1
+  Downloaded zerocopy v0.8.57
+   Compiling libc v0.2.189
+   Compiling glob v0.3.4
+   Compiling autocfg v1.5.1
+   Compiling bitflags v2.13.2
+   Compiling regex-syntax v0.8.11
+   Compiling minimal-lexical v0.2.1
+   Compiling memchr v2.8.3
+   Compiling syn v2.0.119
+   Compiling libloading v0.8.9
+   Compiling either v1.18.0
+   Compiling bindgen v0.72.1
+   Compiling shlex v1.3.0
+   Compiling itertools v0.13.0
+   Compiling clang-sys v1.9.1
+   Compiling rustc-hash v2.1.3
+   Compiling nom v7.1.3
+   Compiling serde_core v1.0.229
+   Compiling zerocopy v0.8.57
+   Compiling regex-automata v0.4.18
+   Compiling errno v0.3.14
+   Compiling cexpr v0.6.0
+   Compiling getrandom v0.2.17
+   Compiling memoffset v0.9.1
+   Compiling cfg_aliases v0.2.2
+   Compiling zmij v1.0.23
+   Compiling nix v0.29.0
+   Compiling rand_core v0.6.4
+   Compiling signal-hook-registry v1.4.8
+   Compiling regex v1.13.1
+   Compiling mio v1.2.3
+   Compiling socket2 v0.6.5
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling tokio v1.53.1
+   Compiling tracing-attributes v0.1.31
+   Compiling num-traits v0.2.19
+   Compiling serde_derive v1.0.229
+   Compiling core-foundation-sys v0.8.7
+   Compiling itoa v1.0.18
+   Compiling sysinfo v0.33.1
+   Compiling tracing v0.1.44
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.3.1
+   Compiling mach2 v0.4.3
+   Compiling generator v0.8.9
+   Compiling matchers v0.2.0
+   Compiling rand v0.8.8
+   Compiling tracing-subscriber v0.3.23
+   Compiling rand_xorshift v0.3.0
+   Compiling unarray v0.1.4
+   Compiling shepherd-test-support v0.1.0 (/Users/nessa/Documents/Codex/2026-11-02/hey-can-you-update-the-nessa/work/org-docs/shepherd/crates/shepherd-test-support)
+   Compiling proptest v1.6.0
+   Compiling shepherd-app v0.1.0 (/Users/nessa/Documents/Codex/2026-11-02/hey-can-you-update-the-nessa/work/org-docs/shepherd/crates/shepherd-app)
+   Compiling loom v0.7.2
+   Compiling libproc v0.14.11
+   Compiling shepherd-infra v0.1.0 (/Users/nessa/Documents/Codex/2026-11-02/hey-can-you-update-the-nessa/work/org-docs/shepherd/crates/shepherd-infra)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/shepherd-infra/src/backend/unix.rs:1220:10
+     |
+1220 |         .fetch_update(
+     |          ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1220 -         .fetch_update(
+1220 +         .try_update(
+     |
+
+   Compiling shepherd v0.1.0 (/Users/nessa/Documents/Codex/2026-11-02/hey-can-you-update-the-nessa/work/org-docs/shepherd/crates/shepherd)
+warning: `shepherd-infra` (lib test) generated 1 warning (run `cargo fix --lib -p shepherd-infra --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.76s
+     Running unittests src/lib.rs (target/debug/deps/shepherd-1178cf20f38f6ef6)
+
+running 1 test
+test blocking::admission_tests::run_keeps_admission_when_caller_poll_is_delayed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/shepherd_infra-46b2679653200c96)
+
+running 41 tests
+test backend::sampling::tests::admission_is_bounded_and_queued_cancellation_releases_child_permit ... ok
+test backend::unix::anchor_tests::externally_reaped_anchor_discards_numeric_wait_and_kill_ownership ... ok
+test backend::unix::anchor_tests::runtime_drop_marks_anchor_pin_unverified_even_before_first_poll ... ok
+test backend::unix::anchor_tests::scope_kill_rejects_new_admission_before_and_after_anchor_reap ... ok
+test backend::unix::anchor_tests::lost_anchor_backstop_still_kills_registered_roots ... ok
+test backend::unix::failed_wait_tests::actual_wait_failure_retries_and_reaps_child ... ok
+test backend::unix::failed_wait_tests::failed_wait_retains_identity_until_verified_reap ... ok
+test backend::unix::anchor_tests::global_backstop_reaches_root_after_group_removal ... ok
+test backend::unix::anchor_tests::scope_backstop_reaches_root_after_group_removal ... ok
+test backend::unix::failed_wait_tests::failed_waiter_does_not_keep_backend_alive_or_spin ... ok
+test backend::unix::failed_wait_tests::hard_kill_before_first_wait_error_still_requests_reap ... ok
+test backend::unix::failed_wait_tests::cleanup_scope_retries_failed_wait_without_touching_sibling ... ok
+test backend::unix::failed_wait_tests::hard_kill_retries_reap_with_backend_retained ... ok
+test backend::unix::failed_wait_tests::echild_stops_native_wait_ownership_permanently ... ok
+test backend::unix::failed_wait_tests::runtime_drop_reaps_still_owned_root ... ok
+test backend::unix::signal_identity_tests::macos_start_identity_allows_owned_root_termination ... ok
+test backend::unix::anchor_tests::group_broadcast_does_not_poison_an_open_scope ... ok
+test kept::store::tests::one_owner_per_name_until_the_claim_drops ... ok
+test output::tests::overflow_drops_oldest_exact_bytes_and_preserves_binary_tail ... ok
+test output::tests::oversized_chunk_and_zero_capacity_remain_bounded ... ok
+test backend::sampling::tests::blocking_read_does_not_stall_runtime_or_duplicate_after_timeout ... ok
+test output::tests::reader_failure_is_observable ... ok
+test output::tests::thousands_of_tiny_evictions_advance_offset_without_moving_retained_bytes ... ok
+test backend::unix::signal_identity_tests::unavailable_identity_cannot_signal_unrelated_live_process ... ok
+test backend::unix::anchor_tests::reaped_anchor_cannot_signal_a_recycled_group_number ... ok
+test usage::macos::native_tests::footprint_tracks_touched_memory_and_identity_mismatch_fails ... ok
+test usage::macos::tests::flavor_fallback_is_only_for_invalid_version_and_clears_storage ... ok
+test usage::macos::tests::cpu_conversion_includes_both_counters_without_overflow ... ok
+test kept::store::tests::damaged_or_foreign_records_are_errors_not_absences ... ok
+test waiters::retention_tests::completed_history_is_bounded_without_invalidating_registered_waiters ... ok
+test waiters::tests::cancelled_wait_does_not_retain_waiter_registry ... ok
+test waiters::tests::verified_correction_survives_delayed_unverified_publication ... ok
+test waiters::tests::exit_before_first_subscriber_is_retained ... ok
+test backend::unix::failed_wait_tests::scoped_kill_requests_reap_without_fresh_wait_call ... ok
+test backend::unix::identity_tests::mismatched_reuse_token_cannot_signal_a_live_child ... ok
+test backend::unix::failed_wait_tests::unanchored_failed_group_cannot_signal_recycled_pgid ... ok
+test kept::store::tests::records_round_trip_and_list_by_name ... ok
+test usage::cancellation_tests::cancellation_keeps_native_work_permits_until_the_work_finishes ... ok
+test usage::tests::failed_members_are_preserved_and_duplicates_do_not_inflate_totals ... ok
+test backend::unix::tests::late_wait_after_natural_exit_still_sees_status ... ok
+test usage::macos::native_tests::cpu_units_match_getrusage_on_this_architecture ... ok
+
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
