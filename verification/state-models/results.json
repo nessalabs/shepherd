@@ -1,0 +1,513 @@
+{
+  "date": "2026-11-03T08:39:12.819Z",
+  "documents": 14,
+  "baselines": [
+    {
+      "owner": "background-tasks",
+      "id": "697faea5-f4b3-4210-8032-cdcbbda28220",
+      "state": "passed",
+      "message": "Every rule held. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:13.460Z",
+        "config": "tla/TaskFinalization.cfg",
+        "modelDigest": "538485926e69a1675293bc7896396b460be2683a7fdb3674870527307c692205",
+        "states": 30,
+        "held": ["PublishAfterCleanup", "CauseBeforeFinished"],
+        "broke": [],
+        "unchecked": []
+      }
+    },
+    {
+      "owner": "kept-processes",
+      "id": "1ebc1298-798a-4f73-9a67-68c43f592c8c",
+      "state": "passed",
+      "message": "Every rule held. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:16.894Z",
+        "config": "tla/KeptPublication.cfg",
+        "modelDigest": "bd2023ce820b15c385718af21d654c0a381540e22aaccf7f32cbb7900b585bbf",
+        "states": 7,
+        "held": ["RecordedBeforeExec", "PreserveNewerRecord"],
+        "broke": [],
+        "unchecked": []
+      }
+    },
+    {
+      "owner": "output",
+      "id": "0750a004-43ce-4c27-8c75-c7768a94ac8e",
+      "state": "passed",
+      "message": "Every rule held. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:20.291Z",
+        "config": "tla/OutputBudget.cfg",
+        "modelDigest": "32dc6514d655e13950e4c1e649a9ec842654aad5c2144f2d4cff5d8f911a14c4",
+        "states": 46,
+        "held": ["QueueBound", "TailBound", "ByteAccounting"],
+        "broke": [],
+        "unchecked": []
+      }
+    },
+    {
+      "owner": "scope-cleanup",
+      "id": "38a79e03-3a4d-4e15-901a-62f585049129",
+      "state": "passed",
+      "message": "Every rule held. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:25.474Z",
+        "config": "tla/ScopeCleanup.cfg",
+        "modelDigest": "b126e0f48ac370d6a7e9f2a2cd3a47ff058a78fe1fbfab05ca6e7dea58ba434d",
+        "states": 36,
+        "held": ["ClosedVerified", "PrunedVerified", "VerifiedNeverLost"],
+        "broke": [],
+        "unchecked": []
+      }
+    },
+    {
+      "owner": "services",
+      "id": "f2573256-dc55-4cf4-a8c7-dbc90d8a1866",
+      "state": "passed",
+      "message": "Every rule held. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:31.345Z",
+        "config": "tla/ServiceAdoption.cfg",
+        "modelDigest": "37ea17d825cdd31d92017004abb3731a047a14c31ca25beba4294893fbf00e08",
+        "states": 14,
+        "held": ["AdoptionMatches", "OnlyFirstAdoption", "ReplacementVerified"],
+        "broke": [],
+        "unchecked": []
+      }
+    }
+  ],
+  "controls": [
+    {
+      "name": "publish-before-cleanup",
+      "owner": "background-tasks",
+      "expected": "PublishAfterCleanup",
+      "passed": true,
+      "id": "bb85e2db-e5bb-43ca-8ba2-cb480a3a13d1",
+      "state": "broke",
+      "message": "A rule broke. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:14.822Z",
+        "config": "tla/TaskFinalization.cfg",
+        "modelDigest": "ef200ef685cf6e693438298af731fe52d2f088cc42104d113ae856d8cecc9cb2",
+        "states": 34,
+        "held": ["CauseBeforeFinished"],
+        "broke": [
+          {
+            "rule": "PublishAfterCleanup",
+            "path": [
+              "Start with cleanup is pending, published is FALSE, phase is Starting, cause is none.",
+              "Stop: cleanup is pending, published is FALSE, phase is Cleaning, cause is exit.",
+              "Publish: cleanup is pending, published is TRUE, phase is Finished, cause is exit."
+            ],
+            "states": []
+          }
+        ],
+        "unchecked": []
+      }
+    },
+    {
+      "name": "settle-without-stop-cause",
+      "owner": "background-tasks",
+      "expected": "CauseBeforeFinished",
+      "passed": true,
+      "id": "0f544693-4bc3-45fa-9b78-355a004cb14a",
+      "state": "broke",
+      "message": "A rule broke. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:16.212Z",
+        "config": "tla/TaskFinalization.cfg",
+        "modelDigest": "f5a9ead3a7807ee981976243ca5368a102a95b4bc0f86ef0b55301ff61561942",
+        "states": 36,
+        "held": ["PublishAfterCleanup"],
+        "broke": [
+          {
+            "rule": "CauseBeforeFinished",
+            "path": [
+              "Start with cleanup is pending, published is FALSE, phase is Starting, cause is none.",
+              "Settle: cleanup is verified, published is FALSE, phase is Collecting, cause is none.",
+              "Publish: cleanup is verified, published is TRUE, phase is Finished, cause is none."
+            ],
+            "states": []
+          }
+        ],
+        "unchecked": []
+      }
+    },
+    {
+      "name": "execute-before-record-commit",
+      "owner": "kept-processes",
+      "expected": "RecordedBeforeExec",
+      "passed": true,
+      "id": "48f046d2-b7c4-401f-9378-908e5362aab3",
+      "state": "broke",
+      "message": "A rule broke. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:18.281Z",
+        "config": "tla/KeptPublication.cfg",
+        "modelDigest": "4ba8483fdd2df226a5f538963542b5c30bfaafae00b4b8752e7270f437e43fea",
+        "states": 8,
+        "held": ["PreserveNewerRecord"],
+        "broke": [
+          {
+            "rule": "RecordedBeforeExec",
+            "path": [
+              "Start with record is 1, observed is 0, scenario is launch, phase is Preparing, durable is FALSE, deletedNewer is FALSE, executing is FALSE.",
+              "Execute: record is 1, observed is 0, scenario is launch, phase is Running, durable is FALSE, deletedNewer is FALSE, executing is TRUE."
+            ],
+            "states": []
+          }
+        ],
+        "unchecked": []
+      }
+    },
+    {
+      "name": "prune-with-stale-listing",
+      "owner": "kept-processes",
+      "expected": "PreserveNewerRecord",
+      "passed": true,
+      "id": "f25080f3-f129-413b-99e6-585898497601",
+      "state": "broke",
+      "message": "A rule broke. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:19.616Z",
+        "config": "tla/KeptPublication.cfg",
+        "modelDigest": "0d89273a759731b378b160309fc531f8c2af3e33c9aeac99c1855639dd1ade39",
+        "states": 8,
+        "held": ["RecordedBeforeExec"],
+        "broke": [
+          {
+            "rule": "PreserveNewerRecord",
+            "path": [
+              "Start with record is 1, observed is 0, scenario is listing, phase is Preparing, durable is FALSE, deletedNewer is FALSE, executing is FALSE.",
+              "InspectStale: record is 1, observed is 1, scenario is listing, phase is Preparing, durable is FALSE, deletedNewer is FALSE, executing is FALSE.",
+              "ReplaceRecord: record is 2, observed is 1, scenario is listing, phase is Preparing, durable is FALSE, deletedNewer is FALSE, executing is FALSE.",
+              "Prune: record is 0, observed is 1, scenario is listing, phase is Preparing, durable is FALSE, deletedNewer is TRUE, executing is FALSE."
+            ],
+            "states": []
+          }
+        ],
+        "unchecked": []
+      }
+    },
+    {
+      "name": "remove-queue-eviction",
+      "owner": "output",
+      "expected": "QueueBound",
+      "passed": true,
+      "id": "861bc674-31ee-4b80-af64-360a630a7cbb",
+      "state": "broke",
+      "message": "A rule broke. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:22.275Z",
+        "config": "tla/OutputBudget.cfg",
+        "modelDigest": "06ee57469ae6f80185e69e0b37e23870dd5c6e34217b80f5f057447cb32b561f",
+        "states": 52,
+        "held": ["TailBound"],
+        "broke": [
+          {
+            "rule": "QueueBound",
+            "path": [
+              "Start with queued is 0, consumed is 0, dropped is 0, produced is 0, tail is 0, writes is 0.",
+              "Write: queued is 1, consumed is 0, dropped is 0, produced is 1, tail is 1, writes is 1.",
+              "Write: queued is 3, consumed is 0, dropped is 1, produced is 3, tail is 1, writes is 2."
+            ],
+            "states": []
+          },
+          {
+            "rule": "ByteAccounting",
+            "path": [
+              "Start with queued is 0, consumed is 0, dropped is 0, produced is 0, tail is 0, writes is 0.",
+              "Write: queued is 1, consumed is 0, dropped is 0, produced is 1, tail is 1, writes is 1.",
+              "Write: queued is 3, consumed is 0, dropped is 1, produced is 3, tail is 1, writes is 2."
+            ],
+            "states": []
+          }
+        ],
+        "unchecked": []
+      }
+    },
+    {
+      "name": "read-forgets-omitted-bytes",
+      "owner": "output",
+      "expected": "ByteAccounting",
+      "passed": true,
+      "id": "28dbe929-21f9-438b-b88f-8dd156a6f7a0",
+      "state": "broke",
+      "message": "A rule broke. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:23.583Z",
+        "config": "tla/OutputBudget.cfg",
+        "modelDigest": "3193ffcd3f6a292d33a79e7bb278bf14ba6a430696419977c65a8814f634e9df",
+        "states": 48,
+        "held": ["QueueBound", "TailBound"],
+        "broke": [
+          {
+            "rule": "ByteAccounting",
+            "path": [
+              "Start with queued is 0, consumed is 0, dropped is 0, produced is 0, tail is 0, writes is 0.",
+              "Write: queued is 1, consumed is 0, dropped is 0, produced is 1, tail is 1, writes is 1.",
+              "Write: queued is 2, consumed is 0, dropped is 1, produced is 3, tail is 1, writes is 2.",
+              "Read: queued is 0, consumed is 2, dropped is 0, produced is 3, tail is 1, writes is 2."
+            ],
+            "states": []
+          }
+        ],
+        "unchecked": []
+      }
+    },
+    {
+      "name": "unbounded-tail",
+      "owner": "output",
+      "expected": "TailBound",
+      "passed": true,
+      "id": "c0afdcb5-4805-4b77-84d6-0b54127e44c1",
+      "state": "broke",
+      "message": "A rule broke. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:24.838Z",
+        "config": "tla/OutputBudget.cfg",
+        "modelDigest": "b6b0f21fc6385010c11cff93a8363a4e200ead445c1fd7972e3fa0d0ff6ac50f",
+        "states": 46,
+        "held": ["QueueBound", "ByteAccounting"],
+        "broke": [
+          {
+            "rule": "TailBound",
+            "path": [
+              "Start with queued is 0, consumed is 0, dropped is 0, produced is 0, tail is 0, writes is 0.",
+              "Write: queued is 2, consumed is 0, dropped is 0, produced is 2, tail is 2, writes is 1."
+            ],
+            "states": []
+          }
+        ],
+        "unchecked": []
+      }
+    },
+    {
+      "name": "close-with-unverified-evidence",
+      "owner": "scope-cleanup",
+      "expected": "ClosedVerified",
+      "passed": true,
+      "id": "766f2821-a666-4cd5-ac1c-5156aca0ded1",
+      "state": "broke",
+      "message": "A rule broke. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:26.825Z",
+        "config": "tla/ScopeCleanup.cfg",
+        "modelDigest": "67c372928b1dda2572fe8f66592060525ef2515729812bf651111863e497b63c",
+        "states": 48,
+        "held": ["PrunedVerified", "VerifiedNeverLost"],
+        "broke": [
+          {
+            "rule": "ClosedVerified",
+            "path": [
+              "Start with verifiedEver is {}, phase is Open, evidence is <<\"none\", \"none\">>, tracked is {1, 2}.",
+              "Drain: verifiedEver is {}, phase is Draining, evidence is <<\"none\", \"none\">>, tracked is {1, 2}.",
+              "Close: verifiedEver is {}, phase is Closed, evidence is <<\"none\", \"none\">>, tracked is {1, 2}."
+            ],
+            "states": []
+          }
+        ],
+        "unchecked": []
+      }
+    },
+    {
+      "name": "prune-unverified-owner",
+      "owner": "scope-cleanup",
+      "expected": "PrunedVerified",
+      "passed": true,
+      "id": "9f41031e-3196-4eac-933d-00b1f43f8d4e",
+      "state": "broke",
+      "message": "A rule broke. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:28.760Z",
+        "config": "tla/ScopeCleanup.cfg",
+        "modelDigest": "721d78cb1f743fd94bcab67cfe50ec3168d6deaebfc858abfdbc84d4a27653aa",
+        "states": 88,
+        "held": ["VerifiedNeverLost"],
+        "broke": [
+          {
+            "rule": "PrunedVerified",
+            "path": [
+              "Start with verifiedEver is {}, phase is Open, evidence is <<\"none\", \"none\">>, tracked is {1, 2}.",
+              "Prune: verifiedEver is {}, phase is Open, evidence is <<\"none\", \"none\">>, tracked is {2}."
+            ],
+            "states": []
+          },
+          {
+            "rule": "ClosedVerified",
+            "path": [
+              "Start with verifiedEver is {}, phase is Open, evidence is <<\"none\", \"none\">>, tracked is {1, 2}.",
+              "Drain: verifiedEver is {}, phase is Draining, evidence is <<\"none\", \"none\">>, tracked is {1, 2}.",
+              "Prune: verifiedEver is {}, phase is Draining, evidence is <<\"none\", \"none\">>, tracked is {2}.",
+              "Prune: verifiedEver is {}, phase is Draining, evidence is <<\"none\", \"none\">>, tracked is {}.",
+              "Close: verifiedEver is {}, phase is Closed, evidence is <<\"none\", \"none\">>, tracked is {}."
+            ],
+            "states": []
+          }
+        ],
+        "unchecked": []
+      }
+    },
+    {
+      "name": "downgrade-verified-evidence",
+      "owner": "scope-cleanup",
+      "expected": "VerifiedNeverLost",
+      "passed": true,
+      "id": "62a48e7a-603f-4f39-9d21-324e471d68d8",
+      "state": "broke",
+      "message": "A rule broke. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:30.706Z",
+        "config": "tla/ScopeCleanup.cfg",
+        "modelDigest": "bea50adb760920dcedf76290da13c99f887b067fc1a2b496a35656223cb7f1bb",
+        "states": 59,
+        "held": ["PrunedVerified"],
+        "broke": [
+          {
+            "rule": "VerifiedNeverLost",
+            "path": [
+              "Start with verifiedEver is {}, phase is Open, evidence is <<\"none\", \"none\">>, tracked is {1, 2}.",
+              "Observe: verifiedEver is {1}, phase is Open, evidence is <<\"verified\", \"none\">>, tracked is {1, 2}.",
+              "Observe: verifiedEver is {1}, phase is Open, evidence is <<\"unverified\", \"none\">>, tracked is {1, 2}."
+            ],
+            "states": []
+          },
+          {
+            "rule": "ClosedVerified",
+            "path": [
+              "Start with verifiedEver is {}, phase is Open, evidence is <<\"none\", \"none\">>, tracked is {1, 2}.",
+              "Drain: verifiedEver is {}, phase is Draining, evidence is <<\"none\", \"none\">>, tracked is {1, 2}.",
+              "Observe: verifiedEver is {1}, phase is Draining, evidence is <<\"verified\", \"none\">>, tracked is {1, 2}.",
+              "Observe: verifiedEver is {1, 2}, phase is Draining, evidence is <<\"verified\", \"verified\">>, tracked is {1, 2}.",
+              "Close: verifiedEver is {1, 2}, phase is Closed, evidence is <<\"verified\", \"verified\">>, tracked is {1, 2}.",
+              "Observe: verifiedEver is {1, 2}, phase is Closed, evidence is <<\"unverified\", \"verified\">>, tracked is {1, 2}."
+            ],
+            "states": []
+          }
+        ],
+        "unchecked": []
+      }
+    },
+    {
+      "name": "adopt-mismatched-fingerprint",
+      "owner": "services",
+      "expected": "AdoptionMatches",
+      "passed": true,
+      "id": "b7dabcb0-94cd-466c-87d5-db1a4db65482",
+      "state": "broke",
+      "message": "A rule broke. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:32.627Z",
+        "config": "tla/ServiceAdoption.cfg",
+        "modelDigest": "4f4bba2dd3939fdb7cb9967151d9726eaceda44cedf79a9cde4aec570dbd63ba",
+        "states": 15,
+        "held": ["OnlyFirstAdoption", "ReplacementVerified"],
+        "broke": [
+          {
+            "rule": "AdoptionMatches",
+            "path": [
+              "Start with priorCleanup is pending, replaced is FALSE, adopted is FALSE, mayAdopt is TRUE, phase is Inspecting, matches is FALSE.",
+              "Adopt: priorCleanup is pending, replaced is FALSE, adopted is TRUE, mayAdopt is TRUE, phase is Running, matches is FALSE."
+            ],
+            "states": []
+          }
+        ],
+        "unchecked": []
+      }
+    },
+    {
+      "name": "adopt-after-earlier-run",
+      "owner": "services",
+      "expected": "OnlyFirstAdoption",
+      "passed": true,
+      "id": "893f3fae-84ec-48fa-a5b8-cd2433ae1a14",
+      "state": "broke",
+      "message": "A rule broke. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:33.890Z",
+        "config": "tla/ServiceAdoption.cfg",
+        "modelDigest": "59f9b7dd9890c98cf577e609bb089249c07c17afd1081d761d0e7675020e291d",
+        "states": 15,
+        "held": ["AdoptionMatches", "ReplacementVerified"],
+        "broke": [
+          {
+            "rule": "OnlyFirstAdoption",
+            "path": [
+              "Start with priorCleanup is pending, replaced is FALSE, adopted is FALSE, mayAdopt is FALSE, phase is Inspecting, matches is TRUE.",
+              "Adopt: priorCleanup is pending, replaced is FALSE, adopted is TRUE, mayAdopt is FALSE, phase is Running, matches is TRUE."
+            ],
+            "states": []
+          }
+        ],
+        "unchecked": []
+      }
+    },
+    {
+      "name": "replace-unverified-predecessor",
+      "owner": "services",
+      "expected": "ReplacementVerified",
+      "passed": true,
+      "id": "66f4a7ea-7670-4e33-b7fd-6902ad3180cb",
+      "state": "broke",
+      "message": "A rule broke. This checks the design, not the code.",
+      "result": {
+        "sourceRevision": "e56c5e583793ad7d69b4dd4738857909ca8007ad",
+        "checker": "tlc-1.7.4",
+        "date": "2026-11-03T08:39:35.160Z",
+        "config": "tla/ServiceAdoption.cfg",
+        "modelDigest": "e3206633f49e65b0ee618e6ea08b478ca40a4a6b2d583e71367cf4ed23145fcb",
+        "states": 17,
+        "held": ["AdoptionMatches", "OnlyFirstAdoption"],
+        "broke": [
+          {
+            "rule": "ReplacementVerified",
+            "path": [
+              "Start with priorCleanup is pending, replaced is FALSE, adopted is FALSE, mayAdopt is FALSE, phase is Inspecting, matches is FALSE.",
+              "Terminate: priorCleanup is unverified, replaced is FALSE, adopted is FALSE, mayAdopt is FALSE, phase is Terminated, matches is FALSE.",
+              "Replace: priorCleanup is unverified, replaced is TRUE, adopted is FALSE, mayAdopt is FALSE, phase is Running, matches is FALSE."
+            ],
+            "states": []
+          }
+        ],
+        "unchecked": []
+      }
+    }
+  ],
+  "ok": true
+}

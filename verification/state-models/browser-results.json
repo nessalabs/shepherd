@@ -1,0 +1,83 @@
+{
+  "ok": true,
+  "browser": "156.0.8078.80",
+  "viewport": {
+    "width": 1440,
+    "height": 1000
+  },
+  "pages": 14,
+  "diagrams": 10,
+  "errors": [],
+  "results": [
+    {
+      "id": "shepherd",
+      "figures": 1,
+      "failed": 0
+    },
+    {
+      "id": "admission",
+      "figures": 1,
+      "failed": 0
+    },
+    {
+      "id": "background-tasks",
+      "figures": 1,
+      "failed": 0
+    },
+    {
+      "id": "blocking",
+      "figures": 1,
+      "failed": 0
+    },
+    {
+      "id": "events-history",
+      "figures": 1,
+      "failed": 0
+    },
+    {
+      "id": "inventory",
+      "figures": 0,
+      "failed": 0
+    },
+    {
+      "id": "kept-processes",
+      "figures": 1,
+      "failed": 0
+    },
+    {
+      "id": "observation",
+      "figures": 1,
+      "failed": 0
+    },
+    {
+      "id": "output",
+      "figures": 1,
+      "failed": 0
+    },
+    {
+      "id": "platforms",
+      "figures": 0,
+      "failed": 0
+    },
+    {
+      "id": "scope-cleanup",
+      "figures": 1,
+      "failed": 0
+    },
+    {
+      "id": "services",
+      "figures": 1,
+      "failed": 0
+    },
+    {
+      "id": "statistics",
+      "figures": 0,
+      "failed": 0
+    },
+    {
+      "id": "verification",
+      "figures": 0,
+      "failed": 0
+    }
+  ]
+}

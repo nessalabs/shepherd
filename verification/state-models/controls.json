@@ -1,0 +1,93 @@
+[
+  {
+    "owner": "scope-cleanup",
+    "name": "close-with-unverified-evidence",
+    "to": "TRUE",
+    "rule": "ClosedVerified",
+    "from": "\\A p \\in tracked : evidence[p] = \"verified\""
+  },
+  {
+    "owner": "scope-cleanup",
+    "name": "prune-unverified-owner",
+    "to": "Prune(p) == /\\ p \\in tracked",
+    "rule": "PrunedVerified",
+    "from": "Prune(p) == /\\ p \\in tracked /\\ evidence[p] = \"verified\""
+  },
+  {
+    "owner": "scope-cleanup",
+    "name": "downgrade-verified-evidence",
+    "to": "/\\ p \\in tracked",
+    "rule": "VerifiedNeverLost",
+    "from": "/\\ p \\in tracked /\\ evidence[p] # \"verified\""
+  },
+  {
+    "owner": "background-tasks",
+    "name": "publish-before-cleanup",
+    "to": "Publish == /\\ phase \\in {\"Cleaning\",\"Collecting\"}",
+    "rule": "PublishAfterCleanup",
+    "from": "Publish == /\\ phase = \"Collecting\""
+  },
+  {
+    "owner": "services",
+    "name": "adopt-mismatched-fingerprint",
+    "to": "/\\ phase = \"Inspecting\" /\\ mayAdopt",
+    "rule": "AdoptionMatches",
+    "from": "/\\ phase = \"Inspecting\" /\\ matches /\\ mayAdopt"
+  },
+  {
+    "owner": "services",
+    "name": "adopt-after-earlier-run",
+    "to": "/\\ phase = \"Inspecting\" /\\ matches",
+    "rule": "OnlyFirstAdoption",
+    "from": "/\\ phase = \"Inspecting\" /\\ matches /\\ mayAdopt"
+  },
+  {
+    "owner": "services",
+    "name": "replace-unverified-predecessor",
+    "to": "/\\ phase = \"Terminated\"",
+    "rule": "ReplacementVerified",
+    "from": "/\\ phase = \"Terminated\" /\\ priorCleanup = \"verified\""
+  },
+  {
+    "owner": "kept-processes",
+    "name": "execute-before-record-commit",
+    "to": "Execute == /\\ scenario = \"launch\" /\\ phase \\in {\"Preparing\",\"Recorded\"}",
+    "rule": "RecordedBeforeExec",
+    "from": "Execute == /\\ scenario = \"launch\" /\\ phase = \"Recorded\""
+  },
+  {
+    "owner": "kept-processes",
+    "name": "prune-with-stale-listing",
+    "to": "/\\ observed # 0 /\\ record # 0",
+    "rule": "PreserveNewerRecord",
+    "from": "/\\ observed # 0 /\\ record = observed"
+  },
+  {
+    "owner": "output",
+    "name": "remove-queue-eviction",
+    "to": "queued' = queued+n",
+    "rule": "QueueBound",
+    "from": "queued' = Min(2,queued+n)"
+  },
+  {
+    "owner": "output",
+    "name": "read-forgets-omitted-bytes",
+    "to": "/\\ dropped' = 0 /\\ UNCHANGED <<tail,produced,writes>>",
+    "rule": "ByteAccounting",
+    "from": "/\\ UNCHANGED <<tail,produced,dropped,writes>>"
+  },
+  {
+    "owner": "output",
+    "name": "unbounded-tail",
+    "to": "tail' = tail+n",
+    "rule": "TailBound",
+    "from": "tail' = Min(1,tail+n)"
+  },
+  {
+    "owner": "background-tasks",
+    "name": "settle-without-stop-cause",
+    "from": "Settle(outcome) == /\\ phase = \"Cleaning\"",
+    "to": "Settle(outcome) == /\\ phase \\in {\"Starting\",\"Cleaning\"}",
+    "rule": "CauseBeforeFinished"
+  }
+]
