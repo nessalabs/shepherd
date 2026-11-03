@@ -183,4 +183,3 @@ test stats::tests::from_raw_copies_every_field_and_adds_identity_and_uptime ... 
 test stats::tests::process_states_are_distinct ... ok
 
 test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-

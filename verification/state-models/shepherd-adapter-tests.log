@@ -162,4 +162,3 @@ test backend::unix::tests::late_wait_after_natural_exit_still_sees_status ... ok
 test usage::macos::native_tests::cpu_units_match_getrusage_on_this_architecture ... ok
 
 test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
-
